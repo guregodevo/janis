@@ -1,12 +1,21 @@
 package qwen
 
 import (
+	"fmt"
 	"math/rand"
 	"os"
 	"strconv"
 
 	"memdoor/llm/engine"
 )
+
+// debugPrefill logs the prefix-reuse split per generation (MLX_DEBUG_PREFILL=1)
+// so we can see how much of a prompt is re-prefilled vs reused across turns.
+var debugPrefill = os.Getenv("MLX_DEBUG_PREFILL") == "1"
+
+func debugLog(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "[mlx] "+format+"\n", a...)
+}
 
 // prefillChunk is the chunked-prefill window: peak activation during prefill is
 // bounded by this many tokens rather than the whole prompt. 256 keeps the spike
@@ -80,6 +89,10 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 
 	suffix := newIDs[P:]
 	offset := P
+
+	if debugPrefill {
+		debugLog("prefill: total=%d reused=%d new=%d (chunk=%d)", len(newIDs), P, len(suffix), prefillChunk)
+	}
 
 	// Chunked prefill. Forwarding a long prompt in one pass holds EVERY layer's
 	// activations (~seq × intermediate × layers) live until the single eval —

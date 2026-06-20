@@ -34,11 +34,17 @@ type sessionMaker interface {
 // Engine is a loaded model + tokenizer with a persistent prefix-reusing session.
 // It is safe for concurrent callers (generation is serialized internally).
 type Engine struct {
-	bk      *mlxc.Backend
-	session *qwen.Session
-	tok     *tokenizer.Tokenizer
-	mtype   string
-	stops   map[int32]bool
+	bk *mlxc.Backend
+	// session is the main conversational session (prefix-reused across an
+	// agent's turns). utilSession serves one-off utility generations — query
+	// reformulation, wiki summarize/synthesize — so they don't overwrite the
+	// agent session's KV prefix and destroy its reuse (each utility call would
+	// otherwise drop the next real prefill's longest-common-prefix to ~1 token).
+	session     *qwen.Session
+	utilSession *qwen.Session
+	tok         *tokenizer.Tokenizer
+	mtype       string
+	stops       map[int32]bool
 }
 
 // Open loads the model from a local snapshot directory (config.json,
@@ -74,6 +80,7 @@ func Open(modelDir string) (*Engine, error) {
 	}
 	e.bk.PinAll() // protect the weights across requests
 	e.session = sm.NewSession()
+	e.utilSession = sm.NewSession()
 
 	if e.tok, err = tokenizer.New(modelDir); err != nil {
 		return nil, err
@@ -90,18 +97,26 @@ func Open(modelDir string) (*Engine, error) {
 // ModelType reports the loaded architecture (qwen2/qwen3/llama/gemma2).
 func (e *Engine) ModelType() string { return e.mtype }
 
-// Chat generates a full reply for the conversation.
+// Chat generates a full reply for the conversation, on the main prefix-reusing
+// session.
 func (e *Engine) Chat(msgs []Message, opts Options) string {
-	return e.chat(msgs, opts, nil)
+	return e.chat(msgs, opts, nil, e.session)
 }
 
 // ChatStream generates a reply, calling onDelta for each incremental text chunk;
 // it also returns the full reply.
 func (e *Engine) ChatStream(msgs []Message, opts Options, onDelta func(string)) string {
-	return e.chat(msgs, opts, onDelta)
+	return e.chat(msgs, opts, onDelta, e.session)
 }
 
-func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string)) string {
+// ChatUtil generates a reply on the throwaway utility session — for one-off
+// calls (query reformulation, wiki ops) that must NOT pollute the agent
+// session's KV prefix and break its cross-turn reuse.
+func (e *Engine) ChatUtil(msgs []Message, opts Options) string {
+	return e.chat(msgs, opts, nil, e.utilSession)
+}
+
+func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *qwen.Session) string {
 	ids := e.tok.Encode(chat.ApplyTemplate(e.mtype, msgs))
 
 	maxTok := opts.MaxTokens
@@ -128,7 +143,7 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string)) string
 	}
 
 	mlxComputeMu.Lock()
-	out := e.session.Generate(e.bk, ids, maxTok, p)
+	out := sess.Generate(e.bk, ids, maxTok, p)
 	mlxComputeMu.Unlock()
 	return e.tok.Decode(out)
 }
