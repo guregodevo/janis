@@ -1,0 +1,157 @@
+// Package llm is the embeddable high-level API: load a model once and chat with
+// it in-process. This is what an app (e.g. memdoor's gateway) imports instead of
+// spawning a separate inference server — no subprocess, no HTTP, no llama-server.
+package llm
+
+import (
+	"fmt"
+	"path/filepath"
+
+	"memdoor/llm/chat"
+	"memdoor/llm/engine"
+	"memdoor/llm/gemma"
+	"memdoor/llm/mlxc"
+	"memdoor/llm/qwen"
+	"memdoor/llm/safetensors"
+	"memdoor/llm/tokenizer"
+)
+
+// Message is re-exported so callers don't import the chat package directly.
+type Message = chat.Message
+
+// Options controls a chat request.
+type Options struct {
+	Temp      float32
+	TopP      float32
+	MaxTokens int
+	Seed      uint64
+}
+
+type sessionMaker interface {
+	NewSession() *qwen.Session
+}
+
+// Engine is a loaded model + tokenizer with a persistent prefix-reusing session.
+// It is safe for concurrent callers (generation is serialized internally).
+type Engine struct {
+	bk      *mlxc.Backend
+	session *qwen.Session
+	tok     *tokenizer.Tokenizer
+	mtype   string
+	stops   map[int32]bool
+}
+
+// Open loads the model from a local snapshot directory (config.json,
+// model.safetensors, tokenizer.json).
+func Open(modelDir string) (*Engine, error) {
+	cfg, err := qwen.LoadConfig(modelDir)
+	if err != nil {
+		return nil, err
+	}
+	e := &Engine{bk: mlxc.New(), mtype: cfg.ModelType, stops: map[int32]bool{}}
+	var b engine.Backend = e.bk
+
+	st, err := safetensors.Open(filepath.Join(modelDir, "model.safetensors"))
+	if err != nil {
+		return nil, err
+	}
+	var sm sessionMaker
+	switch cfg.ModelType {
+	case "qwen2", "qwen3", "llama":
+		m, err := qwen.LoadModel(b, st, cfg)
+		if err != nil {
+			return nil, err
+		}
+		sm = m
+	case "gemma2":
+		m, err := gemma.LoadModel(b, st, cfg)
+		if err != nil {
+			return nil, err
+		}
+		sm = m
+	default:
+		return nil, fmt.Errorf("unsupported model_type %q", cfg.ModelType)
+	}
+	e.bk.PinAll() // protect the weights across requests
+	e.session = sm.NewSession()
+
+	if e.tok, err = tokenizer.New(modelDir); err != nil {
+		return nil, err
+	}
+	for _, id := range e.tok.Encode(chat.StopMarker(cfg.ModelType)) {
+		e.stops[id] = true
+	}
+	for _, id := range cfg.EosTokens {
+		e.stops[id] = true
+	}
+	return e, nil
+}
+
+// ModelType reports the loaded architecture (qwen2/qwen3/llama/gemma2).
+func (e *Engine) ModelType() string { return e.mtype }
+
+// Chat generates a full reply for the conversation.
+func (e *Engine) Chat(msgs []Message, opts Options) string {
+	return e.chat(msgs, opts, nil)
+}
+
+// ChatStream generates a reply, calling onDelta for each incremental text chunk;
+// it also returns the full reply.
+func (e *Engine) ChatStream(msgs []Message, opts Options, onDelta func(string)) string {
+	return e.chat(msgs, opts, onDelta)
+}
+
+func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string)) string {
+	ids := e.tok.Encode(chat.ApplyTemplate(e.mtype, msgs))
+
+	maxTok := opts.MaxTokens
+	if maxTok <= 0 {
+		maxTok = 512
+	}
+	topP := opts.TopP
+	if topP <= 0 {
+		topP = 1.0
+	}
+	p := qwen.SampleParams{Temp: opts.Temp, TopP: topP, Seed: opts.Seed, Stop: e.stops}
+
+	if onDelta != nil {
+		var gen []int32
+		var emitted string
+		p.OnToken = func(tok int32) {
+			gen = append(gen, tok)
+			full := e.tok.Decode(gen)
+			if len(full) > len(emitted) {
+				onDelta(full[len(emitted):])
+				emitted = full
+			}
+		}
+	}
+
+	mlxComputeMu.Lock()
+	out := e.session.Generate(e.bk, ids, maxTok, p)
+	mlxComputeMu.Unlock()
+	return e.tok.Decode(out)
+}
+
+// NumTokens returns the token count of text (for usage stats).
+func (e *Engine) NumTokens(text string) int { return len(e.tok.Encode(text)) }
+
+// Close releases the tokenizer and backend.
+// Close releases the tokenizer and backend. It first acquires the shared MLX
+// compute lock so it never frees the backend out from under an in-flight
+// mlx_eval (which segfaults). If a generation is still running — e.g. the HTTP
+// drain timed out before the request finished — it skips the explicit free and
+// lets process exit reclaim the GPU buffers: bounded and safe, rather than
+// either blocking shutdown or crashing.
+func (e *Engine) Close() {
+	if !mlxComputeMu.TryLock() {
+		return
+	}
+	defer mlxComputeMu.Unlock()
+	if e.tok != nil {
+		e.tok.Close()
+	}
+	if e.bk != nil {
+		e.bk.Close()
+	}
+}
