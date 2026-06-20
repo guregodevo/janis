@@ -2,9 +2,23 @@ package qwen
 
 import (
 	"math/rand"
+	"os"
+	"strconv"
 
 	"memdoor/llm/engine"
 )
+
+// prefillChunk is the chunked-prefill window: peak activation during prefill is
+// bounded by this many tokens rather than the whole prompt. 256 keeps the spike
+// small while staying efficient; override with MLX_PREFILL_CHUNK.
+var prefillChunk = func() int {
+	if v := os.Getenv("MLX_PREFILL_CHUNK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 256
+}()
 
 // Session keeps a conversation's KV cache alive across requests so a follow-up
 // only prefills the new suffix (longest-common-prefix reuse), instead of
@@ -66,10 +80,40 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 
 	suffix := newIDs[P:]
 	offset := P
-	logits := s.Forward(b, b.FromInt32(suffix, len(suffix)), len(suffix), offset, s.Caches)
-	offset += len(suffix)
+
+	// Chunked prefill. Forwarding a long prompt in one pass holds EVERY layer's
+	// activations (~seq × intermediate × layers) live until the single eval —
+	// multiple GB at a few-thousand-token RAG prompt, which jetsam-kills the
+	// process on constrained unified memory (measured: a ~5k-token prefill on a
+	// 3B model OOMs a 16GB Mac). Processing the suffix in fixed-size chunks caps
+	// peak activation at one chunk's worth; the KV cache (pinned) carries state
+	// across chunks, so the final logits are identical to a single forward — the
+	// same mechanism as incremental decode. We MUST eval+sweep each chunk, else
+	// MLX defers every chunk to one eval and the spike returns.
+	var logits engine.Tensor
+	for i := 0; i < len(suffix); i += prefillChunk {
+		end := i + prefillChunk
+		if end > len(suffix) {
+			end = len(suffix)
+		}
+		chunk := suffix[i:end]
+		prev := cacheTensors(s.Caches)
+		logits = s.Forward(b, b.FromInt32(chunk, len(chunk)), len(chunk), offset, s.Caches)
+		offset += len(chunk)
+		if sw != nil {
+			// Force this chunk's compute so its intermediates become free, then
+			// sweep them. Keep the caches (state) and the running logits (needed
+			// for sampling after the last chunk) pinned across the sweep.
+			sw.Pin(logits)
+			b.Eval(append(cacheTensors(s.Caches), logits)...)
+			pinCaches(sw, s.Caches)
+			sw.Unpin(prev...)
+			sw.Sweep()
+		}
+	}
 	tok := sampleToken(b.Floats(logits), p, rng) // last-position logits
 	if sw != nil {
+		sw.Unpin(logits)
 		pinCaches(sw, s.Caches)
 		sw.Unpin(old...)
 		sw.Sweep()
