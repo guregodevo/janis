@@ -1,8 +1,10 @@
 package llm
 
 import (
+	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 
 	"memdoor/llm/engine"
 	"memdoor/llm/mlxc"
@@ -15,7 +17,23 @@ import (
 const (
 	tokBOS = 0 // <s> / [CLS]
 	tokEOS = 2 // </s> / [SEP]
+
+	// defaultRerankMaxTok is the cross-encoder pair length cap (incl. specials).
+	// 512 is the standard reranker context; the page head carries the relevance
+	// signal, so longer windows cost latency without precision.
+	defaultRerankMaxTok = 512
 )
+
+// rerankMaxTokEnv returns the pair-length cap, MEMDOOR_RERANK_MAXTOK overriding
+// the 512 default. Zero or invalid falls back to the default.
+func rerankMaxTokEnv() int {
+	if v := os.Getenv("MEMDOOR_RERANK_MAXTOK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultRerankMaxTok
+}
 
 // Reranker is a loaded bge cross-encoder. Score(query, passage) returns a
 // relevance logit by jointly encoding the pair — far more discriminative than
@@ -34,7 +52,16 @@ func OpenReranker(modelDir string) (*Reranker, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &Reranker{bk: mlxc.New(), maxTok: cfg.MaxPos - 4} // room for <s> </s></s> </s>
+	// Cap the pair length at the standard cross-encoder context (512), not the
+	// model's full position budget: v2-m3 advertises 8194, but scoring 8k-token
+	// passages is ~16x slower for no precision gain — relevance is decided by the
+	// page head (title/summary/opening), and a uniform cap keeps models
+	// comparable. Override with MEMDOOR_RERANK_MAXTOK. Room kept for <s> </s></s> </s>.
+	maxTok := cfg.MaxPos - 4
+	if cap := rerankMaxTokEnv(); cap > 0 && cap-4 < maxTok {
+		maxTok = cap - 4
+	}
+	r := &Reranker{bk: mlxc.New(), maxTok: maxTok}
 	var b engine.Backend = r.bk
 	st, err := safetensors.Open(filepath.Join(modelDir, "model.safetensors"))
 	if err != nil {
