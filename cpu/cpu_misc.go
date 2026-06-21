@@ -147,36 +147,61 @@ func (b *Backend) Dequantize(w, scales, biases engine.Tensor, groupSize, bits in
 	outShape[len(outShape)-1] = in
 	out := newTensor(engine.F32, outShape...)
 
-	for r := 0; r < rows; r++ {
-		wRow, sRow, oRow := r*P, r*G, r*in
-		for j := 0; j < in; j++ {
-			q := (tw.u32[wRow+j/valsPerWord] >> uint((j%valsPerWord)*bits)) & mask
-			g := j / groupSize
-			out.data[oRow+j] = float32(q)*ts.data[sRow+g] + tb.data[sRow+g]
+	parallelFor(rows, func(rs, re int) {
+		for r := rs; r < re; r++ {
+			wRow, sRow, oRow := r*P, r*G, r*in
+			for j := 0; j < in; j++ {
+				q := (tw.u32[wRow+j/valsPerWord] >> uint((j%valsPerWord)*bits)) & mask
+				g := j / groupSize
+				out.data[oRow+j] = float32(q)*ts.data[sRow+g] + tb.data[sRow+g]
+			}
 		}
-	}
+	})
 	return out
 }
 
 // QuantMatmul computes x @ w with w affine-quantized. transpose=true (the
-// QuantizedLinear convention) treats the dequantized w as [out, in] and returns
-// x @ Wᵀ -> [..., out]. Correctness-first: dequantize then dense matmul.
+// QuantizedLinear convention) treats w as [out, in] and returns x @ Wᵀ ->
+// [..., out]. Fused: parallel over output channels, each goroutine dequantizes
+// one weight row into a reused buffer and dots it against every x row — so the
+// unpack is amortized across the batch and NOTHING materializes the full
+// [out,in] weight or a transpose (the old dequantize-then-dense-matmul path did
+// both, every token, which dominated decode latency).
 func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool, groupSize, bits int) engine.Tensor {
-	W := b.Dequantize(w, scales, biases, groupSize, bits)
-	if transpose {
-		W = b.Transpose(W, lastTwoSwapped(as(W).shape)...)
+	if !transpose {
+		// The models never hit this; keep a correct fallback.
+		return b.MatMul(x, b.Dequantize(w, scales, biases, groupSize, bits))
 	}
-	return b.MatMul(x, W)
-}
+	tx, tw, ts, tb := as(x), as(w), as(scales), as(biases)
+	valsPerWord := 32 / bits
+	mask := uint32((1 << bits) - 1)
+	P := tw.shape[len(tw.shape)-1]
+	in := P * valsPerWord
+	outDim := tw.shape[len(tw.shape)-2] // W is [outDim, P] = [outDim, in]
+	G := ts.shape[len(ts.shape)-1]
+	rows := len(tx.data) / in // flattened leading dims of x
 
-// lastTwoSwapped returns the identity axis order with the final two axes
-// swapped — Wᵀ on the matrix dims, leaving any batch dims in place.
-func lastTwoSwapped(shape []int) []int {
-	n := len(shape)
-	axes := make([]int, n)
-	for i := range axes {
-		axes[i] = i
-	}
-	axes[n-2], axes[n-1] = n-1, n-2
-	return axes
+	outShape := append(append([]int(nil), tx.shape[:len(tx.shape)-1]...), outDim)
+	y := newTensor(engine.F32, outShape...)
+
+	parallelFor(outDim, func(os, oe int) {
+		wbuf := make([]float32, in) // reused across channels in this chunk
+		for o := os; o < oe; o++ {
+			wRow, sRow := o*P, o*G
+			for i := 0; i < in; i++ {
+				q := (tw.u32[wRow+i/valsPerWord] >> uint((i%valsPerWord)*bits)) & mask
+				g := i / groupSize
+				wbuf[i] = float32(q)*ts.data[sRow+g] + tb.data[sRow+g]
+			}
+			for r := 0; r < rows; r++ {
+				xRow := tx.data[r*in : r*in+in]
+				var acc float32
+				for i := 0; i < in; i++ {
+					acc += xRow[i] * wbuf[i]
+				}
+				y.data[r*outDim+o] = acc
+			}
+		}
+	})
+	return y
 }

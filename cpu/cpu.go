@@ -17,9 +17,40 @@ package cpu
 import (
 	"encoding/binary"
 	"math"
+	"runtime"
+	"sync"
 
 	"memdoor/llm/engine"
 )
+
+// parallelFor splits [0,n) into one contiguous chunk per CPU and runs fn on each
+// concurrently. The hot matmuls (per output row / output channel) are
+// independent, so this is the backend's main speed lever over the naive
+// single-threaded loops. Runs inline when n is small or there's one CPU.
+func parallelFor(n int, fn func(start, end int)) {
+	if n <= 0 {
+		return
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers > n {
+		workers = n
+	}
+	if workers <= 1 {
+		fn(0, n)
+		return
+	}
+	chunk := (n + workers - 1) / workers
+	var wg sync.WaitGroup
+	for start := 0; start < n; start += chunk {
+		end := start + chunk
+		if end > n {
+			end = n
+		}
+		wg.Add(1)
+		go func(s, e int) { defer wg.Done(); fn(s, e) }(start, end)
+	}
+	wg.Wait()
+}
 
 // Backend is the pure-Go engine.Backend. Stateless — every op is a pure
 // function of its inputs, so one Backend is safe to share.

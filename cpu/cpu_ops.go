@@ -26,20 +26,27 @@ func (b *Backend) MatMul(a, bb engine.Tensor) engine.Tensor {
 	outShape := append(append([]int(nil), batch...), M, N)
 	out := newTensor(engine.F32, outShape...)
 	aMat, bMat := M*K, K*N
-	for bi := 0; bi < nBatch; bi++ {
-		aOff := bcBatch(bi, batch, batchA) * aMat
-		bOff := bcBatch(bi, batch, batchB) * bMat
-		oOff := bi * M * N
-		for i := 0; i < M; i++ {
-			for j := 0; j < N; j++ {
-				var s float32
-				for k := 0; k < K; k++ {
-					s += ta.data[aOff+i*K+k] * tb.data[bOff+k*N+j]
+	// One independent task per output matrix row (flat over batch×M). The inner
+	// loop is ikj order so both B and the output row are walked sequentially —
+	// far better cache behavior than the textbook ijk dot product.
+	parallelFor(nBatch*M, func(rs, re int) {
+		for rr := rs; rr < re; rr++ {
+			bi, i := rr/M, rr%M
+			aOff := bcBatch(bi, batch, batchA)*aMat + i*K
+			bOff := bcBatch(bi, batch, batchB) * bMat
+			oRow := out.data[bi*M*N+i*N : bi*M*N+i*N+N]
+			for k := 0; k < K; k++ {
+				aik := ta.data[aOff+k]
+				if aik == 0 {
+					continue
 				}
-				out.data[oOff+i*N+j] = s
+				bRow := tb.data[bOff+k*N : bOff+k*N+N]
+				for j := 0; j < N; j++ {
+					oRow[j] += aik * bRow[j]
+				}
 			}
 		}
-	}
+	})
 	// A 1-D operand collapses the corresponding output matrix axis, but the
 	// model code always feeds ≥2-D here, so keep the explicit (…,M,N) shape.
 	return out
