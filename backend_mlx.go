@@ -21,3 +21,9 @@ func newBackend() engine.Backend {
 	}
 	return mlxc.New()
 }
+
+// Accelerated reports whether the active backend is GPU-accelerated (MLX on
+// Apple Silicon) — true unless MEMDOOR_BACKEND=cpu forces the pure-Go backend.
+// Callers use this to size the model: large models are fine on a GPU but decode
+// too slowly on CPU.
+func Accelerated() bool { return os.Getenv("MEMDOOR_BACKEND") != "cpu" }
