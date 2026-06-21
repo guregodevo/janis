@@ -55,7 +55,12 @@ func (b *Backend) TakeAxis(a, indices engine.Tensor, axis int) engine.Tensor {
 	outShape = append(outShape, ta.shape[:axis]...)
 	outShape = append(outShape, ti.shape...)
 	outShape = append(outShape, ta.shape[axis+1:]...)
-	out := newTensor(engine.F32, outShape...)
+	out := newTensor(ta.dt, outShape...)
+	// A U32 (packed-quant) source carries exact words; gather those too so a
+	// following Dequantize sees the real packed weights, not the lossy mirror.
+	if ta.u32 != nil {
+		out.u32 = make([]uint32, len(out.data))
+	}
 
 	st := strides(ta.shape)
 	outer := 1
@@ -73,6 +78,9 @@ func (b *Backend) TakeAxis(a, indices engine.Tensor, axis int) engine.Tensor {
 			}
 			src := o*axisLen*inner + idx*inner
 			copy(out.data[dst:dst+inner], ta.data[src:src+inner])
+			if out.u32 != nil {
+				copy(out.u32[dst:dst+inner], ta.u32[src:src+inner])
+			}
 			dst += inner
 		}
 	}
@@ -114,13 +122,61 @@ func (b *Backend) Argmax(x engine.Tensor, axis int) engine.Tensor {
 
 func (b *Backend) Close() {}
 
-// ---- Phase 3 (4-bit quantization) — not yet implemented -------------------
-// Linux ships f16 models first; these land with the dequant path.
+// ---- 4-bit affine quantization (MLX-compatible) ---------------------------
+// MLX packs valsPerWord = 32/bits sub-values into each uint32, LSB first, along
+// the last axis; per group of `groupSize` sub-values there is one scale + bias,
+// and the float value is `scale*q + bias` (affine). Dequantize/QuantMatmul
+// reproduce that exactly so a Qwen3-8B-4bit MLX checkpoint runs unchanged on the
+// CPU backend — no separate f16 model needed.
 
+// Dequantize reconstructs the full float weight from (packed words, scales,
+// biases). w is [..., P] (U32); the output is [..., P*32/bits].
 func (b *Backend) Dequantize(w, scales, biases engine.Tensor, groupSize, bits int) engine.Tensor {
-	panic("cpu.Dequantize: 4-bit quantization is phase 3 (use an f16 model for now)")
+	tw, ts, tb := as(w), as(scales), as(biases)
+	if tw.u32 == nil {
+		panic("cpu.Dequantize: weight tensor is not packed U32")
+	}
+	valsPerWord := 32 / bits
+	mask := uint32((1 << bits) - 1)
+	P := tw.shape[len(tw.shape)-1]
+	in := P * valsPerWord
+	G := ts.shape[len(ts.shape)-1] // groups per row (= in/groupSize)
+	rows := numel(tw.shape) / P
+
+	outShape := append([]int(nil), tw.shape...)
+	outShape[len(outShape)-1] = in
+	out := newTensor(engine.F32, outShape...)
+
+	for r := 0; r < rows; r++ {
+		wRow, sRow, oRow := r*P, r*G, r*in
+		for j := 0; j < in; j++ {
+			q := (tw.u32[wRow+j/valsPerWord] >> uint((j%valsPerWord)*bits)) & mask
+			g := j / groupSize
+			out.data[oRow+j] = float32(q)*ts.data[sRow+g] + tb.data[sRow+g]
+		}
+	}
+	return out
 }
 
+// QuantMatmul computes x @ w with w affine-quantized. transpose=true (the
+// QuantizedLinear convention) treats the dequantized w as [out, in] and returns
+// x @ Wᵀ -> [..., out]. Correctness-first: dequantize then dense matmul.
 func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool, groupSize, bits int) engine.Tensor {
-	panic("cpu.QuantMatmul: 4-bit quantization is phase 3 (use an f16 model for now)")
+	W := b.Dequantize(w, scales, biases, groupSize, bits)
+	if transpose {
+		W = b.Transpose(W, lastTwoSwapped(as(W).shape)...)
+	}
+	return b.MatMul(x, W)
+}
+
+// lastTwoSwapped returns the identity axis order with the final two axes
+// swapped — Wᵀ on the matrix dims, leaving any batch dims in place.
+func lastTwoSwapped(shape []int) []int {
+	n := len(shape)
+	axes := make([]int, n)
+	for i := range axes {
+		axes[i] = i
+	}
+	axes[n-2], axes[n-1] = n-1, n-2
+	return axes
 }

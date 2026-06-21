@@ -18,10 +18,17 @@ func (b *Backend) RoPE(x engine.Tensor, dims int, traditional bool, base, scale 
 	return b.applyRoPE(x, dims, traditional, scale, offset, inv)
 }
 
-// RoPEFreqs is RoPE with explicit per-dim inverse frequencies (base ignored) —
-// llama3 rope scaling supplies these directly.
+// RoPEFreqs is RoPE with explicit per-dim frequencies (base ignored) — llama3
+// rope scaling supplies these. MLX's fast.rope DIVIDES by the supplied freqs
+// (theta = pos*scale/freqs), the freqs being the denominators base^(2i/d) that
+// mlx-lm's Llama3RoPE computes. applyRoPE multiplies by inv, so pass 1/freqs —
+// matching how plain RoPE builds inv[i] = base^(-2i/d).
 func (b *Backend) RoPEFreqs(x engine.Tensor, dims int, traditional bool, scale float32, offset int, freqs engine.Tensor) engine.Tensor {
-	inv := append([]float32(nil), as(freqs).data...)
+	f := as(freqs).data
+	inv := make([]float32, len(f))
+	for i, v := range f {
+		inv[i] = 1 / v
+	}
 	return b.applyRoPE(x, dims, traditional, scale, offset, inv)
 }
 

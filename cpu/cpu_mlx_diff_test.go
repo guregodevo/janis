@@ -8,6 +8,7 @@
 package cpu
 
 import (
+	"encoding/binary"
 	"math"
 	"math/rand"
 	"testing"
@@ -23,6 +24,28 @@ func rnd(n int) []float32 {
 		d[i] = r.Float32()*2 - 1
 	}
 	return d
+}
+
+// rndSeed is rnd with a chosen seed, so independent operands (e.g. scales vs
+// biases) get genuinely different data and a swap would be caught.
+func rndSeed(n int, seed int64) []float32 {
+	r := rand.New(rand.NewSource(seed))
+	d := make([]float32, n)
+	for i := range d {
+		d[i] = r.Float32()*2 - 1
+	}
+	return d
+}
+
+// rndPackedU32 returns n random packed words as little-endian bytes — the wire
+// form of an MLX-quantized weight, fed verbatim to both backends' FromRaw.
+func rndPackedU32(n int, seed int64) []byte {
+	r := rand.New(rand.NewSource(seed))
+	raw := make([]byte, n*4)
+	for i := 0; i < n; i++ {
+		binary.LittleEndian.PutUint32(raw[i*4:], r.Uint32())
+	}
+	return raw
 }
 
 func maxAbsDiff(a, b []float32) float64 {
@@ -98,6 +121,48 @@ func TestCPUMatchesMLX(t *testing.T) {
 	diffOK(t, "SDPA(causal,GQA)", tol,
 		c.Floats(c.SDPA(c.FromFloats(q, 1, 4, 5, 8), c.FromFloats(k, 1, 2, 5, 8), c.FromFloats(v, 1, 2, 5, 8), scale, true)),
 		m.Floats(m.SDPA(m.FromFloats(q, 1, 4, 5, 8), m.FromFloats(k, 1, 2, 5, 8), m.FromFloats(v, 1, 2, 5, 8), scale, true)))
+
+	// 4-bit affine quantization — the convention that lets a Qwen3-8B-4bit MLX
+	// checkpoint run on the CPU backend. weight [out=8, P=16] packed = [8,128]
+	// dequantized; groupSize 64, 4 bits → 2 groups/row. Identical packed bytes +
+	// f32 scales/biases go to both backends.
+	const out, in, gs, bits = 8, 128, 64, 4
+	P, G := in*bits/32, in/gs
+	raw := rndPackedU32(out*P, 7)
+	sc, bi := rndSeed(out*G, 2), rndSeed(out*G, 3)
+	cW, mW := c.FromRaw(engine.U32, raw, out, P), m.FromRaw(engine.U32, raw, out, P)
+	cS, cB := c.FromFloats(sc, out, G), c.FromFloats(bi, out, G)
+	mS, mB := m.FromFloats(sc, out, G), m.FromFloats(bi, out, G)
+
+	diffOK(t, "Dequantize", tol,
+		c.Floats(c.Dequantize(cW, cS, cB, gs, bits)),
+		m.Floats(m.Dequantize(mW, mS, mB, gs, bits)))
+
+	// QuantMatmul transpose=true (QuantizedLinear): x[3,128] @ Wᵀ -> [3,8]
+	xq := rnd(3 * in)
+	diffOK(t, "QuantMatmul", tol,
+		c.Floats(c.QuantMatmul(c.FromFloats(xq, 3, in), cW, cS, cB, true, gs, bits)),
+		m.Floats(m.QuantMatmul(m.FromFloats(xq, 3, in), mW, mS, mB, true, gs, bits)))
+
+	// Quantized embedding lookup: gather packed rows (TakeAxis over U32) +
+	// per-row scales/biases, then dequantize — the QuantEmbedding.Forward path.
+	ids := []int32{0, 3, 5, 2}
+	cIdx, mIdx := c.FromInt32(ids, len(ids)), m.FromInt32(ids, len(ids))
+	diffOK(t, "QuantEmbed(gather+dequant)", tol,
+		c.Floats(c.Dequantize(c.TakeAxis(cW, cIdx, 0), c.TakeAxis(cS, cIdx, 0), c.TakeAxis(cB, cIdx, 0), gs, bits)),
+		m.Floats(m.Dequantize(m.TakeAxis(mW, mIdx, 0), m.TakeAxis(mS, mIdx, 0), m.TakeAxis(mB, mIdx, 0), gs, bits)))
+
+	// RoPEFreqs — the llama3-scaling path (explicit denominators base^(2i/d),
+	// nonzero offset). This is what the plain-RoPE unit test missed.
+	rf := rnd(1 * 2 * 4 * 8)
+	half := 8 / 2
+	fr := make([]float32, half)
+	for i := range fr {
+		fr[i] = float32(math.Pow(10000, float64(2*i)/8))
+	}
+	diffOK(t, "RoPEFreqs(offset=3)", tol,
+		c.Floats(c.RoPEFreqs(c.FromFloats(rf, 1, 2, 4, 8), 8, false, 1.0, 3, c.FromFloats(fr, half))),
+		m.Floats(m.RoPEFreqs(m.FromFloats(rf, 1, 2, 4, 8), 8, false, 1.0, 3, m.FromFloats(fr, half))))
 }
 
 var _ = engine.F32 // keep the engine import even if assertions change

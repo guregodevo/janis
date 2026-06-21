@@ -1,8 +1,11 @@
 package cpu
 
 import (
+	"encoding/binary"
 	"math"
 	"testing"
+
+	"memdoor/llm/engine"
 )
 
 func approx(a, b float32) bool { return math.Abs(float64(a-b)) < 1e-4 }
@@ -113,4 +116,34 @@ func eq(a, b []float32) bool {
 		}
 	}
 	return true
+}
+
+// TestDequantize4bit checks the MLX-affine 4-bit path with a hand-packed word,
+// so Linux (where the MLX diff harness can't run) still covers the quant path.
+// nibbles q = [1..8] packed LSB-first -> 0x87654321; groupSize 4 -> 2 groups.
+func TestDequantize4bit(t *testing.T) {
+	b := New()
+	raw := make([]byte, 4)
+	binary.LittleEndian.PutUint32(raw, 0x87654321) // q0=1 (low nibble) .. q7=8
+	w := b.FromRaw(engine.U32, raw, 1, 1)          // [rows=1, P=1]
+	scales := b.FromFloats([]float32{2, 0.1}, 1, 2)
+	biases := b.FromFloats([]float32{0.5, -1}, 1, 2)
+
+	got := vals(t, b.Dequantize(w, scales, biases, 4 /*group*/, 4 /*bits*/))
+	want := []float32{2.5, 4.5, 6.5, 8.5, -0.5, -0.4, -0.3, -0.2} // q*scale+bias per group
+	if len(got) != len(want) {
+		t.Fatalf("Dequantize len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if !approx(got[i], want[i]) {
+			t.Fatalf("Dequantize[%d] = %v, want %v (%v)", i, got[i], want[i], got)
+		}
+	}
+
+	// QuantMatmul transpose=true: x=ones[1,8] @ Wᵀ -> sum of the dequantized row.
+	x := b.FromFloats([]float32{1, 1, 1, 1, 1, 1, 1, 1}, 1, 8)
+	y := vals(t, b.QuantMatmul(x, w, scales, biases, true, 4, 4))
+	if !approx(y[0], 20.6) { // 2.5+4.5+6.5+8.5-0.5-0.4-0.3-0.2
+		t.Fatalf("QuantMatmul = %v, want 20.6", y[0])
+	}
 }

@@ -33,9 +33,15 @@ func (b *Backend) Version() string { return "cpu-go-0.1" }
 // tensor is the concrete handle: a shape + dense row-major f32 data. ints holds
 // integer payloads (token ids / gather indices) when the tensor is I32/U32 —
 // float data still mirrors it so float ops stay uniform.
+//
+// u32 holds the EXACT packed words of a U32 tensor (MLX-quantized weights, where
+// each word packs 32/bits sub-values). A packed word can exceed float32's exact
+// integer range (2^24), so the f32 `data` mirror is lossy for those — the
+// quant path (TakeAxis gather, Dequantize, QuantMatmul) reads `u32` instead.
 type tensor struct {
 	shape []int
 	data  []float32
+	u32   []uint32 // non-nil only for U32 (packed-quant) tensors
 	dt    engine.DType
 }
 
@@ -91,9 +97,18 @@ func (b *Backend) FromRaw(dt engine.DType, raw []byte, shape ...int) engine.Tens
 			// bf16 is the top 16 bits of an f32.
 			t.data[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[i*2:])) << 16)
 		}
-	case engine.I32, engine.U32:
+	case engine.I32:
 		for i := 0; i < n; i++ {
 			t.data[i] = float32(int32(binary.LittleEndian.Uint32(raw[i*4:])))
+		}
+	case engine.U32:
+		// Keep the exact words (packed quant weights need them losslessly); the
+		// f32 mirror is best-effort and unused on the quant path.
+		t.u32 = make([]uint32, n)
+		for i := 0; i < n; i++ {
+			w := binary.LittleEndian.Uint32(raw[i*4:])
+			t.u32[i] = w
+			t.data[i] = float32(w)
 		}
 	default:
 		panic("cpu.FromRaw: unsupported dtype")

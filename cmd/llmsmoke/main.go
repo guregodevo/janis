@@ -1,5 +1,10 @@
 // Command llmsmoke proves memdoor can embed the engine in-process: load a model
 // from the HF cache and run one chat, no subprocess/HTTP.
+//
+// Usage: llmsmoke [model-name-substring] [prompt]
+// Defaults to Qwen2.5-3B-Instruct-4bit. Set MEMDOOR_BACKEND=cpu (on a Mac) to
+// run the pure-Go CPU backend instead of MLX — running it both ways on the same
+// model at temp=0 is how we verify the CPU forward matches MLX end-to-end.
 package main
 
 import (
@@ -11,12 +16,27 @@ import (
 )
 
 func main() {
+	model := "Qwen2.5-3B-Instruct-4bit"
+	prompt := "What is the capital of France? Answer in one short sentence."
+	if len(os.Args) > 1 {
+		model = os.Args[1]
+	}
+	if len(os.Args) > 2 {
+		prompt = os.Args[2]
+	}
+
 	home, _ := os.UserHomeDir()
-	dirs, _ := filepath.Glob(filepath.Join(home, ".cache/huggingface/hub/models--mlx-community--Qwen2.5-3B-Instruct-4bit/snapshots/*"))
+	dirs, _ := filepath.Glob(filepath.Join(home, ".cache/huggingface/hub/models--mlx-community--"+model+"/snapshots/*"))
 	if len(dirs) == 0 {
-		fmt.Println("model not cached")
+		fmt.Printf("model %q not cached\n", model)
 		os.Exit(1)
 	}
+
+	backend := os.Getenv("MEMDOOR_BACKEND")
+	if backend == "" {
+		backend = "mlx (default)"
+	}
+	fmt.Printf("backend=%s model=%s\n", backend, model)
 
 	eng, err := llm.Open(dirs[0])
 	if err != nil {
@@ -26,7 +46,7 @@ func main() {
 	fmt.Println("loaded:", eng.ModelType())
 
 	reply := eng.Chat([]llm.Message{
-		{Role: "user", Content: "What is the capital of France? Answer in one short sentence."},
+		{Role: "user", Content: prompt},
 	}, llm.Options{Temp: 0, MaxTokens: 32})
 	fmt.Println("REPLY:", reply)
 }
