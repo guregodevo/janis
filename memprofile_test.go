@@ -1,3 +1,7 @@
+//go:build darwin && arm64
+
+// MLX-only: imports mlxc and reports its memory stats, so it builds on Apple
+// Silicon only.
 package llm
 
 import (

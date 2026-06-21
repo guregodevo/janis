@@ -1,3 +1,8 @@
+//go:build darwin && arm64
+
+// MLX-only: probes the MLX backend's buffer-reuse cache via mlxc-specific
+// methods (SetCacheLimit/ClearCache/*MemoryMB), so it builds on Apple Silicon
+// only. The CPU backend has no such cache (Go GC manages memory).
 package llm
 
 import (
@@ -5,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"memdoor/llm/mlxc"
 )
 
 // TestEmbedMemoryGrowth probes whether MLX's buffer-reuse cache grows unbounded
@@ -21,10 +28,11 @@ func TestEmbedMemoryGrowth(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer e.Close()
+	bk := e.bk.(*mlxc.Backend) // MLX-only test (build-tagged); safe assertion
 
 	clear := os.Getenv("MLX_CLEAR") == "1"
 	if os.Getenv("MLX_CACHE_LIMIT") != "" {
-		e.bk.SetCacheLimit(0) // disable cache entirely
+		bk.SetCacheLimit(0) // disable cache entirely
 		t.Log("cache limit set to 0 (caching disabled)")
 	}
 
@@ -35,15 +43,15 @@ func TestEmbedMemoryGrowth(t *testing.T) {
 		txt := strings.Repeat(base, 1+(i%40))
 		_ = e.Embed(txt)
 		if clear {
-			e.bk.ClearCache()
+			bk.ClearCache()
 		}
 		if i%30 == 0 {
 			t.Logf("iter=%3d  active=%6.0fMB  cache=%6.0fMB  peak=%6.0fMB",
-				i, e.bk.ActiveMemoryMB(), e.bk.CacheMemoryMB(), e.bk.PeakMemoryMB())
+				i, bk.ActiveMemoryMB(), bk.CacheMemoryMB(), bk.PeakMemoryMB())
 		}
 	}
 	t.Logf("FINAL     active=%6.0fMB  cache=%6.0fMB  peak=%6.0fMB",
-		e.bk.ActiveMemoryMB(), e.bk.CacheMemoryMB(), e.bk.PeakMemoryMB())
+		bk.ActiveMemoryMB(), bk.CacheMemoryMB(), bk.PeakMemoryMB())
 }
 
 func bgeDir(t *testing.T) string {
