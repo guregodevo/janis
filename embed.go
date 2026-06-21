@@ -5,7 +5,6 @@ import (
 
 	"memdoor/llm/bge"
 	"memdoor/llm/engine"
-	"memdoor/llm/mlxc"
 	"memdoor/llm/safetensors"
 	"memdoor/llm/tokenizer"
 )
@@ -15,7 +14,7 @@ import (
 // the gateway needs no separate embedding server. Safe for concurrent callers
 // (work is serialized internally; the MLX backend is single-threaded).
 type Embedder struct {
-	bk     *mlxc.Backend
+	bk     engine.Backend
 	model  *bge.Model
 	tok    *tokenizer.Tokenizer
 	dim    int
@@ -29,8 +28,8 @@ func OpenEmbedder(modelDir string) (*Embedder, error) {
 	if err != nil {
 		return nil, err
 	}
-	e := &Embedder{bk: mlxc.New(), dim: cfg.Hidden, maxTok: cfg.MaxPos - 2}
-	var b engine.Backend = e.bk
+	e := &Embedder{bk: newBackend(), dim: cfg.Hidden, maxTok: cfg.MaxPos - 2}
+	b := e.bk
 
 	st, err := safetensors.Open(filepath.Join(modelDir, "model.safetensors"))
 	if err != nil {
@@ -39,7 +38,7 @@ func OpenEmbedder(modelDir string) (*Embedder, error) {
 	if e.model, err = bge.LoadModel(b, st, cfg); err != nil {
 		return nil, err
 	}
-	e.bk.PinAll() // protect the weights across requests
+	pinAll(e.bk) // protect the weights across requests
 
 	if e.tok, err = tokenizer.New(modelDir); err != nil {
 		return nil, err
@@ -74,7 +73,7 @@ func (e *Embedder) embedLocked(text string) []float32 {
 		ids = ids[:e.maxTok]
 	}
 	vec := e.model.Embed(e.bk, ids) // Floats copies to host before we sweep
-	e.bk.Sweep()                    // free this call's transient arrays
+	sweep(e.bk)                     // free this call's transient arrays
 	return vec
 }
 

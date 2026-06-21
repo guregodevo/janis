@@ -7,7 +7,6 @@ import (
 	"strconv"
 
 	"memdoor/llm/engine"
-	"memdoor/llm/mlxc"
 	"memdoor/llm/reranker"
 	"memdoor/llm/safetensors"
 	"memdoor/llm/tokenizer"
@@ -40,7 +39,7 @@ func rerankMaxTokEnv() int {
 // the bi-encoder cosine (Embedder), so it both reorders candidates and exposes
 // "nothing actually answers this" gaps. Serialized through the shared MLX lock.
 type Reranker struct {
-	bk     *mlxc.Backend
+	bk     engine.Backend
 	model  *reranker.Model
 	tok    *tokenizer.Tokenizer
 	maxTok int
@@ -61,8 +60,8 @@ func OpenReranker(modelDir string) (*Reranker, error) {
 	if cap := rerankMaxTokEnv(); cap > 0 && cap-4 < maxTok {
 		maxTok = cap - 4
 	}
-	r := &Reranker{bk: mlxc.New(), maxTok: maxTok}
-	var b engine.Backend = r.bk
+	r := &Reranker{bk: newBackend(), maxTok: maxTok}
+	b := r.bk
 	st, err := safetensors.Open(filepath.Join(modelDir, "model.safetensors"))
 	if err != nil {
 		return nil, err
@@ -70,7 +69,7 @@ func OpenReranker(modelDir string) (*Reranker, error) {
 	if r.model, err = reranker.LoadModel(b, st, cfg); err != nil {
 		return nil, err
 	}
-	r.bk.PinAll()
+	pinAll(r.bk)
 	if r.tok, err = tokenizer.New(modelDir); err != nil {
 		return nil, err
 	}
@@ -82,7 +81,7 @@ func (r *Reranker) Score(query, passage string) float32 {
 	mlxComputeMu.Lock()
 	defer mlxComputeMu.Unlock()
 	s := r.scoreLocked(query, passage)
-	r.bk.Sweep()
+	sweep(r.bk)
 	return s
 }
 
@@ -96,7 +95,7 @@ func (r *Reranker) Rank(query string, passages []string) (order []int, scores []
 	for i, p := range passages {
 		scores[i] = r.scoreLocked(query, p)
 		order[i] = i
-		r.bk.Sweep()
+		sweep(r.bk)
 	}
 	sort.SliceStable(order, func(a, b int) bool { return scores[order[a]] > scores[order[b]] })
 	return order, scores

@@ -10,7 +10,6 @@ import (
 	"memdoor/llm/chat"
 	"memdoor/llm/engine"
 	"memdoor/llm/gemma"
-	"memdoor/llm/mlxc"
 	"memdoor/llm/qwen"
 	"memdoor/llm/safetensors"
 	"memdoor/llm/tokenizer"
@@ -34,7 +33,7 @@ type sessionMaker interface {
 // Engine is a loaded model + tokenizer with a persistent prefix-reusing session.
 // It is safe for concurrent callers (generation is serialized internally).
 type Engine struct {
-	bk *mlxc.Backend
+	bk engine.Backend
 	// session is the main conversational session (prefix-reused across an
 	// agent's turns). utilSession serves one-off utility generations — query
 	// reformulation, wiki summarize/synthesize — so they don't overwrite the
@@ -54,8 +53,8 @@ func Open(modelDir string) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	e := &Engine{bk: mlxc.New(), mtype: cfg.ModelType, stops: map[int32]bool{}}
-	var b engine.Backend = e.bk
+	e := &Engine{bk: newBackend(), mtype: cfg.ModelType, stops: map[int32]bool{}}
+	b := e.bk
 
 	st, err := safetensors.Open(filepath.Join(modelDir, "model.safetensors"))
 	if err != nil {
@@ -78,7 +77,7 @@ func Open(modelDir string) (*Engine, error) {
 	default:
 		return nil, fmt.Errorf("unsupported model_type %q", cfg.ModelType)
 	}
-	e.bk.PinAll() // protect the weights across requests
+	pinAll(e.bk) // protect the weights across requests (no-op on GC backends)
 	e.session = sm.NewSession()
 	e.utilSession = sm.NewSession()
 
