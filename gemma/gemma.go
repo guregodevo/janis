@@ -80,8 +80,8 @@ func (a *Attention) forward(b engine.Backend, x engine.Tensor, cache *qwen.KVCac
 	k = b.ExpandDims(k, 2) // [B, n_kv, 1, T, hd]
 	v = b.ExpandDims(v, 2)
 
-	kT := b.Transpose(k, 0, 1, 2, 4, 3)            // [B, n_kv, 1, hd, T]
-	scores := b.MatMul(q, kT)                      // [B, n_kv, repeats, L, T]
+	kT := b.Transpose(k, 0, 1, 2, 4, 3) // [B, n_kv, 1, hd, T]
+	scores := b.MatMul(q, kT)           // [B, n_kv, repeats, L, T]
 	scores = b.ScalarMul(b.Tanh(b.ScalarMul(scores, 1.0/a.Softcap)), a.Softcap)
 	if mask != nil {
 		scores = b.Add(scores, mask)

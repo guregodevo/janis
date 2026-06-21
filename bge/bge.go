@@ -111,12 +111,12 @@ func (e *embeddings) forward(b engine.Backend, ids []int32) engine.Tensor {
 }
 
 type encoderLayer struct {
-	q, k, v, attnOut   *linear
-	attnLNW, attnLNB   engine.Tensor
-	inter, out         *linear
-	outLNW, outLNB     engine.Tensor
-	nHeads, headDim    int
-	eps, scale         float32
+	q, k, v, attnOut *linear
+	attnLNW, attnLNB engine.Tensor
+	inter, out       *linear
+	outLNW, outLNB   engine.Tensor
+	nHeads, headDim  int
+	eps, scale       float32
 }
 
 func (l *encoderLayer) forward(b engine.Backend, x engine.Tensor) engine.Tensor {

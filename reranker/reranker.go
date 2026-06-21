@@ -133,11 +133,11 @@ func geluExact(b engine.Backend, x engine.Tensor) engine.Tensor {
 
 // Model is a bge cross-encoder reranker.
 type Model struct {
-	emb            *embeddings
-	layers         []*encoderLayer
-	clsDense       *linear // classifier.dense  (hidden -> hidden), then tanh
-	clsOut         *linear // classifier.out_proj (hidden -> 1)
-	cfg            Config
+	emb      *embeddings
+	layers   []*encoderLayer
+	clsDense *linear // classifier.dense  (hidden -> hidden), then tanh
+	clsOut   *linear // classifier.out_proj (hidden -> 1)
+	cfg      Config
 }
 
 func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, error) {
@@ -210,10 +210,10 @@ func (m *Model) Score(b engine.Backend, ids []int32) float32 {
 	}
 	// XLMRobertaClassificationHead: take the <s>/[CLS] token (position 0),
 	// dense -> tanh -> out_proj -> single logit.
-	cls := b.Slice(h, 1, 0, 1)                 // [1, 1, hidden]
-	cls = b.Reshape(cls, 1, m.cfg.Hidden)      // [1, hidden]
-	d := b.Tanh(m.clsDense.forward(b, cls))    // dense + tanh
-	logit := m.clsOut.forward(b, d)            // -> [1, 1]
+	cls := b.Slice(h, 1, 0, 1)              // [1, 1, hidden]
+	cls = b.Reshape(cls, 1, m.cfg.Hidden)   // [1, hidden]
+	d := b.Tanh(m.clsDense.forward(b, cls)) // dense + tanh
+	logit := m.clsOut.forward(b, d)         // -> [1, 1]
 	return b.Floats(logit)[0]
 }
 

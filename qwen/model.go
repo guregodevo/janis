@@ -254,7 +254,7 @@ func GreedyGenerate(b engine.Backend, prompt []int32, nGen, nLayers int, forward
 		old := cacheTensors(caches)
 
 		logits = forward(b, tokT, 1, offset, caches) // [1,1,vocab]
-		tokT = b.Reshape(b.Argmax(logits, 2), 1)              // device [1] token
+		tokT = b.Reshape(b.Argmax(logits, 2), 1)     // device [1] token
 		devToks = append(devToks, tokT)
 		offset++
 

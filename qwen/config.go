@@ -40,21 +40,21 @@ type Config struct {
 
 // rawConfig mirrors the HF config.json fields we consume.
 type rawConfig struct {
-	ModelType         string  `json:"model_type"`
-	HiddenSize        int     `json:"hidden_size"`
-	NumHiddenLayers   int     `json:"num_hidden_layers"`
-	NumAttentionHeads int     `json:"num_attention_heads"`
-	NumKeyValueHeads  int     `json:"num_key_value_heads"`
-	HeadDim           int     `json:"head_dim"`
-	VocabSize         int     `json:"vocab_size"`
-	IntermediateSize  int     `json:"intermediate_size"`
-	RopeTheta         float64 `json:"rope_theta"`
-	RMSNormEps        float64 `json:"rms_norm_eps"`
+	ModelType             string          `json:"model_type"`
+	HiddenSize            int             `json:"hidden_size"`
+	NumHiddenLayers       int             `json:"num_hidden_layers"`
+	NumAttentionHeads     int             `json:"num_attention_heads"`
+	NumKeyValueHeads      int             `json:"num_key_value_heads"`
+	HeadDim               int             `json:"head_dim"`
+	VocabSize             int             `json:"vocab_size"`
+	IntermediateSize      int             `json:"intermediate_size"`
+	RopeTheta             float64         `json:"rope_theta"`
+	RMSNormEps            float64         `json:"rms_norm_eps"`
 	TieWordEmbeddings     *bool           `json:"tie_word_embeddings"`
 	EosTokenID            json.RawMessage `json:"eos_token_id"`
-	AttnLogitSoftcapping  float64 `json:"attn_logit_softcapping"`
-	FinalLogitSoftcapping float64 `json:"final_logit_softcapping"`
-	QueryPreAttnScalar    float64 `json:"query_pre_attn_scalar"`
+	AttnLogitSoftcapping  float64         `json:"attn_logit_softcapping"`
+	FinalLogitSoftcapping float64         `json:"final_logit_softcapping"`
+	QueryPreAttnScalar    float64         `json:"query_pre_attn_scalar"`
 	RopeScaling           *struct {
 		RopeType                      string  `json:"rope_type"`
 		Factor                        float64 `json:"factor"`
@@ -90,18 +90,18 @@ func LoadConfig(modelDir string) (Config, error) {
 	tie := r.TieWordEmbeddings == nil || *r.TieWordEmbeddings
 
 	cfg := Config{
-		ModelType:         r.ModelType,
-		Hidden:            r.HiddenSize,
-		Layers:            r.NumHiddenLayers,
-		NHeads:            r.NumAttentionHeads,
-		NKVHeads:          nkv,
-		HeadDim:           headDim,
-		Vocab:             r.VocabSize,
-		Intermediate:      r.IntermediateSize,
-		RopeBase:          float32(r.RopeTheta),
-		RMSEps:            float32(r.RMSNormEps),
-		GroupSize:         r.Quantization.GroupSize,
-		Bits:              r.Quantization.Bits,
+		ModelType:          r.ModelType,
+		Hidden:             r.HiddenSize,
+		Layers:             r.NumHiddenLayers,
+		NHeads:             r.NumAttentionHeads,
+		NKVHeads:           nkv,
+		HeadDim:            headDim,
+		Vocab:              r.VocabSize,
+		Intermediate:       r.IntermediateSize,
+		RopeBase:           float32(r.RopeTheta),
+		RMSEps:             float32(r.RMSNormEps),
+		GroupSize:          r.Quantization.GroupSize,
+		Bits:               r.Quantization.Bits,
 		TieWordEmbeddings:  tie,
 		AttentionBias:      r.ModelType == "qwen2", // qwen2 always has q/k/v bias
 		QKNorm:             r.ModelType == "qwen3",
