@@ -184,6 +184,47 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 	outShape := append(append([]int(nil), tx.shape[:len(tx.shape)-1]...), outDim)
 	y := newTensor(engine.F32, outShape...)
 
+	// Decode fast path (rows == 1): the dominant cost at generation time. Walk
+	// the packed words sequentially (no per-element i/valsPerWord div+mod), unpack
+	// a whole word at a time, and fuse the dequant into the dot WITHOUT a wbuf
+	// round-trip. scale/bias are constant per group, so within a group accumulate
+	// sum(x·q) and sum(x) once and combine — turning the per-element
+	// (q*scale+bias)*x into one scale-mul + one bias-mul per group. Requires
+	// groupSize to be a multiple of valsPerWord (always true: groupSize∈{32,64,128},
+	// valsPerWord∈{8,4,2}); otherwise fall through to the general path below.
+	if rows == 1 && groupSize%valsPerWord == 0 {
+		x0 := tx.data
+		wordsPerGroup := groupSize / valsPerWord
+		parallelFor(outDim, func(os, oe int) {
+			for o := os; o < oe; o++ {
+				wp, sBase := o*P, o*G
+				var acc float32
+				xi := 0
+				for g := 0; g < G; g++ {
+					s, bb := ts.data[sBase+g], tb.data[sBase+g]
+					var sumXQ, sumX float32
+					for wc := 0; wc < wordsPerGroup; wc++ {
+						word := tw.u32[wp]
+						wp++
+						sh := uint(0)
+						for v := 0; v < valsPerWord; v++ {
+							xv := x0[xi]
+							xi++
+							sumXQ += xv * float32((word>>sh)&mask)
+							sumX += xv
+							sh += uint(bits)
+						}
+					}
+					acc += s*sumXQ + bb*sumX
+				}
+				y.data[o] = acc
+			}
+		})
+		return y
+	}
+
+	// General/prefill path (rows > 1): unpack each weight row once into a reused
+	// buffer and dot it against every x row, amortizing the unpack across the batch.
 	parallelFor(outDim, func(os, oe int) {
 		wbuf := make([]float32, in) // reused across channels in this chunk
 		for o := os; o < oe; o++ {

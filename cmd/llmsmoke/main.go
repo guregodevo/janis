@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
+	"time"
 
 	"memdoor/llm"
 )
@@ -45,8 +47,22 @@ func main() {
 	defer eng.Close()
 	fmt.Println("loaded:", eng.ModelType())
 
+	// MEMDOOR_CPUPROFILE=path writes a CPU profile around the generation.
+	if p := os.Getenv("MEMDOOR_CPUPROFILE"); p != "" {
+		f, ferr := os.Create(p)
+		if ferr != nil {
+			panic(ferr)
+		}
+		_ = pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
+
+	start := time.Now()
 	reply := eng.Chat([]llm.Message{
 		{Role: "user", Content: prompt},
 	}, llm.Options{Temp: 0, MaxTokens: 32})
-	fmt.Println("REPLY:", reply)
+	dur := time.Since(start)
+	ntok := eng.NumTokens(reply)
+	fmt.Printf("REPLY: %s\n", reply)
+	fmt.Printf("[%d tok in %.1fs → %.2f tok/s]\n", ntok, dur.Seconds(), float64(ntok)/dur.Seconds())
 }

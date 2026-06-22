@@ -138,11 +138,19 @@ func TestCPUMatchesMLX(t *testing.T) {
 		c.Floats(c.Dequantize(cW, cS, cB, gs, bits)),
 		m.Floats(m.Dequantize(mW, mS, mB, gs, bits)))
 
-	// QuantMatmul transpose=true (QuantizedLinear): x[3,128] @ Wᵀ -> [3,8]
+	// QuantMatmul transpose=true (QuantizedLinear): x[3,128] @ Wᵀ -> [3,8].
+	// rows=3 exercises the general/prefill path.
 	xq := rnd(3 * in)
-	diffOK(t, "QuantMatmul", tol,
+	diffOK(t, "QuantMatmul(M=3,prefill)", tol,
 		c.Floats(c.QuantMatmul(c.FromFloats(xq, 3, in), cW, cS, cB, true, gs, bits)),
 		m.Floats(m.QuantMatmul(m.FromFloats(xq, 3, in), mW, mS, mB, true, gs, bits)))
+
+	// rows=1 exercises the DECODE fast path (the fused, word-at-a-time loop) —
+	// the hot path at generation time. Must match MLX too.
+	xq1 := rnd(in)
+	diffOK(t, "QuantMatmul(M=1,decode)", tol,
+		c.Floats(c.QuantMatmul(c.FromFloats(xq1, 1, in), cW, cS, cB, true, gs, bits)),
+		m.Floats(m.QuantMatmul(m.FromFloats(xq1, 1, in), mW, mS, mB, true, gs, bits)))
 
 	// Quantized embedding lookup: gather packed rows (TakeAxis over U32) +
 	// per-row scales/biases, then dequantize — the QuantEmbedding.Forward path.
