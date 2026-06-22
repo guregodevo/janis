@@ -202,12 +202,55 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 		// below handles any other bit width.
 		if bits == 4 {
 			parWork(outDim, in, func(os, oe int) {
-				for o := os; o < oe; o++ {
+				o := os
+				// 4-channel register blocking: process four output channels per
+				// pass. x is loaded ONCE and reused across all four, and sumX (the
+				// per-group Σx) is identical for every channel so it's computed
+				// once and shared — only the four sumXQ accumulators differ. Four
+				// independent chains also give the CPU plenty of ILP. The dominant
+				// decode cost is this loop, so the x-reuse + shared-sumX is the win.
+				for ; o+4 <= oe; o += 4 {
+					wp0, wp1, wp2, wp3 := o*P, (o+1)*P, (o+2)*P, (o+3)*P
+					sB0, sB1, sB2, sB3 := o*G, (o+1)*G, (o+2)*G, (o+3)*G
+					var acc0, acc1, acc2, acc3 float32
+					xi := 0
+					for g := 0; g < G; g++ {
+						var q0, q1, q2, q3, sx float32
+						for wc := 0; wc < wordsPerGroup; wc++ {
+							w0, w1 := tw.u32[wp0], tw.u32[wp1]
+							w2, w3 := tw.u32[wp2], tw.u32[wp3]
+							wp0++
+							wp1++
+							wp2++
+							wp3++
+							x := x0[xi : xi+8 : xi+8]
+							xi += 8
+							a0, a1, a2, a3 := x[0], x[1], x[2], x[3]
+							a4, a5, a6, a7 := x[4], x[5], x[6], x[7]
+							q0 += a0*float32(w0&0xF) + a1*float32((w0>>4)&0xF) + a2*float32((w0>>8)&0xF) + a3*float32((w0>>12)&0xF) +
+								a4*float32((w0>>16)&0xF) + a5*float32((w0>>20)&0xF) + a6*float32((w0>>24)&0xF) + a7*float32((w0>>28)&0xF)
+							q1 += a0*float32(w1&0xF) + a1*float32((w1>>4)&0xF) + a2*float32((w1>>8)&0xF) + a3*float32((w1>>12)&0xF) +
+								a4*float32((w1>>16)&0xF) + a5*float32((w1>>20)&0xF) + a6*float32((w1>>24)&0xF) + a7*float32((w1>>28)&0xF)
+							q2 += a0*float32(w2&0xF) + a1*float32((w2>>4)&0xF) + a2*float32((w2>>8)&0xF) + a3*float32((w2>>12)&0xF) +
+								a4*float32((w2>>16)&0xF) + a5*float32((w2>>20)&0xF) + a6*float32((w2>>24)&0xF) + a7*float32((w2>>28)&0xF)
+							q3 += a0*float32(w3&0xF) + a1*float32((w3>>4)&0xF) + a2*float32((w3>>8)&0xF) + a3*float32((w3>>12)&0xF) +
+								a4*float32((w3>>16)&0xF) + a5*float32((w3>>20)&0xF) + a6*float32((w3>>24)&0xF) + a7*float32((w3>>28)&0xF)
+							sx += a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7
+						}
+						acc0 += ts.data[sB0+g]*q0 + tb.data[sB0+g]*sx
+						acc1 += ts.data[sB1+g]*q1 + tb.data[sB1+g]*sx
+						acc2 += ts.data[sB2+g]*q2 + tb.data[sB2+g]*sx
+						acc3 += ts.data[sB3+g]*q3 + tb.data[sB3+g]*sx
+					}
+					y.data[o], y.data[o+1], y.data[o+2], y.data[o+3] = acc0, acc1, acc2, acc3
+				}
+				// Remainder channels (outDim not a multiple of 4): single channel,
+				// dual-lane to keep some ILP.
+				for ; o < oe; o++ {
 					wp, sBase := o*P, o*G
 					var acc float32
 					xi := 0
 					for g := 0; g < G; g++ {
-						s, bb := ts.data[sBase+g], tb.data[sBase+g]
 						var xq0, xq1, sx0, sx1 float32
 						for wc := 0; wc < wordsPerGroup; wc++ {
 							word := tw.u32[wp]
@@ -223,7 +266,7 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 							sx0 += a0 + a2 + a4 + a6
 							sx1 += a1 + a3 + a5 + a7
 						}
-						acc += s*(xq0+xq1) + bb*(sx0+sx1)
+						acc += ts.data[sBase+g]*(xq0+xq1) + tb.data[sBase+g]*(sx0+sx1)
 					}
 					y.data[o] = acc
 				}
