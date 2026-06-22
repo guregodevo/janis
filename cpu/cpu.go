@@ -26,7 +26,14 @@ import (
 // parallelFor splits [0,n) into one contiguous chunk per CPU and runs fn on each
 // concurrently. The hot matmuls (per output row / output channel) are
 // independent, so this is the backend's main speed lever over the naive
-// single-threaded loops. Runs inline when n is small or there's one CPU.
+// single-threaded loops.
+//
+// A model forward fires ~100 of these per token, so the per-call sync cost
+// matters. Two things keep it low: (1) the CALLING goroutine runs the last
+// chunk itself instead of parking on Wait — it does real work during the
+// parallel region and only blocks (briefly) at the very end, removing one
+// thread park/unpark per call; (2) tiny regions run inline (parMinWork) so a
+// small op never pays goroutine-spawn + barrier overhead at all.
 func parallelFor(n int, fn func(start, end int)) {
 	if n <= 0 {
 		return
@@ -41,15 +48,34 @@ func parallelFor(n int, fn func(start, end int)) {
 	}
 	chunk := (n + workers - 1) / workers
 	var wg sync.WaitGroup
-	for start := 0; start < n; start += chunk {
+	// Spawn for every chunk EXCEPT the last; the caller runs that one inline.
+	for start := 0; start+chunk < n; start += chunk {
 		end := start + chunk
-		if end > n {
-			end = n
-		}
 		wg.Add(1)
 		go func(s, e int) { defer wg.Done(); fn(s, e) }(start, end)
 	}
+	// Last chunk on this goroutine — keeps the calling thread busy rather than
+	// parked, and by the time it finishes the workers usually have too.
+	lastStart := ((n - 1) / chunk) * chunk
+	fn(lastStart, n)
 	wg.Wait()
+}
+
+// parWork runs fn over [0,n) in parallel only when the total work (n*unit, in
+// rough flop units) is large enough to amortize the goroutine + barrier
+// overhead; otherwise it runs inline. The hot matmuls pass their inner
+// dimension as unit so a small projection stays single-threaded instead of
+// paying parallelFor's sync cost ~100×/token.
+func parWork(n, unit int, fn func(start, end int)) {
+	const parMinWork = 1 << 16 // ~65k MACs; below this, threading loses
+	if n <= 0 {
+		return
+	}
+	if n*unit < parMinWork || runtime.GOMAXPROCS(0) <= 1 {
+		fn(0, n)
+		return
+	}
+	parallelFor(n, fn)
 }
 
 // Backend is the pure-Go engine.Backend. Stateless — every op is a pure

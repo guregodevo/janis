@@ -28,8 +28,9 @@ func (b *Backend) MatMul(a, bb engine.Tensor) engine.Tensor {
 	aMat, bMat := M*K, K*N
 	// One independent task per output matrix row (flat over batch×M). The inner
 	// loop is ikj order so both B and the output row are walked sequentially —
-	// far better cache behavior than the textbook ijk dot product.
-	parallelFor(nBatch*M, func(rs, re int) {
+	// far better cache behavior than the textbook ijk dot product. Each row is
+	// K*N MACs; parWork keeps small matmuls (attention scores at decode) inline.
+	parWork(nBatch*M, K*N, func(rs, re int) {
 		for rr := rs; rr < re; rr++ {
 			bi, i := rr/M, rr%M
 			aOff := bcBatch(bi, batch, batchA)*aMat + i*K

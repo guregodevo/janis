@@ -147,7 +147,7 @@ func (b *Backend) Dequantize(w, scales, biases engine.Tensor, groupSize, bits in
 	outShape[len(outShape)-1] = in
 	out := newTensor(engine.F32, outShape...)
 
-	parallelFor(rows, func(rs, re int) {
+	parWork(rows, in, func(rs, re int) {
 		for r := rs; r < re; r++ {
 			wRow, sRow, oRow := r*P, r*G, r*in
 			for j := 0; j < in; j++ {
@@ -195,7 +195,42 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 	if rows == 1 && groupSize%valsPerWord == 0 {
 		x0 := tx.data
 		wordsPerGroup := groupSize / valsPerWord
-		parallelFor(outDim, func(os, oe int) {
+		// 4-bit is the only width the models use; specialize it. Each u32 holds 8
+		// nibbles — unroll them with constant shifts (no per-element shift/loop
+		// counter) and use TWO accumulator lanes so the float adds aren't a single
+		// dependent chain (better instruction-level parallelism). General path
+		// below handles any other bit width.
+		if bits == 4 {
+			parWork(outDim, in, func(os, oe int) {
+				for o := os; o < oe; o++ {
+					wp, sBase := o*P, o*G
+					var acc float32
+					xi := 0
+					for g := 0; g < G; g++ {
+						s, bb := ts.data[sBase+g], tb.data[sBase+g]
+						var xq0, xq1, sx0, sx1 float32
+						for wc := 0; wc < wordsPerGroup; wc++ {
+							word := tw.u32[wp]
+							wp++
+							x := x0[xi : xi+8 : xi+8]
+							xi += 8
+							a0, a1, a2, a3 := x[0], x[1], x[2], x[3]
+							a4, a5, a6, a7 := x[4], x[5], x[6], x[7]
+							xq0 += a0*float32(word&0xF) + a2*float32((word>>8)&0xF) +
+								a4*float32((word>>16)&0xF) + a6*float32((word>>24)&0xF)
+							xq1 += a1*float32((word>>4)&0xF) + a3*float32((word>>12)&0xF) +
+								a5*float32((word>>20)&0xF) + a7*float32((word>>28)&0xF)
+							sx0 += a0 + a2 + a4 + a6
+							sx1 += a1 + a3 + a5 + a7
+						}
+						acc += s*(xq0+xq1) + bb*(sx0+sx1)
+					}
+					y.data[o] = acc
+				}
+			})
+			return y
+		}
+		parWork(outDim, in, func(os, oe int) {
 			for o := os; o < oe; o++ {
 				wp, sBase := o*P, o*G
 				var acc float32
@@ -225,7 +260,7 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 
 	// General/prefill path (rows > 1): unpack each weight row once into a reused
 	// buffer and dot it against every x row, amortizing the unpack across the batch.
-	parallelFor(outDim, func(os, oe int) {
+	parWork(outDim, in*rows, func(os, oe int) {
 		wbuf := make([]float32, in) // reused across channels in this chunk
 		for o := os; o < oe; o++ {
 			wRow, sRow := o*P, o*G
