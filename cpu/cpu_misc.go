@@ -200,6 +200,18 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 		// counter) and use TWO accumulator lanes so the float adds aren't a single
 		// dependent chain (better instruction-level parallelism). General path
 		// below handles any other bit width.
+		if bits == 4 && hasQuant4SIMD {
+			// SIMD per-channel kernel (NEON on arm64). One call per output
+			// channel; x is shared. Falls back to the blocked-Go path below on
+			// arches without a kernel (incl. linux/amd64).
+			parWork(outDim, in, func(os, oe int) {
+				for o := os; o < oe; o++ {
+					v, _ := qChannel4Accel(&tw.u32[o*P], &x0[0], &ts.data[o*G], &tb.data[o*G], G, wordsPerGroup)
+					y.data[o] = v
+				}
+			})
+			return y
+		}
 		if bits == 4 {
 			parWork(outDim, in, func(os, oe int) {
 				o := os
