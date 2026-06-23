@@ -2,9 +2,18 @@
 
 package cpu
 
-// hasQuant4SIMD reports that a 4-bit per-channel SIMD kernel is available
-// (NEON here). QuantMatmul uses it for the decode path on arm64.
-const hasQuant4SIMD = true
+import "golang.org/x/sys/cpu"
+
+// Detect NEON (Advanced SIMD) at runtime. It's baseline on ARMv8 so this is
+// effectively always true, but going through the same detect-and-fall-back path
+// as amd64 keeps selection uniform and env-free, and guards the unlikely
+// no-ASIMD host instead of running an unsupported instruction.
+func init() {
+	if cpu.ARM64.HasASIMD {
+		quant4SIMD = true
+		simdName = "NEON"
+	}
+}
 
 // qChannel4Accel computes one quantized output channel (4-bit) using the NEON
 // kernel: acc = Σ_g scales[g]·(Σ x_i·q_i) + biases[g]·(Σ x_i), over `groups`

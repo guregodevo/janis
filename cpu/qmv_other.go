@@ -2,14 +2,13 @@
 
 package cpu
 
-// hasQuant4SIMD is false off arm64 — QuantMatmul uses the portable blocked-Go
-// decode path there (incl. the friend's linux/amd64).
-const hasQuant4SIMD = false
+// No init here, so quant4SIMD stays false off arm64 — QuantMatmul auto-selects
+// the portable blocked-Go decode path (incl. the friend's linux/amd64). An
+// amd64 AVX2 kernel lands as qmv_amd64.go: an init() gated on cpu.X86.HasAVX2
+// flips quant4SIMD on only when the CPU actually supports it (best-fit, no env).
 
-// qChannel4Accel has no SIMD kernel off arm64 (the friend's linux/amd64 and
-// everything else use the portable blocked-Go path in QuantMatmul). Returning
-// ok=false keeps that path the default with zero risk. An amd64 SSE/AVX kernel
-// can land here later behind its own build tag.
+// qChannel4Accel has no SIMD kernel off arm64 yet. Returning ok=false keeps the
+// blocked-Go path the default with zero risk.
 func qChannel4Accel(w *uint32, x, scales, biases *float32, groups, wordsPerGroup int) (float32, bool) {
 	return 0, false
 }

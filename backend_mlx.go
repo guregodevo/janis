@@ -27,3 +27,12 @@ func newBackend() engine.Backend {
 // Callers use this to size the model: large models are fine on a GPU but decode
 // too slowly on CPU.
 func Accelerated() bool { return os.Getenv("MEMDOOR_BACKEND") != "cpu" }
+
+// EngineInfo describes the auto-detected inference path for this host (for
+// `llm status`).
+func EngineInfo() string {
+	if os.Getenv("MEMDOOR_BACKEND") == "cpu" {
+		return "CPU backend (forced), SIMD: " + cpu.SIMDInfo()
+	}
+	return "MLX backend (Metal GPU)"
+}

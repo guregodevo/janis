@@ -200,7 +200,7 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 		// counter) and use TWO accumulator lanes so the float adds aren't a single
 		// dependent chain (better instruction-level parallelism). General path
 		// below handles any other bit width.
-		if bits == 4 && hasQuant4SIMD {
+		if bits == 4 && quant4SIMD {
 			// SIMD per-channel kernel (NEON on arm64). One call per output
 			// channel; x is shared. Falls back to the blocked-Go path below on
 			// arches without a kernel (incl. linux/amd64).
