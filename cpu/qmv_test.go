@@ -32,6 +32,9 @@ func qChannel4Ref(w []uint32, x, scales, biases []float32, groups, wordsPerGroup
 // reference over a range of shapes. On non-arm64 qChannel4Accel returns
 // ok=false and the test is a no-op (the portable Go path is used there).
 func TestQChannel4Accel(t *testing.T) {
+	// Surface which kernel is exercised so CI logs confirm AVX2 actually ran on
+	// the amd64 runner (not silently skipped).
+	t.Logf("SIMD kernel: %s", SIMDInfo())
 	r := rand.New(rand.NewSource(42))
 	shapes := []struct{ groups, wordsPerGroup int }{
 		{1, 1}, {1, 8}, {2, 8}, {4, 8}, {32, 8}, {16, 2}, {8, 16}, {3, 4},

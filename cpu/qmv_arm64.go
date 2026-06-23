@@ -24,6 +24,9 @@ func init() {
 // scales/biases at the channel's first group. The kernel walks them in lockstep
 // and never escapes (the slices outlive the call).
 func qChannel4Accel(w *uint32, x, scales, biases *float32, groups, wordsPerGroup int) (float32, bool) {
+	if !quant4SIMD {
+		return 0, false
+	}
 	return qChannel4NEON(w, x, scales, biases, groups, wordsPerGroup), true
 }
 
