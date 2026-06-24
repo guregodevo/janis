@@ -224,9 +224,15 @@ func (m *Model) GenerateSampled(b engine.Backend, prompt []int32, nGen int, p Sa
 	return SampledGenerate(b, prompt, nGen, m.Cfg.Layers, m.Cfg.Vocab, m.forwardCachedT, p)
 }
 
-// NewSession returns a prefix-reusing session for multi-turn serving.
+// NewSession returns a prefix-reusing session for multi-turn serving. MoE models
+// prefill one token at a time (PrefillChunk=1) to use the stream-free decode path
+// per token instead of a slow batched per-layer-eval pass.
 func (m *Model) NewSession() *Session {
-	return &Session{NLayers: m.Cfg.Layers, Vocab: m.Cfg.Vocab, Forward: m.forwardCachedT}
+	s := &Session{NLayers: m.Cfg.Layers, Vocab: m.Cfg.Vocab, Forward: m.forwardCachedT}
+	if m.Cfg.NumExperts > 0 {
+		s.PrefillChunk = 1
+	}
+	return s
 }
 
 // ForwardFunc computes logits [1, seqLen, vocab] for a device index tensor

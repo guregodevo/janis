@@ -37,6 +37,13 @@ type Session struct {
 	Vocab   int
 	Forward ForwardFunc
 
+	// PrefillChunk overrides the global prefill window for this session (0 = use
+	// the global default). MoE models set it to 1 so each prompt token is
+	// prefilled through the stream-free decode path (nTok==1, no per-layer eval),
+	// instead of one batched per-layer-eval pass that re-materializes ~all the
+	// prompt's experts at once — ~3x faster prefill on Qwen3-30B-A3B.
+	PrefillChunk int
+
 	IDs    []int32 // tokens currently materialized in the caches
 	Caches []*KVCache
 }
@@ -103,9 +110,13 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 	// across chunks, so the final logits are identical to a single forward — the
 	// same mechanism as incremental decode. We MUST eval+sweep each chunk, else
 	// MLX defers every chunk to one eval and the spike returns.
+	chunkSize := prefillChunk
+	if s.PrefillChunk > 0 {
+		chunkSize = s.PrefillChunk
+	}
 	var logits engine.Tensor
-	for i := 0; i < len(suffix); i += prefillChunk {
-		end := i + prefillChunk
+	for i := 0; i < len(suffix); i += chunkSize {
+		end := i + chunkSize
 		if end > len(suffix) {
 			end = len(suffix)
 		}
