@@ -131,23 +131,33 @@ func SampledGenerate(b engine.Backend, prompt []int32, nGen, nLayers, vocab int,
 // Model is a full Qwen2 causal LM. The output projection is the tied embedding
 // (LMHead nil) or a separate quantized lm_head.
 type Model struct {
-	Embed  *QuantEmbedding
-	Blocks []*Block
-	Norm   *RMSNorm
-	LMHead *QuantLinear // nil when embeddings are tied
-	Cfg    Config
+	Embed   *QuantEmbedding
+	Blocks  []*Block
+	Norm    *RMSNorm
+	LMHead  *QuantLinear // nil when embeddings are tied
+	Cfg     Config
+	Experts *ExpertStore // non-nil for MoE models (offloaded experts)
 }
 
+// moeExpertBudgetBytes bounds resident expert weights for MoE models. ~9 GB
+// leaves room for non-expert weights + KV + activations inside 16 GB.
+const moeExpertBudgetBytes = 9 << 30
+
 // LoadModel loads the embedding, all decoder blocks, the final norm, and (when
-// untied) the lm_head.
+// untied) the lm_head. For MoE models it builds an ExpertStore so expert weights
+// are streamed on demand instead of loaded resident.
 func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, error) {
 	emb, err := LoadQuantEmbedding(b, st, "model.embed_tokens", cfg.GroupSize, cfg.Bits)
 	if err != nil {
 		return nil, err
 	}
+	var store *ExpertStore
+	if cfg.NumExperts > 0 {
+		store = NewExpertStore(b, st, cfg.GroupSize, cfg.Bits, moeExpertBudgetBytes)
+	}
 	blocks := make([]*Block, cfg.Layers)
 	for i := range blocks {
-		if blocks[i], err = LoadBlock(b, st, i, cfg); err != nil {
+		if blocks[i], err = LoadBlock(b, st, i, cfg, store); err != nil {
 			return nil, err
 		}
 	}
@@ -155,7 +165,7 @@ func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, erro
 	if err != nil {
 		return nil, err
 	}
-	m := &Model{Embed: emb, Blocks: blocks, Norm: norm, Cfg: cfg}
+	m := &Model{Embed: emb, Blocks: blocks, Norm: norm, Cfg: cfg, Experts: store}
 	if !cfg.TieWordEmbeddings {
 		if m.LMHead, err = LoadQuantLinear(b, st, "lm_head", cfg.GroupSize, cfg.Bits, false); err != nil {
 			return nil, err

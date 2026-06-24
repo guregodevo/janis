@@ -61,7 +61,7 @@ func Open(modelDir string) (*Engine, error) {
 	}
 	var sm sessionMaker
 	switch cfg.ModelType {
-	case "qwen2", "qwen3", "llama":
+	case "qwen2", "qwen3", "qwen3_moe", "llama":
 		m, err := qwen.LoadModel(b, st, cfg)
 		if err != nil {
 			return nil, err

@@ -35,6 +35,13 @@ type Config struct {
 	RopeFactor, RopeLowFreq, RopeHighFreq float32
 	RopeOrigMaxPos                        int
 
+	// qwen3_moe (zero/unset for dense models)
+	NumExperts      int  // 0 = dense model
+	TopK            int  // experts activated per token
+	MoeIntermediate int  // per-expert FFN width
+	SparseStep      int  // every Nth layer is MoE (1 = all)
+	NormTopk        bool // renormalize the top-k router scores
+
 	EosTokens []int32 // end-of-sequence token ids (stop tokens)
 }
 
@@ -66,6 +73,11 @@ type rawConfig struct {
 		GroupSize int `json:"group_size"`
 		Bits      int `json:"bits"`
 	} `json:"quantization"`
+	NumExperts          int   `json:"num_experts"`
+	NumExpertsPerTok    int   `json:"num_experts_per_tok"`
+	MoeIntermediateSize int   `json:"moe_intermediate_size"`
+	DecoderSparseStep   int   `json:"decoder_sparse_step"`
+	NormTopkProb        *bool `json:"norm_topk_prob"`
 }
 
 // LoadConfig reads config.json from a model directory.
@@ -104,7 +116,12 @@ func LoadConfig(modelDir string) (Config, error) {
 		Bits:               r.Quantization.Bits,
 		TieWordEmbeddings:  tie,
 		AttentionBias:      r.ModelType == "qwen2", // qwen2 always has q/k/v bias
-		QKNorm:             r.ModelType == "qwen3",
+		QKNorm:             r.ModelType == "qwen3" || r.ModelType == "qwen3_moe",
+		NumExperts:         r.NumExperts,
+		TopK:               r.NumExpertsPerTok,
+		MoeIntermediate:    r.MoeIntermediateSize,
+		SparseStep:         r.DecoderSparseStep,
+		NormTopk:           r.NormTopkProb == nil || *r.NormTopkProb,
 		AttnSoftcap:        float32(r.AttnLogitSoftcapping),
 		FinalSoftcap:       float32(r.FinalLogitSoftcapping),
 		QueryPreAttnScalar: float32(r.QueryPreAttnScalar),
