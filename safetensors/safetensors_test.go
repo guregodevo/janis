@@ -163,6 +163,49 @@ func TestShardedDuplicateTensorErrors(t *testing.T) {
 	}
 }
 
+func TestStackedRow(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "model.safetensors")
+	// 4 rows x 6 float32, values 0..23
+	vals := make([]float32, 24)
+	for i := range vals {
+		vals[i] = float32(i)
+	}
+	buf := new(bytes.Buffer)
+	_ = binary.Write(buf, binary.LittleEndian, vals)
+	writeST(t, path, map[string]tensorData{
+		"stack": {dtype: "F32", shape: []int{4, 6}, data: buf.Bytes()},
+	})
+	f, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	for row := 0; row < 4; row++ {
+		dt, shape, raw, err := f.StackedRow("stack", row)
+		if err != nil {
+			t.Fatalf("StackedRow(%d): %v", row, err)
+		}
+		if dt != "F32" || len(shape) != 1 || shape[0] != 6 {
+			t.Fatalf("row %d: dt=%s shape=%v", row, dt, shape)
+		}
+		got := make([]float32, 6)
+		_ = binary.Read(bytes.NewReader(raw), binary.LittleEndian, got)
+		for j := 0; j < 6; j++ {
+			if want := float32(row*6 + j); got[j] != want {
+				t.Errorf("row %d elem %d = %v, want %v", row, j, got[j], want)
+			}
+		}
+	}
+	if _, _, _, err := f.StackedRow("stack", 4); err == nil {
+		t.Error("expected out-of-range error for row 4")
+	}
+	if _, _, _, err := f.StackedRow("stack", -1); err == nil {
+		t.Error("expected out-of-range error for row -1")
+	}
+}
+
 func TestShardedMissingShardFile(t *testing.T) {
 	dir := t.TempDir()
 	// index references a shard file that doesn't exist on disk.

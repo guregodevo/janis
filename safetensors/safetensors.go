@@ -164,6 +164,56 @@ func (s *File) Get(name string) (dtype string, shape []int, raw []byte, err erro
 	return e.Dtype, e.Shape, buf, nil
 }
 
+// dtypeSize returns the byte width of a safetensors dtype.
+func dtypeSize(dt string) int {
+	switch dt {
+	case "F32", "I32", "U32":
+		return 4
+	case "F16", "BF16", "I16", "U16":
+		return 2
+	case "I8", "U8":
+		return 1
+	case "F64", "I64", "U64":
+		return 8
+	}
+	return 0
+}
+
+// StackedRow reads a single row (e.g. one MoE expert) out of a stacked tensor
+// [nrows, ...] WITHOUT materializing the whole stack — it seeks to that row's
+// contiguous byte range and reads only it. This is the primitive that lets the
+// expert-offload engine touch ~8 of 128 experts per token instead of all of
+// them. Returns the row's dtype, its shape (the stacked shape minus the leading
+// axis), and the raw bytes.
+func (s *File) StackedRow(name string, row int) (dtype string, rowShape []int, raw []byte, err error) {
+	e, ok := s.index[name]
+	if !ok {
+		return "", nil, nil, fmt.Errorf("tensor %q not found", name)
+	}
+	if len(e.Shape) < 2 {
+		return "", nil, nil, fmt.Errorf("tensor %q is not stacked (shape %v)", name, e.Shape)
+	}
+	if row < 0 || row >= e.Shape[0] {
+		return "", nil, nil, fmt.Errorf("row %d out of range [0,%d) for %q", row, e.Shape[0], name)
+	}
+	esz := dtypeSize(e.Dtype)
+	if esz == 0 {
+		return "", nil, nil, fmt.Errorf("unsupported dtype %q for %q", e.Dtype, name)
+	}
+	per := 1
+	for _, d := range e.Shape[1:] {
+		per *= d
+	}
+	rowBytes := int64(per * esz)
+	buf := make([]byte, rowBytes)
+	sh := s.shards[e.shard]
+	off := sh.dataStart + e.DataOffsets[0] + int64(row)*rowBytes
+	if _, err := sh.f.ReadAt(buf, off); err != nil {
+		return "", nil, nil, fmt.Errorf("read row %d of %q: %w", row, name, err)
+	}
+	return e.Dtype, append([]int(nil), e.Shape[1:]...), buf, nil
+}
+
 // Close releases every backing shard, returning the first close error.
 func (s *File) Close() error {
 	var firstErr error
