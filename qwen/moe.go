@@ -290,12 +290,19 @@ func (m *MoEBlock) Forward(b engine.Backend, x engine.Tensor) engine.Tensor {
 	scT := b.FromFloats(scores, append(append([]int{}, lead...), K, 1)...)
 	out := b.ScalarMul(b.Mean(b.Mul(d2, scT), nd-1), float32(K)) // [..lead.., hidden]
 
-	// Bound peak memory: materialize this layer's output and free its expert
-	// stacks before the next layer. Without this the MLX backend holds all 48
-	// layers' stacks until the per-step Sweep -> OOM on multi-token prefill.
-	if f, ok := b.(engine.Freer); ok {
+	// Decode (nTok==1): stream-free. Don't eval or free here — the heavy expert
+	// matmuls stay lazy and batch into the single per-token eval, so there's no
+	// per-layer GPU sync. The ~900 MB of one token's 48 stacks stays tracked and
+	// is reclaimed by the decode loop's per-step Sweep. This is the hot path.
+	//
+	// Prefill (nTok>1): the lazy graph would otherwise hold all 48 layers' large
+	// per-sequence stacks at once -> OOM. Eval per layer and free its stacks to
+	// bound peak to one layer; a one-time cost on the prompt, not the hot path.
+	if nTok > 1 {
 		b.Eval(out)
-		f.Free(gW, gS, gB, uW, uS, uB, dW, dS, dB, g, u, hh, d)
+		if f, ok := b.(engine.Freer); ok {
+			f.Free(gW, gS, gB, uW, uS, uB, dW, dS, dB, g, u, hh, d)
+		}
 	}
 	return out
 }
