@@ -91,6 +91,22 @@ func (b *Backend) Unpin(ts ...engine.Tensor) {
 	}
 }
 
+// Free immediately releases specific tensors (engine.Freer) — used to drop a
+// MoE layer's expert stacks mid-forward. Pinned tensors are left alone; freed
+// arrays are nulled so the next Sweep skips them.
+func (b *Backend) Free(ts ...engine.Tensor) {
+	for _, t := range ts {
+		if t == nil {
+			continue
+		}
+		tt := t.(*tensor)
+		if !tt.pinned && tt.arr.ctx != nil {
+			C.mlx_array_free(tt.arr)
+			tt.arr.ctx = nil
+		}
+	}
+}
+
 func (b *Backend) Sweep() {
 	kept := b.tracked[:0]
 	for _, t := range b.tracked {
@@ -509,6 +525,21 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 	C.mlx_quantized_matmul(&out, tx.arr, tw.arr, ts.arr, tb.arr, C.bool(transpose), optInt(groupSize), optInt(bits), mode, b.stream)
 	n := len(tx.shape)
 	shape := append(cloneShape(tx.shape[:n-1]), tw.shape[0])
+	return b.newT(out, shape)
+}
+
+func (b *Backend) GatherQuantMatmul(x, w, scales, biases, rhsIndices engine.Tensor, transpose bool, groupSize, bits int) engine.Tensor {
+	tx, tw, ts, tb := x.(*tensor), w.(*tensor), scales.(*tensor), biases.(*tensor)
+	tr := rhsIndices.(*tensor)
+	out := C.mlx_array_new()
+	mode := C.CString("affine")
+	defer C.free(unsafe.Pointer(mode))
+	var nullArr C.mlx_array // lhs_indices = null (no left gather)
+	C.mlx_gather_qmm(&out, tx.arr, tw.arr, ts.arr, tb.arr, nullArr, tr.arr,
+		C.bool(transpose), optInt(groupSize), optInt(bits), mode, C.bool(false), b.stream)
+	// x is [..lead.., 1, 1, in] (mlx-lm's double expand_dims); the result keeps
+	// an M=1 axis -> shape = rhsIndices.shape + [1, w.out]. w is [E, out, in_p].
+	shape := append(cloneShape(tr.shape), 1, tw.shape[1])
 	return b.newT(out, shape)
 }
 

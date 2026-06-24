@@ -167,6 +167,38 @@ func (b *Backend) Dequantize(w, scales, biases engine.Tensor, groupSize, bits in
 // unpack is amortized across the batch and NOTHING materializes the full
 // [out,in] weight or a transpose (the old dequantize-then-dense-matmul path did
 // both, every token, which dominated decode latency).
+// GatherQuantMatmul is a correct (unoptimized) fallback: loop over the selected
+// experts and QuantMatmul each. x is [B, M, Kin] (M==1 broadcasts over T),
+// w/scales/biases are stacked [E, ...], rhsIndices is [B, T]; output [B, T, out].
+func (b *Backend) GatherQuantMatmul(x, w, scales, biases, rhsIndices engine.Tensor, transpose bool, groupSize, bits int) engine.Tensor {
+	xs, ws, ss, bs := x.Shape(), w.Shape(), scales.Shape(), biases.Shape()
+	rs := rhsIndices.Shape()
+	B, M, Kin := xs[0], xs[1], xs[2]
+	outDim := ws[1]
+	T := rs[len(rs)-1]
+	idx := b.Ints(rhsIndices)
+	var rows []engine.Tensor
+	for bb := 0; bb < B; bb++ {
+		for t := 0; t < T; t++ {
+			e := int(idx[bb*T+t])
+			we := b.Reshape(b.Slice(w, 0, e, e+1), ws[1], ws[2])
+			se := b.Reshape(b.Slice(scales, 0, e, e+1), ss[1], ss[2])
+			be := b.Reshape(b.Slice(biases, 0, e, e+1), bs[1], bs[2])
+			m := t
+			if M == 1 {
+				m = 0
+			}
+			xrow := b.Reshape(b.Slice(b.Slice(x, 0, bb, bb+1), 1, m, m+1), 1, Kin)
+			rows = append(rows, b.QuantMatmul(xrow, we, se, be, transpose, groupSize, bits))
+		}
+	}
+	out := rows[0]
+	for _, r := range rows[1:] {
+		out = b.Concat(out, r, 0)
+	}
+	return b.Reshape(out, append(append([]int{}, rs...), outDim)...)
+}
+
 func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool, groupSize, bits int) engine.Tensor {
 	if !transpose {
 		// The models never hit this; keep a correct fallback.

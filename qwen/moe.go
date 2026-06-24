@@ -84,6 +84,65 @@ func (s *ExpertStore) Expert(layer int, proj string, e int) (*QuantLinear, error
 // Resident reports the current resident expert-weight byte count.
 func (s *ExpertStore) Resident() int64 { return s.bytes }
 
+// StackRaw gathers the active experts' weight/scales/biases directly from disk
+// into one stacked [K, ...] tensor per projection — reading only those experts'
+// bytes (via StackedRow) and concatenating them into a single FromRaw. Unlike
+// Stack it never materializes per-expert tensors or duplicates a resident cache,
+// so peak memory is just the transient per-token stacks (~tens of MB); hot
+// experts stay fast via the OS page cache. This is the path that fits in 16 GB.
+func (s *ExpertStore) StackRaw(layer int, proj string, experts []int) (w, sc, bi engine.Tensor, err error) {
+	base := fmt.Sprintf("model.layers.%d.mlp.switch_mlp.%s", layer, proj)
+	if w, err = s.stackTensor(base+".weight", experts); err != nil {
+		return
+	}
+	if sc, err = s.stackTensor(base+".scales", experts); err != nil {
+		return
+	}
+	bi, err = s.stackTensor(base+".biases", experts)
+	return
+}
+
+func (s *ExpertStore) stackTensor(name string, experts []int) (engine.Tensor, error) {
+	var dt string
+	var rowShape []int
+	var buf []byte
+	for _, e := range experts {
+		d, shp, raw, err := s.st.StackedRow(name, e)
+		if err != nil {
+			return nil, err
+		}
+		dt, rowShape = d, shp
+		buf = append(buf, raw...)
+	}
+	edt, err := stDType(dt)
+	if err != nil {
+		return nil, fmt.Errorf("expert %s: %w", name, err)
+	}
+	shape := append([]int{len(experts)}, rowShape...)
+	return s.b.FromRaw(edt, buf, shape...), nil
+}
+
+// Stack returns the active experts' weight/scales/biases stacked along a new
+// leading axis ([K, ...]), for one fused GatherQuantMatmul call. Per-expert
+// tensors come from the LRU cache; only the stacking is done per call.
+func (s *ExpertStore) Stack(layer int, proj string, experts []int) (w, sc, bi engine.Tensor, err error) {
+	for i, e := range experts {
+		lin, lerr := s.Expert(layer, proj, e)
+		if lerr != nil {
+			return nil, nil, nil, lerr
+		}
+		ew := s.b.ExpandDims(lin.Weight, 0)
+		es := s.b.ExpandDims(lin.Scales, 0)
+		eb := s.b.ExpandDims(lin.Biases, 0)
+		if i == 0 {
+			w, sc, bi = ew, es, eb
+		} else {
+			w, sc, bi = s.b.Concat(w, ew, 0), s.b.Concat(sc, es, 0), s.b.Concat(bi, eb, 0)
+		}
+	}
+	return w, sc, bi, nil
+}
+
 func (s *ExpertStore) load(layer int, proj string, e int) (*QuantLinear, int64, error) {
 	base := fmt.Sprintf("model.layers.%d.mlp.switch_mlp.%s", layer, proj)
 	w, wsz, err := s.tensor(base+".weight", e)
@@ -157,23 +216,27 @@ func topK(row []float32, k int) (idx []int, val []float32) {
 // hidden last). Top-k routing is done host-side (the router logits are small),
 // then only the selected experts' weights are materialized per token.
 func (m *MoEBlock) Forward(b engine.Backend, x engine.Tensor) engine.Tensor {
-	shp := x.Shape()
-	hidden := shp[len(shp)-1]
-	seq := 1
-	for _, d := range shp[:len(shp)-1] {
-		seq *= d
-	}
-	x2 := x
-	if len(shp) != 2 {
-		x2 = b.Reshape(x, seq, hidden)
+	shp := x.Shape() // [..lead.., hidden], lead is usually [1, seq]
+	nd := len(shp)
+	lead := shp[:nd-1]
+	nTok := 1
+	for _, d := range lead {
+		nTok *= d
 	}
 
-	probs := b.Softmax(m.Router.Forward(b, x2), -1) // [seq, numExperts]
+	probs := b.Softmax(m.Router.Forward(b, x), -1) // [..lead.., numExperts]
 	pf := b.Floats(probs)
 
-	var out engine.Tensor
-	for t := 0; t < seq; t++ {
-		idx, sc := topK(pf[t*m.NumExperts:(t+1)*m.NumExperts], m.TopK)
+	// Host-side top-k for every token at once. Collect the UNIQUE experts this
+	// layer touches (materialized once, not per token), the rhs index map into
+	// that unique set, and the per-(token,slot) scores.
+	K := m.TopK
+	pos := make(map[int]int)
+	var uniq []int
+	ri := make([]int32, nTok*K)
+	scores := make([]float32, nTok*K)
+	for t := 0; t < nTok; t++ {
+		idx, sc := topK(pf[t*m.NumExperts:(t+1)*m.NumExperts], K)
 		if m.NormTopk {
 			var s float32
 			for _, v := range sc {
@@ -185,37 +248,54 @@ func (m *MoEBlock) Forward(b engine.Backend, x engine.Tensor) engine.Tensor {
 				}
 			}
 		}
-		xt := b.Slice(x2, 0, t, t+1) // [1, hidden]
-		var acc engine.Tensor
 		for j, e := range idx {
-			ge, err := m.Store.Expert(m.Layer, "gate_proj", e)
-			if err != nil {
-				panic(err)
+			p, ok := pos[e]
+			if !ok {
+				p = len(uniq)
+				pos[e] = p
+				uniq = append(uniq, e)
 			}
-			ue, err := m.Store.Expert(m.Layer, "up_proj", e)
-			if err != nil {
-				panic(err)
-			}
-			de, err := m.Store.Expert(m.Layer, "down_proj", e)
-			if err != nil {
-				panic(err)
-			}
-			h := b.Mul(b.SiLU(ge.Forward(b, xt)), ue.Forward(b, xt))
-			ye := b.ScalarMul(de.Forward(b, h), sc[j]) // [1, hidden]
-			if acc == nil {
-				acc = ye
-			} else {
-				acc = b.Add(acc, ye)
-			}
-		}
-		if out == nil {
-			out = acc
-		} else {
-			out = b.Concat(out, acc, 0)
+			ri[t*K+j] = int32(p)
+			scores[t*K+j] = sc[j]
 		}
 	}
-	if len(shp) != 2 {
-		out = b.Reshape(out, shp...)
+
+	// Materialize the layer's unique experts ONCE, then one fused
+	// GatherQuantMatmul over the whole sequence per projection.
+	gW, gS, gB, err := m.Store.StackRaw(m.Layer, "gate_proj", uniq)
+	if err != nil {
+		panic(err)
+	}
+	uW, uS, uB, err := m.Store.StackRaw(m.Layer, "up_proj", uniq)
+	if err != nil {
+		panic(err)
+	}
+	dW, dS, dB, err := m.Store.StackRaw(m.Layer, "down_proj", uniq)
+	if err != nil {
+		panic(err)
+	}
+	gs, bits := m.Store.groupSize, m.Store.bits
+	hidden := shp[nd-1]
+	// mlx-lm convention: x -> [..lead.., 1, 1, hidden] (double expand); each
+	// gather_qmm yields [..lead.., K, 1, N]; squeeze the M=1 axis at the end.
+	ridx := b.FromInt32(ri, append(append([]int{}, lead...), K)...)
+	xe := b.ExpandDims(b.ExpandDims(x, nd-1), nd-1) // [..lead.., 1, 1, hidden]
+	g := b.GatherQuantMatmul(xe, gW, gS, gB, ridx, true, gs, bits) // [..lead.., K, 1, inter]
+	u := b.GatherQuantMatmul(xe, uW, uS, uB, ridx, true, gs, bits)
+	hh := b.Mul(b.SiLU(g), u)                                      // [..lead.., K, 1, inter]
+	d := b.GatherQuantMatmul(hh, dW, dS, dB, ridx, true, gs, bits) // [..lead.., K, 1, hidden]
+	// squeeze the M=1 axis -> [..lead.., K, hidden], then score-weighted sum
+	// over the K experts (axis nd-1): mean(d*scores)*K.
+	d2 := b.Reshape(d, append(append([]int{}, lead...), K, hidden)...)
+	scT := b.FromFloats(scores, append(append([]int{}, lead...), K, 1)...)
+	out := b.ScalarMul(b.Mean(b.Mul(d2, scT), nd-1), float32(K)) // [..lead.., hidden]
+
+	// Bound peak memory: materialize this layer's output and free its expert
+	// stacks before the next layer. Without this the MLX backend holds all 48
+	// layers' stacks until the per-step Sweep -> OOM on multi-token prefill.
+	if f, ok := b.(engine.Freer); ok {
+		b.Eval(out)
+		f.Free(gW, gS, gB, uW, uS, uB, dW, dS, dB, g, u, hh, d)
 	}
 	return out
 }

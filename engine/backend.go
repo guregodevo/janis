@@ -48,6 +48,16 @@ type Sweeper interface {
 	Sweep()
 }
 
+// Freer is implemented by backends that can free specific tensors immediately,
+// mid-forward, without a global Sweep. MoE expert offloading uses this to drop a
+// layer's materialized expert stacks before building the next layer's, so peak
+// memory stays at one layer instead of accumulating all of them until the
+// per-step Sweep. Optional; callers fall back to letting Sweep reclaim them.
+type Freer interface {
+	// Free immediately releases the given tensors (no-op on pinned ones).
+	Free(ts ...Tensor)
+}
+
 // Backend records a tensor graph and evaluates it. Implementations wrap a
 // kernel library; model code depends only on this interface.
 //
@@ -151,6 +161,13 @@ type Backend interface {
 	// QuantMatmul computes x @ w (w affine-quantized). With transpose=true it
 	// treats w as [out, in] (the QuantizedLinear convention) -> [..., out].
 	QuantMatmul(x, w, scales, biases Tensor, transpose bool, groupSize, bits int) Tensor
+
+	// GatherQuantMatmul is the batched MoE expert matmul: w/scales/biases are
+	// stacked [E, out, in] over experts; rhsIndices selects which expert applies
+	// to each row. Output shape is rhsIndices.shape + [out]. This is the fused
+	// op (MLX gather_qmm) that runs all of a layer's active experts in one call
+	// instead of one QuantMatmul per expert.
+	GatherQuantMatmul(x, w, scales, biases, rhsIndices Tensor, transpose bool, groupSize, bits int) Tensor
 
 	// Floats evaluates t (forcing the graph) and copies its data out.
 	Floats(t Tensor) []float32

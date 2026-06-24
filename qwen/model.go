@@ -139,9 +139,10 @@ type Model struct {
 	Experts *ExpertStore // non-nil for MoE models (offloaded experts)
 }
 
-// moeExpertBudgetBytes bounds resident expert weights for MoE models. ~9 GB
-// leaves room for non-expert weights + KV + activations inside 16 GB.
-const moeExpertBudgetBytes = 9 << 30
+// moeExpertBudgetBytes bounds resident expert weights for MoE models. ~6 GB
+// leaves room for non-expert weights + KV + activations + the per-token
+// gathered expert stacks inside 16 GB.
+const moeExpertBudgetBytes = 6 << 30
 
 // LoadModel loads the embedding, all decoder blocks, the final norm, and (when
 // untied) the lm_head. For MoE models it builds an ExpertStore so expert weights
