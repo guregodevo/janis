@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/pprof"
+	"strconv"
 	"time"
 
 	"memdoor/llm"
@@ -57,10 +58,16 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
+	maxTok := 32
+	if v := os.Getenv("MEMDOOR_MAXTOK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxTok = n
+		}
+	}
 	start := time.Now()
 	reply := eng.Chat([]llm.Message{
 		{Role: "user", Content: prompt},
-	}, llm.Options{Temp: 0, MaxTokens: 32})
+	}, llm.Options{Temp: 0, MaxTokens: maxTok})
 	dur := time.Since(start)
 	ntok := eng.NumTokens(reply)
 	fmt.Printf("REPLY: %s\n", reply)
