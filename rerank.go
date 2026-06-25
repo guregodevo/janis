@@ -2,7 +2,6 @@ package llm
 
 import (
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 
@@ -62,7 +61,7 @@ func OpenReranker(modelDir string) (*Reranker, error) {
 	}
 	r := &Reranker{bk: newBackend(), maxTok: maxTok}
 	b := r.bk
-	st, err := safetensors.Open(filepath.Join(modelDir, "model.safetensors"))
+	st, err := safetensors.OpenModel(modelDir)
 	if err != nil {
 		return nil, err
 	}

@@ -1,8 +1,6 @@
 package llm
 
 import (
-	"path/filepath"
-
 	"memdoor/llm/bge"
 	"memdoor/llm/engine"
 	"memdoor/llm/safetensors"
@@ -31,7 +29,7 @@ func OpenEmbedder(modelDir string) (*Embedder, error) {
 	e := &Embedder{bk: newBackend(), dim: cfg.Hidden, maxTok: cfg.MaxPos - 2}
 	b := e.bk
 
-	st, err := safetensors.Open(filepath.Join(modelDir, "model.safetensors"))
+	st, err := safetensors.OpenModel(modelDir)
 	if err != nil {
 		return nil, err
 	}

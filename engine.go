@@ -5,7 +5,6 @@ package llm
 
 import (
 	"fmt"
-	"path/filepath"
 
 	"memdoor/llm/chat"
 	"memdoor/llm/engine"
@@ -56,7 +55,7 @@ func Open(modelDir string) (*Engine, error) {
 	e := &Engine{bk: newBackend(), mtype: cfg.ModelType, stops: map[int32]bool{}}
 	b := e.bk
 
-	st, err := safetensors.Open(filepath.Join(modelDir, "model.safetensors"))
+	st, err := safetensors.OpenModel(modelDir)
 	if err != nil {
 		return nil, err
 	}
