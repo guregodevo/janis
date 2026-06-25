@@ -326,7 +326,9 @@ func (b *Backend) Reshape(x engine.Tensor, shape ...int) engine.Tensor {
 	if neg >= 0 {
 		out[neg] = len(tx.data) / prod
 	}
-	return &tensor{shape: out, data: tx.data, dt: tx.dt}
+	// Carry the packed u32 buffer through for quantized tensors; reshape only
+	// relabels axes, so the same words/mirror back the result.
+	return &tensor{shape: out, data: tx.data, u32: tx.u32, dt: tx.dt}
 }
 
 func (b *Backend) ExpandDims(x engine.Tensor, axis int) engine.Tensor {
@@ -338,7 +340,9 @@ func (b *Backend) ExpandDims(x engine.Tensor, axis int) engine.Tensor {
 	ns = append(ns, tx.shape[:axis]...)
 	ns = append(ns, 1)
 	ns = append(ns, tx.shape[axis:]...)
-	return &tensor{shape: ns, data: tx.data, dt: tx.dt}
+	// Inserting a length-1 axis doesn't move data; carry the packed u32 buffer
+	// through so quantized weights survive (the MoE Stack path expands experts).
+	return &tensor{shape: ns, data: tx.data, u32: tx.u32, dt: tx.dt}
 }
 
 func (b *Backend) Softmax(x engine.Tensor, axis int) engine.Tensor {

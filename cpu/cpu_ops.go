@@ -220,7 +220,7 @@ func (b *Backend) Slice(x engine.Tensor, axis, start, end int) engine.Tensor {
 	}
 	ns := append([]int(nil), tx.shape...)
 	ns[axis] = end - start
-	out := newTensor(engine.F32, ns...)
+	out := newTensor(tx.dt, ns...)
 	outer := 1
 	for i := 0; i < axis; i++ {
 		outer *= tx.shape[i]
@@ -233,6 +233,16 @@ func (b *Backend) Slice(x engine.Tensor, axis, start, end int) engine.Tensor {
 	dstBlk := (end - start) * inner
 	for o := 0; o < outer; o++ {
 		copy(out.data[o*dstBlk:], tx.data[o*srcBlk+start*inner:o*srcBlk+end*inner])
+	}
+	// Quantized (U32) tensors keep their exact packed words in u32, parallel to
+	// data with identical shape/indexing; slice that buffer with the same block
+	// layout or the quant path reads an empty slice. The MoE expert gather slices
+	// stacked quant weights through here.
+	if tx.u32 != nil {
+		out.u32 = make([]uint32, len(out.data))
+		for o := 0; o < outer; o++ {
+			copy(out.u32[o*dstBlk:], tx.u32[o*srcBlk+start*inner:o*srcBlk+end*inner])
+		}
 	}
 	return out
 }

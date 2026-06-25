@@ -167,36 +167,66 @@ func (b *Backend) Dequantize(w, scales, biases engine.Tensor, groupSize, bits in
 // unpack is amortized across the batch and NOTHING materializes the full
 // [out,in] weight or a transpose (the old dequantize-then-dense-matmul path did
 // both, every token, which dominated decode latency).
-// GatherQuantMatmul is a correct (unoptimized) fallback: loop over the selected
-// experts and QuantMatmul each. x is [B, M, Kin] (M==1 broadcasts over T),
-// w/scales/biases are stacked [E, ...], rhsIndices is [B, T]; output [B, T, out].
+// GatherQuantMatmul is a correct (unoptimized) fallback for mlx's gather_qmm,
+// matching the convention MoEBlock.Forward uses: x is [..lead.., 1, 1, in]
+// (mlx-lm's double expand_dims, so one input vector per lead position),
+// rhsIndices is [..lead.., K] selecting K experts out of the stacked
+// w/scales/biases ([E, out, *]); output is [..lead.., K, 1, out]. Output slots
+// are grouped by expert so each expert's weight is dequantized once (inside one
+// QuantMatmul) and dotted against every token routed to it — amortizing the
+// dequant across the batch without materializing a dense expert.
 func (b *Backend) GatherQuantMatmul(x, w, scales, biases, rhsIndices engine.Tensor, transpose bool, groupSize, bits int) engine.Tensor {
 	xs, ws, ss, bs := x.Shape(), w.Shape(), scales.Shape(), biases.Shape()
 	rs := rhsIndices.Shape()
-	B, M, Kin := xs[0], xs[1], xs[2]
+	in := xs[len(xs)-1]
 	outDim := ws[1]
-	T := rs[len(rs)-1]
+	E := ws[0]
+	K := rs[len(rs)-1]
 	idx := b.Ints(rhsIndices)
-	var rows []engine.Tensor
-	for bb := 0; bb < B; bb++ {
-		for t := 0; t < T; t++ {
-			e := int(idx[bb*T+t])
-			we := b.Reshape(b.Slice(w, 0, e, e+1), ws[1], ws[2])
-			se := b.Reshape(b.Slice(scales, 0, e, e+1), ss[1], ss[2])
-			be := b.Reshape(b.Slice(biases, 0, e, e+1), bs[1], bs[2])
-			m := t
-			if M == 1 {
-				m = 0
+	nLead := 1
+	for _, d := range rs[:len(rs)-1] {
+		nLead *= d
+	}
+	// x is [..lead.., A, 1, in]: A==1 broadcasts one input vector across all K
+	// experts (gate/up projections), A==K aligns a distinct vector per expert
+	// slot (down projection, where x is the per-slot hidden state).
+	A := xs[len(xs)-3]
+	xt := as(x)
+	out := newTensor(engine.F32, append(append([]int{}, rs...), 1, outDim)...)
+
+	// Bucket the (lead, slot) output positions by the expert they route to.
+	type slot struct{ src, dst int } // offsets into xt.data and out.data
+	byExpert := make([][]slot, E)
+	for l := 0; l < nLead; l++ {
+		for k := 0; k < K; k++ {
+			a := 0
+			if A != 1 {
+				a = k
 			}
-			xrow := b.Reshape(b.Slice(b.Slice(x, 0, bb, bb+1), 1, m, m+1), 1, Kin)
-			rows = append(rows, b.QuantMatmul(xrow, we, se, be, transpose, groupSize, bits))
+			e := int(idx[l*K+k])
+			byExpert[e] = append(byExpert[e], slot{src: (l*A + a) * in, dst: (l*K + k) * outDim})
 		}
 	}
-	out := rows[0]
-	for _, r := range rows[1:] {
-		out = b.Concat(out, r, 0)
+	for e, slots := range byExpert {
+		if len(slots) == 0 {
+			continue
+		}
+		// Slice this expert out of the stack once (relies on Slice/Reshape carrying
+		// the packed u32 buffer), gather its tokens into one [R, in] batch, and run
+		// a single QuantMatmul.
+		we := b.Reshape(b.Slice(w, 0, e, e+1), ws[1], ws[2])
+		se := b.Reshape(b.Slice(scales, 0, e, e+1), ss[1], ss[2])
+		be := b.Reshape(b.Slice(biases, 0, e, e+1), bs[1], bs[2])
+		xb := make([]float32, len(slots)*in)
+		for i, s := range slots {
+			copy(xb[i*in:], xt.data[s.src:s.src+in])
+		}
+		r := as(b.QuantMatmul(b.FromFloats(xb, len(slots), in), we, se, be, transpose, groupSize, bits))
+		for i, s := range slots {
+			copy(out.data[s.dst:s.dst+outDim], r.data[i*outDim:(i+1)*outDim])
+		}
 	}
-	return b.Reshape(out, append(append([]int{}, rs...), outDim)...)
+	return out
 }
 
 func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool, groupSize, bits int) engine.Tensor {
