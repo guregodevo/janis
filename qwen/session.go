@@ -134,6 +134,13 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 			sw.Unpin(prev...)
 			sw.Sweep()
 		}
+		if p.Cancel != nil && p.Cancel() {
+			// Cancelled mid-prefill: the cache now holds `offset` tokens, so record
+			// that exact prefix as the session state — keeps the next turn's KV
+			// prefix-reuse consistent instead of claiming the full prompt is cached.
+			s.IDs = append([]int32(nil), newIDs[:offset]...)
+			return nil
+		}
 	}
 	tok := sampleToken(b.Floats(logits), p, rng) // last-position logits
 	if sw != nil {
@@ -153,6 +160,9 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 			p.OnToken(tok)
 		}
 		if len(gen) >= nGen {
+			break
+		}
+		if p.Cancel != nil && p.Cancel() {
 			break
 		}
 		prev := cacheTensors(s.Caches)

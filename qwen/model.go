@@ -17,6 +17,10 @@ type SampleParams struct {
 	Stop map[int32]bool // stop generation when one of these is produced
 	// OnToken, if set, is called for each emitted token (for streaming).
 	OnToken func(tok int32)
+	// Cancel, if set, is polled between prefill chunks and before each decode
+	// step; returning true stops generation early and returns the partial output.
+	// Lets a client interrupt a long prompt (prefill) or a runaway decode.
+	Cancel func() bool
 }
 
 // sampleToken draws a token from logits under temperature + nucleus (top-p).

@@ -23,6 +23,9 @@ type Options struct {
 	TopP      float32
 	MaxTokens int
 	Seed      uint64
+	// Cancel, if set, is polled during generation; returning true stops early and
+	// returns the partial reply. Used to interrupt an in-flight chat.
+	Cancel func() bool
 }
 
 type sessionMaker interface {
@@ -125,7 +128,7 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 	if topP <= 0 {
 		topP = 1.0
 	}
-	p := qwen.SampleParams{Temp: opts.Temp, TopP: topP, Seed: opts.Seed, Stop: e.stops}
+	p := qwen.SampleParams{Temp: opts.Temp, TopP: topP, Seed: opts.Seed, Stop: e.stops, Cancel: opts.Cancel}
 
 	if onDelta != nil {
 		var gen []int32
