@@ -21,8 +21,8 @@ type synTensor struct {
 func writeSyntheticST(t *testing.T, path string, ts map[string]synTensor) {
 	t.Helper()
 	type hdrE struct {
-		Dtype       string  `json:"dtype"`
-		Shape       []int   `json:"shape"`
+		Dtype       string   `json:"dtype"`
+		Shape       []int    `json:"shape"`
 		DataOffsets [2]int64 `json:"data_offsets"`
 	}
 	hdr := map[string]hdrE{}
@@ -52,9 +52,9 @@ func TestExpertStore(t *testing.T) {
 	// gate_proj for layer 0: weight U32 [N,2,1], scales/biases F16 [N,2,1]
 	mk := func(n, sz int) []byte { return make([]byte, n*sz) }
 	writeSyntheticST(t, path, map[string]synTensor{
-		"model.layers.0.mlp.switch_mlp.gate_proj.weight":  {"U32", []int{N, 2, 1}, mk(N*2, 4)},
-		"model.layers.0.mlp.switch_mlp.gate_proj.scales":  {"F16", []int{N, 2, 1}, mk(N*2, 2)},
-		"model.layers.0.mlp.switch_mlp.gate_proj.biases":  {"F16", []int{N, 2, 1}, mk(N*2, 2)},
+		"model.layers.0.mlp.switch_mlp.gate_proj.weight": {"U32", []int{N, 2, 1}, mk(N*2, 4)},
+		"model.layers.0.mlp.switch_mlp.gate_proj.scales": {"F16", []int{N, 2, 1}, mk(N*2, 2)},
+		"model.layers.0.mlp.switch_mlp.gate_proj.biases": {"F16", []int{N, 2, 1}, mk(N*2, 2)},
 	})
 
 	st, err := safetensors.Open(path)

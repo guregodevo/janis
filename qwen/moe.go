@@ -279,7 +279,7 @@ func (m *MoEBlock) Forward(b engine.Backend, x engine.Tensor) engine.Tensor {
 	// mlx-lm convention: x -> [..lead.., 1, 1, hidden] (double expand); each
 	// gather_qmm yields [..lead.., K, 1, N]; squeeze the M=1 axis at the end.
 	ridx := b.FromInt32(ri, append(append([]int{}, lead...), K)...)
-	xe := b.ExpandDims(b.ExpandDims(x, nd-1), nd-1) // [..lead.., 1, 1, hidden]
+	xe := b.ExpandDims(b.ExpandDims(x, nd-1), nd-1)                // [..lead.., 1, 1, hidden]
 	g := b.GatherQuantMatmul(xe, gW, gS, gB, ridx, true, gs, bits) // [..lead.., K, 1, inter]
 	u := b.GatherQuantMatmul(xe, uW, uS, uB, ridx, true, gs, bits)
 	hh := b.Mul(b.SiLU(g), u)                                      // [..lead.., K, 1, inter]
