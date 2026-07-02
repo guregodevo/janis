@@ -156,6 +156,9 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 			break
 		}
 		gen = append(gen, tok)
+		if p.Grammar != nil {
+			p.Grammar.Advance(tok) // commit the token so the next sample sees updated state
+		}
 		if p.OnToken != nil {
 			p.OnToken(tok)
 		}

@@ -21,15 +21,47 @@ type SampleParams struct {
 	// step; returning true stops generation early and returns the partial output.
 	// Lets a client interrupt a long prompt (prefill) or a runaway decode.
 	Cancel func() bool
+	// Grammar, if set, constrains decoding: while it is Active the sampler only
+	// draws tokens it Allows, and every committed token is fed back via Advance so
+	// the grammar can track its state. nil (the default) leaves sampling untouched.
+	Grammar Grammar
+}
+
+// Grammar constrains sampling to tokens that keep the output within a formal
+// structure (grammar-constrained decoding). Advance is called for every committed
+// token so the grammar can follow along; Allows is consulted only when Active
+// reports the grammar is currently constraining, keeping the free-run path fast.
+type Grammar interface {
+	Active() bool
+	Allows(id int32) bool
+	Advance(id int32)
 }
 
 // sampleToken draws a token from logits under temperature + nucleus (top-p).
+// When a grammar is Active it forbids tokens the grammar disallows: greedy picks
+// the highest-logit allowed token; sampling renormalizes over allowed tokens. With
+// no grammar (or an inactive one) the code path is unchanged.
 func sampleToken(logits []float32, p SampleParams, rng *rand.Rand) int32 {
+	constrain := p.Grammar != nil && p.Grammar.Active()
+
 	if p.Temp <= 0 {
-		best := 0
+		best := -1
 		for i := range logits {
-			if logits[i] > logits[best] {
+			if constrain && !p.Grammar.Allows(int32(i)) {
+				continue
+			}
+			if best < 0 || logits[i] > logits[best] {
 				best = i
+			}
+		}
+		if best < 0 {
+			// The grammar allowed nothing (shouldn't happen for a well-formed
+			// grammar) — fall back to the unconstrained argmax rather than deadlock.
+			best = 0
+			for i := range logits {
+				if logits[i] > logits[best] {
+					best = i
+				}
 			}
 		}
 		return int32(best)
@@ -60,12 +92,28 @@ func sampleToken(logits []float32, p SampleParams, rng *rand.Rand) int32 {
 	}
 	sort.Slice(idx, func(a, b int) bool { return probs[idx[a]] > probs[idx[b]] })
 
+	// Grammar constraint: keep only allowed candidates, in the same prob order, and
+	// sample within them. If the grammar allows none (shouldn't happen), fall back
+	// to the full set rather than deadlock. When no grammar is active idx is
+	// unchanged, so the sampling below is byte-identical to the unconstrained path.
+	if constrain {
+		filtered := make([]int, 0, len(idx))
+		for _, id := range idx {
+			if p.Grammar.Allows(int32(id)) {
+				filtered = append(filtered, id)
+			}
+		}
+		if len(filtered) > 0 {
+			idx = filtered
+		}
+	}
+
 	topP := float64(p.TopP)
 	if topP <= 0 || topP > 1 {
 		topP = 1.0
 	}
 	var cum float64
-	cut := n
+	cut := len(idx)
 	for rank, id := range idx {
 		cum += probs[id]
 		if cum >= topP {

@@ -49,7 +49,6 @@ type turnStat struct {
 	decodeTokS float64
 	outTok     int
 	totalMs    float64
-	err        string
 }
 
 func main() {

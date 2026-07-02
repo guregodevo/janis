@@ -5,10 +5,12 @@ package llm
 
 import (
 	"fmt"
+	"sync"
 
 	"memdoor/llm/chat"
 	"memdoor/llm/engine"
 	"memdoor/llm/gemma"
+	"memdoor/llm/grammar"
 	"memdoor/llm/qwen"
 	"memdoor/llm/safetensors"
 	"memdoor/llm/tokenizer"
@@ -26,6 +28,15 @@ type Options struct {
 	// Cancel, if set, is polled during generation; returning true stops early and
 	// returns the partial reply. Used to interrupt an in-flight chat.
 	Cancel func() bool
+	// ToolCallGrammar constrains decoding to the <tool_call>{json}</tool_call>
+	// envelope (grammar-constrained decoding): plain text stays free, but once the
+	// model opens a tool call the JSON is forced well-formed and correctly closed.
+	// Set it for tool-using turns so the provider parser never sees malformed calls.
+	ToolCallGrammar bool
+	// ForceToolCall additionally REQUIRES the reply to begin with a tool call — the
+	// model can't narrate a solution as prose. Set it for "must-act" turns (e.g. a
+	// doer agent's first turn). Implies ToolCallGrammar.
+	ForceToolCall bool
 }
 
 type sessionMaker interface {
@@ -46,6 +57,13 @@ type Engine struct {
 	tok         *tokenizer.Tokenizer
 	mtype       string
 	stops       map[int32]bool
+	vocab       int
+	// tokTable is a lazily-built id→text table for grammar-constrained decoding:
+	// the sampler tests the grammar against many candidate tokens each step, so it
+	// needs O(1) token text, not a per-candidate cgo tokenizer call. Built once,
+	// only when a grammar is first used (non-tool chats never pay for it).
+	tokTable     []string
+	tokTableOnce sync.Once
 }
 
 // Open loads the model from a local snapshot directory (config.json,
@@ -55,7 +73,7 @@ func Open(modelDir string) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	e := &Engine{bk: newBackend(), mtype: cfg.ModelType, stops: map[int32]bool{}}
+	e := &Engine{bk: newBackend(), mtype: cfg.ModelType, stops: map[int32]bool{}, vocab: cfg.Vocab}
 	b := e.bk
 
 	st, err := safetensors.OpenModel(modelDir)
@@ -98,6 +116,22 @@ func Open(modelDir string) (*Engine, error) {
 // ModelType reports the loaded architecture (qwen2/qwen3/llama/gemma2).
 func (e *Engine) ModelType() string { return e.mtype }
 
+// tokenText returns the decoded text of a single token via a table built once on
+// first use. Grammar-constrained decoding vets many candidate tokens per step, so
+// this must be an O(1) lookup rather than a per-candidate tokenizer (cgo) call.
+func (e *Engine) tokenText(id int32) string {
+	e.tokTableOnce.Do(func() {
+		e.tokTable = make([]string, e.vocab)
+		for i := 0; i < e.vocab; i++ {
+			e.tokTable[i] = e.tok.Decode([]int32{int32(i)})
+		}
+	})
+	if id < 0 || int(id) >= len(e.tokTable) {
+		return ""
+	}
+	return e.tokTable[id]
+}
+
 // Chat generates a full reply for the conversation, on the main prefix-reusing
 // session.
 func (e *Engine) Chat(msgs []Message, opts Options) string {
@@ -129,6 +163,17 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 		topP = 1.0
 	}
 	p := qwen.SampleParams{Temp: opts.Temp, TopP: topP, Seed: opts.Seed, Stop: e.stops, Cancel: opts.Cancel}
+	if opts.ForceToolCall || opts.ToolCallGrammar {
+		// A fresh grammar per generation (it carries per-turn state). It decodes
+		// candidate tokens via the O(1) token table (built once). ForceToolCall
+		// additionally requires the reply to OPEN with a tool call (no narration).
+		decode := e.tokenText
+		if opts.ForceToolCall {
+			p.Grammar = grammar.NewToolCallForced(decode)
+		} else {
+			p.Grammar = grammar.NewToolCall(decode)
+		}
+	}
 
 	if onDelta != nil {
 		var gen []int32
