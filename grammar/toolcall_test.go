@@ -119,33 +119,6 @@ func TestBodyMustBeObject(t *testing.T) {
 	}
 }
 
-func TestForcedModeRequiresOpeningCall(t *testing.T) {
-	g := NewToolCallForced(charDecoder)
-	if !g.Active() {
-		t.Fatal("forced grammar must be Active from the first token")
-	}
-	// Narration tokens are forbidden; only whitespace or the open literal's start.
-	if g.Allows('I') || g.Allows('`') {
-		t.Fatal("forced mode must forbid narration at the start")
-	}
-	if !g.Allows(' ') {
-		t.Fatal("leading whitespace should be allowed before the forced call")
-	}
-	if !g.Allows('<') {
-		t.Fatal("the open literal '<' must be allowed")
-	}
-	// A full forced call is accepted and then the grammar relaxes to free text.
-	if i := feed(g, `<tool_call>{"name":"bash","arguments":{"command":"ls"}}</tool_call>`); i != -1 {
-		t.Fatalf("forced call rejected at byte %d", i)
-	}
-	if g.Active() {
-		t.Fatal("after the required first call, forced mode should relax to free text")
-	}
-	if i := feed(g, " now some prose is fine"); i != -1 {
-		t.Fatalf("post-call free text rejected at %d", i)
-	}
-}
-
 // mapDecoder returns registered multi-byte strings, to test that the open literal
 // is recognized even when it arrives as a single (multi-byte) token.
 func TestOpenLiteralAsSingleToken(t *testing.T) {

@@ -21,10 +21,9 @@ const (
 type phase uint8
 
 const (
-	phText      phase = iota // free assistant text; the open literal is being watched
-	phJSON                   // inside the tool_call, consuming the JSON object
-	phClose                  // JSON done; the closing </tool_call> tag is required
-	phForceOpen              // must-act turn: the reply must OPEN with a tool call
+	phText  phase = iota // free assistant text; the open literal is being watched
+	phJSON               // inside the tool_call, consuming the JSON object
+	phClose              // JSON done; the closing </tool_call> tag is required
 )
 
 // state is a value type (copyable) so Allows can simulate a candidate token's
@@ -69,21 +68,6 @@ func step(s state, b byte) (state, bool) {
 			s.closed++
 			if s.closed == len(closeLit) {
 				s = state{phase: phText} // call complete; back to free text
-			}
-			return s, true
-		}
-		return s, false
-
-	case phForceOpen:
-		// The turn must begin with the open literal (leading whitespace aside).
-		// Nothing else — no narration — is legal until the call is opened.
-		if s.open == 0 && isSpace(b) {
-			return s, true
-		}
-		if b == openLit[s.open] {
-			s.open++
-			if s.open == len(openLit) {
-				s = state{phase: phJSON} // opened; enforce the JSON body next
 			}
 			return s, true
 		}
@@ -157,15 +141,6 @@ type ToolCall struct {
 // only a tool call the model opens on its own is forced well-formed.
 func NewToolCall(decode Decoder) *ToolCall {
 	return &ToolCall{decode: decode}
-}
-
-// NewToolCallForced is NewToolCall for a "must-act" turn: the reply is REQUIRED to
-// begin with a tool call — the grammar is Active from the first token and only
-// permits (leading whitespace then) the "<tool_call>" open literal and a
-// well-formed call. After that first call completes it relaxes to free text. Use
-// it so a doer agent invokes a tool instead of narrating a solution as prose.
-func NewToolCallForced(decode Decoder) *ToolCall {
-	return &ToolCall{decode: decode, st: state{phase: phForceOpen}}
 }
 
 // Active reports whether the grammar is currently constraining. It returns false

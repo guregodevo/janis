@@ -33,10 +33,6 @@ type Options struct {
 	// model opens a tool call the JSON is forced well-formed and correctly closed.
 	// Set it for tool-using turns so the provider parser never sees malformed calls.
 	ToolCallGrammar bool
-	// ForceToolCall additionally REQUIRES the reply to begin with a tool call — the
-	// model can't narrate a solution as prose. Set it for "must-act" turns (e.g. a
-	// doer agent's first turn). Implies ToolCallGrammar.
-	ForceToolCall bool
 }
 
 type sessionMaker interface {
@@ -163,16 +159,11 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 		topP = 1.0
 	}
 	p := qwen.SampleParams{Temp: opts.Temp, TopP: topP, Seed: opts.Seed, Stop: e.stops, Cancel: opts.Cancel}
-	if opts.ForceToolCall || opts.ToolCallGrammar {
+	if opts.ToolCallGrammar {
 		// A fresh grammar per generation (it carries per-turn state). It decodes
-		// candidate tokens via the O(1) token table (built once). ForceToolCall
-		// additionally requires the reply to OPEN with a tool call (no narration).
-		decode := e.tokenText
-		if opts.ForceToolCall {
-			p.Grammar = grammar.NewToolCallForced(decode)
-		} else {
-			p.Grammar = grammar.NewToolCall(decode)
-		}
+		// candidate tokens via the O(1) token table (built once) and constrains any
+		// tool call the model emits to be well-formed — it does not force one.
+		p.Grammar = grammar.NewToolCall(e.tokenText)
 	}
 
 	if onDelta != nil {
