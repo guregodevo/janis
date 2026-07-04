@@ -5,6 +5,8 @@ package llm
 
 import (
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
 
 	"memdoor/llm/chat"
@@ -15,6 +17,32 @@ import (
 	"memdoor/llm/safetensors"
 	"memdoor/llm/tokenizer"
 )
+
+// Repetition-penalty defaults for local decoding, tunable via env. 1.1 over the
+// last 64 tokens is the llama.cpp default — mild enough not to distort code, strong
+// enough to break a runaway repeat loop. MEMDOOR_REPEAT_PENALTY=1 disables it.
+var (
+	repeatPenalty = envFloat32("MEMDOOR_REPEAT_PENALTY", 1.1)
+	repeatLastN   = envInt("MEMDOOR_REPEAT_LAST_N", 64)
+)
+
+func envFloat32(key string, def float32) float32 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 32); err == nil {
+			return float32(f)
+		}
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
 
 // Message is re-exported so callers don't import the chat package directly.
 type Message = chat.Message
@@ -33,6 +61,10 @@ type Options struct {
 	// model opens a tool call the JSON is forced well-formed and correctly closed.
 	// Set it for tool-using turns so the provider parser never sees malformed calls.
 	ToolCallGrammar bool
+	// ForceToolCall additionally REQUIRES the turn to open a <tool_call> — the model
+	// cannot answer in prose or a ```json fence. Only meaningful with ToolCallGrammar
+	// and tools present; set it for a turn where a tool call is expected.
+	ForceToolCall bool
 }
 
 type sessionMaker interface {
@@ -158,12 +190,25 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 	if topP <= 0 {
 		topP = 1.0
 	}
-	p := qwen.SampleParams{Temp: opts.Temp, TopP: topP, Seed: opts.Seed, Stop: e.stops, Cancel: opts.Cancel}
+	p := qwen.SampleParams{
+		Temp: opts.Temp, TopP: topP, Seed: opts.Seed, Stop: e.stops, Cancel: opts.Cancel,
+		// Repetition penalty is on by default so a local model can't lock into a
+		// decode loop on free text (the classic "of of of" / echo-forever failure).
+		// Tunable via env; 1.0 disables. Skipped automatically during grammar-
+		// constrained tool calls (see sampleToken).
+		RepeatPenalty: repeatPenalty,
+		RepeatLastN:   repeatLastN,
+	}
 	if opts.ToolCallGrammar {
 		// A fresh grammar per generation (it carries per-turn state). It decodes
-		// candidate tokens via the O(1) token table (built once) and constrains any
-		// tool call the model emits to be well-formed — it does not force one.
-		p.Grammar = grammar.NewToolCall(e.tokenText)
+		// candidate tokens via the O(1) token table (built once) and constrains the
+		// tool-call JSON to be well-formed. ForceToolCall additionally requires the
+		// turn to OPEN a call (the model can't drift into malformed free-text JSON).
+		if opts.ForceToolCall {
+			p.Grammar = grammar.NewToolCallForced(e.tokenText)
+		} else {
+			p.Grammar = grammar.NewToolCall(e.tokenText)
+		}
 	}
 
 	if onDelta != nil {

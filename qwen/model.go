@@ -25,6 +25,12 @@ type SampleParams struct {
 	// draws tokens it Allows, and every committed token is fed back via Advance so
 	// the grammar can track its state. nil (the default) leaves sampling untouched.
 	Grammar Grammar
+	// RepeatPenalty (>1) divides the logit of any token seen in the last RepeatLastN
+	// generated tokens, discouraging repetition so the model doesn't fall into a
+	// decode loop on free text. RepeatPenalty <= 1 disables it. Not applied while a
+	// grammar is Active — tool-call JSON legitimately repeats structural tokens.
+	RepeatPenalty float32
+	RepeatLastN   int
 }
 
 // Grammar constrains sampling to tokens that keep the output within a formal
@@ -41,8 +47,33 @@ type Grammar interface {
 // When a grammar is Active it forbids tokens the grammar disallows: greedy picks
 // the highest-logit allowed token; sampling renormalizes over allowed tokens. With
 // no grammar (or an inactive one) the code path is unchanged.
-func sampleToken(logits []float32, p SampleParams, rng *rand.Rand) int32 {
+func sampleToken(logits []float32, p SampleParams, rng *rand.Rand, recent []int32) int32 {
 	constrain := p.Grammar != nil && p.Grammar.Active()
+
+	// Repetition penalty (llama.cpp-style): down-weight tokens seen in the recent
+	// window so free-text generation can't lock into a decode loop. Skipped while a
+	// grammar is active, since a tool call's JSON repeats structural tokens.
+	if p.RepeatPenalty > 1 && !constrain && len(recent) > 0 {
+		lastN := p.RepeatLastN
+		if lastN <= 0 || lastN > len(recent) {
+			lastN = len(recent)
+		}
+		seen := make(map[int32]struct{}, lastN)
+		for _, id := range recent[len(recent)-lastN:] {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			if int(id) < 0 || int(id) >= len(logits) {
+				continue
+			}
+			if logits[id] > 0 {
+				logits[id] /= p.RepeatPenalty
+			} else {
+				logits[id] *= p.RepeatPenalty
+			}
+		}
+	}
 
 	if p.Temp <= 0 {
 		best := -1
@@ -148,7 +179,7 @@ func SampledGenerate(b engine.Backend, prompt []int32, nGen, nLayers, vocab int,
 	}
 
 	logits := forward(b, b.FromInt32(prompt, len(prompt)), len(prompt), 0, caches)
-	tok := sampleToken(b.Floats(logits), p, rng) // forward returns last-position logits
+	tok := sampleToken(b.Floats(logits), p, rng, nil) // forward returns last-position logits
 	offset := len(prompt)
 	if sw != nil {
 		pinCaches(sw, caches)
@@ -169,7 +200,7 @@ func SampledGenerate(b engine.Backend, prompt []int32, nGen, nLayers, vocab int,
 		}
 		old := cacheTensors(caches)
 		logits = forward(b, b.FromInt32([]int32{tok}, 1), 1, offset, caches)
-		tok = sampleToken(b.Floats(logits), p, rng)
+		tok = sampleToken(b.Floats(logits), p, rng, out)
 		offset++
 		if sw != nil {
 			pinCaches(sw, caches)

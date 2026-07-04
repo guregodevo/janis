@@ -142,7 +142,7 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 			return nil
 		}
 	}
-	tok := sampleToken(b.Floats(logits), p, rng) // last-position logits
+	tok := sampleToken(b.Floats(logits), p, rng, nil) // last-position logits; no history yet
 	if sw != nil {
 		sw.Unpin(logits)
 		pinCaches(sw, s.Caches)
@@ -170,7 +170,7 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 		}
 		prev := cacheTensors(s.Caches)
 		logits = s.Forward(b, b.FromInt32([]int32{tok}, 1), 1, offset, s.Caches)
-		tok = sampleToken(b.Floats(logits), p, rng)
+		tok = sampleToken(b.Floats(logits), p, rng, gen)
 		offset++
 		if sw != nil {
 			pinCaches(sw, s.Caches)

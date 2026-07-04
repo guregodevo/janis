@@ -21,9 +21,10 @@ const (
 type phase uint8
 
 const (
-	phText  phase = iota // free assistant text; the open literal is being watched
-	phJSON               // inside the tool_call, consuming the JSON object
-	phClose              // JSON done; the closing </tool_call> tag is required
+	phText      phase = iota // free assistant text; the open literal is being watched
+	phJSON                   // inside the tool_call, consuming the JSON object
+	phClose                  // JSON done; the closing </tool_call> tag is required
+	phForceOpen              // the turn MUST open <tool_call>: only its bytes are legal
 )
 
 // state is a value type (copyable) so Allows can simulate a candidate token's
@@ -68,6 +69,23 @@ func step(s state, b byte) (state, bool) {
 			s.closed++
 			if s.closed == len(closeLit) {
 				s = state{phase: phText} // call complete; back to free text
+			}
+			return s, true
+		}
+		return s, false
+
+	case phForceOpen:
+		// Force the open: only bytes that continue "<tool_call>" are legal (leading
+		// whitespace tolerated before it starts), so the model cannot answer in prose
+		// or a ```json fence — it must open the envelope. Once open, it flows into the
+		// same phJSON path that guarantees valid, escaped JSON.
+		if s.open == 0 && isSpace(b) {
+			return s, true
+		}
+		if b == openLit[s.open] {
+			s.open++
+			if s.open == len(openLit) {
+				s = state{phase: phJSON}
 			}
 			return s, true
 		}
@@ -143,6 +161,14 @@ func NewToolCall(decode Decoder) *ToolCall {
 	return &ToolCall{decode: decode}
 }
 
+// NewToolCallForced is like NewToolCall but REQUIRES the turn to open a tool call:
+// it starts in phForceOpen, so the model must emit "<tool_call>" (then valid JSON)
+// as its response. Use it only for a turn where a tool call is expected — an action
+// agent's first inference — so the model can't drift into malformed free-text JSON.
+func NewToolCallForced(decode Decoder) *ToolCall {
+	return &ToolCall{decode: decode, st: state{phase: phForceOpen}}
+}
+
 // Active reports whether the grammar is currently constraining. It returns false
 // in free-text mode, so the sampler skips per-token vetting on the hot path and
 // only pays for it inside a tool call.
@@ -153,8 +179,15 @@ func (g *ToolCall) Active() bool { return g.st.phase != phText }
 // this across the candidate set each constrained step, so back it with an O(1)
 // lookup table, not a live tokenizer call.
 func (g *ToolCall) Allows(id int32) bool {
-	s := g.st
 	str := g.decode(id)
+	// A token that renders to nothing (EOS / special tokens) makes no progress and
+	// must NOT satisfy a constrained phase — otherwise a forced open is bypassed by
+	// the model simply stopping, and a tool call can be cut short mid-JSON. Reject
+	// it whenever the grammar is constraining (Allows is only consulted then).
+	if str == "" {
+		return false
+	}
+	s := g.st
 	for i := 0; i < len(str); i++ {
 		var ok bool
 		if s, ok = step(s, str[i]); !ok {

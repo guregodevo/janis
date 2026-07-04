@@ -17,12 +17,12 @@ func TestSampleTokenGrammarGreedy(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 
 	// No grammar: greedy picks the argmax (unchanged behavior).
-	if got := sampleToken(logits, SampleParams{Temp: 0}, rng); got != 2 {
+	if got := sampleToken(logits, SampleParams{Temp: 0}, rng, nil); got != 2 {
 		t.Fatalf("nil grammar greedy: want argmax 2, got %d", got)
 	}
 
 	// Grammar allows only token 0: greedy must pick 0 despite 2 being the argmax.
-	got := sampleToken(logits, SampleParams{Temp: 0, Grammar: onlyGrammar{allow: 0}}, rng)
+	got := sampleToken(logits, SampleParams{Temp: 0, Grammar: onlyGrammar{allow: 0}}, rng, nil)
 	if got != 0 {
 		t.Fatalf("constrained greedy: want the only allowed token 0, got %d", got)
 	}
@@ -34,7 +34,7 @@ func TestSampleTokenGrammarSampled(t *testing.T) {
 	// must return 1 regardless of the RNG.
 	for seed := int64(0); seed < 20; seed++ {
 		rng := rand.New(rand.NewSource(seed))
-		got := sampleToken(logits, SampleParams{Temp: 0.8, TopP: 1, Grammar: onlyGrammar{allow: 1}}, rng)
+		got := sampleToken(logits, SampleParams{Temp: 0.8, TopP: 1, Grammar: onlyGrammar{allow: 1}}, rng, nil)
 		if got != 1 {
 			t.Fatalf("seed %d: constrained sampling must return the only allowed token 1, got %d", seed, got)
 		}
@@ -46,8 +46,8 @@ func TestSampleTokenNilGrammarUnchanged(t *testing.T) {
 	// the same token with and without an explicit (but inactive) grammar absent.
 	logits := []float32{2, 2, 2, 2}
 	for seed := int64(0); seed < 10; seed++ {
-		a := sampleToken(logits, SampleParams{Temp: 1, TopP: 1}, rand.New(rand.NewSource(seed)))
-		b := sampleToken(logits, SampleParams{Temp: 1, TopP: 1}, rand.New(rand.NewSource(seed)))
+		a := sampleToken(logits, SampleParams{Temp: 1, TopP: 1}, rand.New(rand.NewSource(seed)), nil)
+		b := sampleToken(logits, SampleParams{Temp: 1, TopP: 1}, rand.New(rand.NewSource(seed)), nil)
 		if a != b {
 			t.Fatalf("seed %d: nil-grammar sampling not deterministic: %d vs %d", seed, a, b)
 		}
