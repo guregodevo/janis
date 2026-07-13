@@ -174,6 +174,12 @@ func NewToolCallForced(decode Decoder) *ToolCall {
 // only pays for it inside a tool call.
 func (g *ToolCall) Active() bool { return g.st.phase != phText }
 
+// InString reports whether decoding is currently inside a JSON string literal — the
+// tool call's CONTENT (e.g. an apply_patch patch body), where a small model can loop
+// on repeated lines. The sampler applies the repetition penalty here but not to the
+// structural tokens outside strings.
+func (g *ToolCall) InString() bool { return g.st.inStr }
+
 // Allows reports whether emitting token id keeps the output within the envelope.
 // Consulted only when Active is true. decode(id) must be cheap — the sampler calls
 // this across the candidate set each constrained step, so back it with an O(1)

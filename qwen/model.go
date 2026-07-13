@@ -41,6 +41,11 @@ type Grammar interface {
 	Active() bool
 	Allows(id int32) bool
 	Advance(id int32)
+	// InString reports whether the grammar is currently inside a string literal
+	// (content), as opposed to structural position. The repetition penalty applies
+	// to content (where a small model loops generating the same lines) but not to
+	// structural tokens (JSON braces/quotes/commas legitimately repeat).
+	InString() bool
 }
 
 // sampleToken draws a token from logits under temperature + nucleus (top-p).
@@ -51,9 +56,12 @@ func sampleToken(logits []float32, p SampleParams, rng *rand.Rand, recent []int3
 	constrain := p.Grammar != nil && p.Grammar.Active()
 
 	// Repetition penalty (llama.cpp-style): down-weight tokens seen in the recent
-	// window so free-text generation can't lock into a decode loop. Skipped while a
-	// grammar is active, since a tool call's JSON repeats structural tokens.
-	if p.RepeatPenalty > 1 && !constrain && len(recent) > 0 {
+	// window so generation can't lock into a decode loop. Applied on free text AND on
+	// string CONTENT inside a tool call (where a small model loops generating the same
+	// lines — e.g. an apply_patch body repeating a func block) — but NOT on structural
+	// JSON tokens, which legitimately repeat and would corrupt the call if penalized.
+	inContent := !constrain || (p.Grammar != nil && p.Grammar.InString())
+	if p.RepeatPenalty > 1 && inContent && len(recent) > 0 {
 		lastN := p.RepeatLastN
 		if lastN <= 0 || lastN > len(recent) {
 			lastN = len(recent)

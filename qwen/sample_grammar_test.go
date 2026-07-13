@@ -11,6 +11,7 @@ type onlyGrammar struct{ allow int32 }
 func (g onlyGrammar) Active() bool         { return true }
 func (g onlyGrammar) Allows(id int32) bool { return id == g.allow }
 func (g onlyGrammar) Advance(id int32)     {}
+func (g onlyGrammar) InString() bool         { return false }
 
 func TestSampleTokenGrammarGreedy(t *testing.T) {
 	logits := []float32{5, 1, 9, 2} // argmax is index 2
