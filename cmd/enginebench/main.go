@@ -161,6 +161,8 @@ func runMemdoor(modelSub, system, seed, chunk string, turns, gen int, outDir str
 
 	var stats []turnStat
 	var lastOut string
+	var prevIOBytes int64
+	var prevIODur time.Duration
 	for t := 0; t < turns; t++ {
 		msgs := buildTurns(system, seed, chunk, t)
 		ctxTok := 0
@@ -187,7 +189,14 @@ func runMemdoor(modelSub, system, seed, chunk string, turns, gen int, outDir str
 		}
 		stats = append(stats, st)
 		lastOut = reply
-		fmt.Fprintf(os.Stderr, "  memdoor turn %d: ctx=%d prefill=%.0fms decode=%.1f tok/s\n", t, ctxTok, st.prefillMs, st.decodeTokS)
+		if ioB, ioD, ok := eng.ExpertIOStats(); ok {
+			dB, dD := ioB-prevIOBytes, ioD-prevIODur
+			prevIOBytes, prevIODur = ioB, ioD
+			fmt.Fprintf(os.Stderr, "  memdoor turn %d: ctx=%d prefill=%.0fms decode=%.1f tok/s  expert-io=%dMB/%.0fms\n",
+				t, ctxTok, st.prefillMs, st.decodeTokS, dB>>20, dD.Seconds()*1000)
+		} else {
+			fmt.Fprintf(os.Stderr, "  memdoor turn %d: ctx=%d prefill=%.0fms decode=%.1f tok/s\n", t, ctxTok, st.prefillMs, st.decodeTokS)
+		}
 	}
 	_ = os.WriteFile(filepath.Join(outDir, "enginebench-memdoor.txt"), []byte(lastOut), 0o644)
 	return stats, nil

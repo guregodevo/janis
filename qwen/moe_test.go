@@ -94,3 +94,220 @@ func TestExpertStore(t *testing.T) {
 		t.Errorf("cache map (%d) and lru (%d) out of sync", len(store.cache), store.lru.Len())
 	}
 }
+
+// TestReadRowsParallel checks that the bounded-parallel read path preserves
+// expert order in the stacked rows, counts bytes, and surfaces read errors.
+func TestReadRowsParallel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "model.safetensors")
+	const N = 32
+	// Each row of "stack" is 4 bytes; row e is filled with byte(e) so order
+	// scrambling by the goroutines would be visible in the assembled rows.
+	data := make([]byte, N*4)
+	for e := 0; e < N; e++ {
+		for j := 0; j < 4; j++ {
+			data[e*4+j] = byte(e)
+		}
+	}
+	writeSyntheticST(t, path, map[string]synTensor{
+		"stack": {"U8", []int{N, 4}, data},
+	})
+
+	st, err := safetensors.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	store := NewExpertStore(cpu.New(), st, 64, 4, 1<<20)
+
+	experts := []int{7, 0, 31, 15, 3, 22, 9, 1, 28, 4, 18, 11}
+	rows, err := store.readRows("stack", experts)
+	if err != nil {
+		t.Fatalf("readRows: %v", err)
+	}
+	if len(rows.rows) != len(experts) {
+		t.Fatalf("got %d rows, want %d", len(rows.rows), len(experts))
+	}
+	for i, e := range experts {
+		for _, b := range rows.rows[i] {
+			if b != byte(e) {
+				t.Fatalf("row %d (expert %d): got byte %d, want %d — order not preserved", i, e, b, e)
+			}
+		}
+	}
+	if got, _ := store.IOStats(); got != int64(len(experts)*4) {
+		t.Errorf("IOStats bytes = %d, want %d", got, len(experts)*4)
+	}
+
+	if _, err := store.readRows("stack", []int{0, N + 5}); err == nil {
+		t.Error("out-of-range expert should surface a read error")
+	}
+}
+
+// TestEnsureCached checks that one call materializes all three projections of
+// the requested experts into the cache, that a following Stack is pure hits,
+// and that a second EnsureCached for the same experts reads nothing new.
+func TestEnsureCached(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "model.safetensors")
+	const N = 4
+	ts := map[string]synTensor{}
+	for _, p := range []string{"gate_proj", "up_proj", "down_proj"} {
+		base := "model.layers.0.mlp.switch_mlp." + p
+		ts[base+".weight"] = synTensor{"U32", []int{N, 2, 1}, make([]byte, N*2*4)}
+		ts[base+".scales"] = synTensor{"F16", []int{N, 2, 1}, make([]byte, N*2*2)}
+		ts[base+".biases"] = synTensor{"F16", []int{N, 2, 1}, make([]byte, N*2*2)}
+	}
+	writeSyntheticST(t, path, ts)
+
+	st, err := safetensors.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	store := NewExpertStore(cpu.New(), st, 64, 4, 1<<20)
+
+	experts := []int{2, 0}
+	if err := store.EnsureCached(0, experts); err != nil {
+		t.Fatalf("EnsureCached: %v", err)
+	}
+	if store.Misses != len(experts)*3 {
+		t.Errorf("misses = %d, want %d (3 projections per expert)", store.Misses, len(experts)*3)
+	}
+	bytesAfterFill, _ := store.IOStats()
+
+	if _, _, _, err := store.Stack(0, "gate_proj", experts); err != nil {
+		t.Fatalf("Stack: %v", err)
+	}
+	if store.Hits != len(experts) {
+		t.Errorf("hits after Stack = %d, want %d", store.Hits, len(experts))
+	}
+
+	if err := store.EnsureCached(0, experts); err != nil {
+		t.Fatalf("EnsureCached(repeat): %v", err)
+	}
+	if b, _ := store.IOStats(); b != bytesAfterFill {
+		t.Errorf("repeat EnsureCached read %d new bytes, want 0", b-bytesAfterFill)
+	}
+}
+
+// TestSlotStack checks the persistent slot cache: first touch misses and
+// scatters rows in, a repeat is all hits with stable slot indices, a new
+// expert evicts the least-frequently-used victim, and the slot tensors carry
+// the right rows (verified through the CPU backend's exact U32 words).
+func TestSlotStack(t *testing.T) {
+	t.Setenv("MEMDOOR_MOE_SLOTS", "3")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "model.safetensors")
+	const N = 8
+	ts := map[string]synTensor{}
+	for _, p := range []string{"gate_proj", "up_proj", "down_proj"} {
+		base := "model.layers.0.mlp.switch_mlp." + p
+		// weight row e = two U32 words of value e, so slot contents are checkable
+		wdata := make([]byte, N*2*4)
+		for e := 0; e < N; e++ {
+			for w := 0; w < 2; w++ {
+				wdata[e*8+w*4] = byte(e)
+			}
+		}
+		ts[base+".weight"] = synTensor{"U32", []int{N, 2, 1}, wdata}
+		ts[base+".scales"] = synTensor{"F16", []int{N, 2, 1}, make([]byte, N*2*2)}
+		ts[base+".biases"] = synTensor{"F16", []int{N, 2, 1}, make([]byte, N*2*2)}
+	}
+	writeSyntheticST(t, path, ts)
+
+	st, err := safetensors.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	b := cpu.New()
+	store := NewExpertStore(b, st, 64, 4, 1<<20)
+
+	// First touch: both experts miss and land in slots.
+	projs, idx, ok, err := store.SlotStack(0, []int{5, 2})
+	if err != nil || !ok {
+		t.Fatalf("SlotStack: ok=%v err=%v", ok, err)
+	}
+	if store.Misses != 2 || store.Hits != 0 {
+		t.Errorf("first touch: hits=%d misses=%d, want 0/2", store.Hits, store.Misses)
+	}
+
+	// Repeat: pure hits, same slots.
+	_, idx2, ok, err := store.SlotStack(0, []int{5, 2})
+	if err != nil || !ok {
+		t.Fatalf("SlotStack(repeat): ok=%v err=%v", ok, err)
+	}
+	if store.Hits != 2 {
+		t.Errorf("repeat: hits=%d, want 2", store.Hits)
+	}
+	if idx2[0] != idx[0] || idx2[1] != idx[1] {
+		t.Errorf("slot indices changed on repeat: %v -> %v", idx, idx2)
+	}
+
+	// Slot contents: expert 5's weight row (words == 5) sits at slot idx[0].
+	w := projs[0].W
+	raw := b.Floats(w) // CPU backend mirrors U32 words into f32
+	rowLen := 2
+	if got := raw[int(idx[0])*rowLen]; got != 5 {
+		t.Errorf("slot %d word = %v, want 5", idx[0], got)
+	}
+	if got := raw[int(idx2[1])*rowLen]; got != 2 {
+		t.Errorf("slot %d word = %v, want 2", idx2[1], got)
+	}
+
+	// Third expert fills the last free slot; fourth evicts the LFU victim.
+	if _, _, _, err := store.SlotStack(0, []int{7}); err != nil {
+		t.Fatal(err)
+	}
+	if _, idx4, _, err := store.SlotStack(0, []int{6}); err != nil {
+		t.Fatal(err)
+	} else if idx4[0] != 2 {
+		// slots 0/1 hold experts 5/2 (freq 2 each); slot 2 holds 7 (freq 1)
+		t.Errorf("eviction picked slot %d, want 2 (LFU)", idx4[0])
+	}
+}
+
+// TestStackProjs checks the fused multi-projection fetch: one call yields
+// stacked W/S/B tensors per projection with the leading axis sized to the
+// active expert count.
+func TestStackProjs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "model.safetensors")
+	const N = 4
+	ts := map[string]synTensor{}
+	for _, p := range []string{"gate_proj", "up_proj", "down_proj"} {
+		base := "model.layers.0.mlp.switch_mlp." + p
+		ts[base+".weight"] = synTensor{"U32", []int{N, 2, 1}, make([]byte, N*2*4)}
+		ts[base+".scales"] = synTensor{"F16", []int{N, 2, 1}, make([]byte, N*2*2)}
+		ts[base+".biases"] = synTensor{"F16", []int{N, 2, 1}, make([]byte, N*2*2)}
+	}
+	writeSyntheticST(t, path, ts)
+
+	st, err := safetensors.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	store := NewExpertStore(cpu.New(), st, 64, 4, 1<<20)
+
+	experts := []int{3, 1}
+	ps, err := store.StackProjs(0, experts, "gate_proj", "up_proj", "down_proj")
+	if err != nil {
+		t.Fatalf("StackProjs: %v", err)
+	}
+	if len(ps) != 3 {
+		t.Fatalf("got %d projections, want 3", len(ps))
+	}
+	for i, p := range ps {
+		if p.W == nil || p.S == nil || p.B == nil {
+			t.Fatalf("projection %d has nil tensors", i)
+		}
+		if shp := p.W.Shape(); shp[0] != len(experts) {
+			t.Errorf("projection %d leading axis = %d, want %d", i, shp[0], len(experts))
+		}
+	}
+	if bytes, _ := store.IOStats(); bytes == 0 {
+		t.Error("IOStats should count the fused fetch")
+	}
+}

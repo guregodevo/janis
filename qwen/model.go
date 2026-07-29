@@ -3,7 +3,9 @@ package qwen
 import (
 	"math"
 	"math/rand"
+	"os"
 	"sort"
+	"strconv"
 
 	"memdoor/llm/engine"
 	"memdoor/llm/safetensors"
@@ -230,22 +232,30 @@ type Model struct {
 	Experts *ExpertStore // non-nil for MoE models (offloaded experts)
 }
 
-// moeExpertBudgetBytes bounds resident expert weights for MoE models. ~6 GB
-// leaves room for non-expert weights + KV + activations + the per-token
-// gathered expert stacks inside 16 GB.
-const moeExpertBudgetBytes = 6 << 30
+// moeExpertBudget bounds the pinned GPU expert cache for MoE models. The
+// default (2.5 GB ≈ 16 hot experts per layer on a 48-layer 30B-A3B, mirroring
+// TurboFieldfare's validated slot count) balances two consumers of the same
+// RAM: a bigger cache raises the hit rate, but starves the OS page cache that
+// makes the remaining misses cheap. MEMDOOR_MOE_CACHE_MB overrides for tuning.
+func moeExpertBudget() int64 {
+	if mb, _ := strconv.Atoi(os.Getenv("MEMDOOR_MOE_CACHE_MB")); mb > 0 {
+		return int64(mb) << 20
+	}
+	return 2500 << 20
+}
 
 // LoadModel loads the embedding, all decoder blocks, the final norm, and (when
 // untied) the lm_head. For MoE models it builds an ExpertStore so expert weights
 // are streamed on demand instead of loaded resident.
 func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, error) {
-	emb, err := LoadQuantEmbedding(b, st, "model.embed_tokens", cfg.GroupSize, cfg.Bits)
+	embGS, embBits := cfg.QuantFor("model.embed_tokens")
+	emb, err := LoadQuantEmbedding(b, st, "model.embed_tokens", embGS, embBits)
 	if err != nil {
 		return nil, err
 	}
 	var store *ExpertStore
 	if cfg.NumExperts > 0 {
-		store = NewExpertStore(b, st, cfg.GroupSize, cfg.Bits, moeExpertBudgetBytes)
+		store = NewExpertStore(b, st, cfg.GroupSize, cfg.Bits, moeExpertBudget())
 	}
 	blocks := make([]*Block, cfg.Layers)
 	for i := range blocks {
@@ -259,7 +269,8 @@ func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, erro
 	}
 	m := &Model{Embed: emb, Blocks: blocks, Norm: norm, Cfg: cfg, Experts: store}
 	if !cfg.TieWordEmbeddings {
-		if m.LMHead, err = LoadQuantLinear(b, st, "lm_head", cfg.GroupSize, cfg.Bits, false); err != nil {
+		gs, bits := cfg.QuantFor("lm_head")
+		if m.LMHead, err = LoadQuantLinear(b, st, "lm_head", gs, bits, false); err != nil {
 			return nil, err
 		}
 	}

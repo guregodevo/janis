@@ -44,19 +44,23 @@ func llama3Freqs(headDim int, base, factor, lowF, highF float32, origCtx int) []
 // LoadAttention loads the four projections under prefix (e.g.
 // "model.layers.0.self_attn"), with q/k/v bias controlled by the config.
 func LoadAttention(b engine.Backend, st *safetensors.File, prefix string, cfg Config) (*Attention, error) {
-	q, err := LoadQuantLinear(b, st, prefix+".q_proj", cfg.GroupSize, cfg.Bits, cfg.AttentionBias)
+	load := func(name string, bias bool) (*QuantLinear, error) {
+		gs, bits := cfg.QuantFor(prefix + "." + name)
+		return LoadQuantLinear(b, st, prefix+"."+name, gs, bits, bias)
+	}
+	q, err := load("q_proj", cfg.AttentionBias)
 	if err != nil {
 		return nil, err
 	}
-	k, err := LoadQuantLinear(b, st, prefix+".k_proj", cfg.GroupSize, cfg.Bits, cfg.AttentionBias)
+	k, err := load("k_proj", cfg.AttentionBias)
 	if err != nil {
 		return nil, err
 	}
-	v, err := LoadQuantLinear(b, st, prefix+".v_proj", cfg.GroupSize, cfg.Bits, cfg.AttentionBias)
+	v, err := load("v_proj", cfg.AttentionBias)
 	if err != nil {
 		return nil, err
 	}
-	o, err := LoadQuantLinear(b, st, prefix+".o_proj", cfg.GroupSize, cfg.Bits, false)
+	o, err := load("o_proj", false)
 	if err != nil {
 		return nil, err
 	}

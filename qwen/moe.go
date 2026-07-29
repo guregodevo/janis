@@ -3,10 +3,18 @@ package qwen
 import (
 	"container/list"
 	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"memdoor/llm/engine"
 	"memdoor/llm/safetensors"
 )
+
+// moeReadConcurrency bounds in-flight expert-row preads per store. Apple SSDs
+// sustain multiple concurrent reads at full bandwidth; unbounded goroutines
+// would thrash the page cache under memory pressure.
+const moeReadConcurrency = 8
 
 type exKey struct {
 	layer int
@@ -36,6 +44,12 @@ type ExpertStore struct {
 	cache        map[exKey]*list.Element
 	lru          *list.List // front = most-recently-used; Value is *exEntry
 	Hits, Misses int
+
+	readSem   chan struct{} // bounds concurrent expert-row preads
+	readBytes atomic.Int64
+	readNanos atomic.Int64
+
+	slots map[int]*layerSlots // per-layer expert slot cache (decode hot path)
 }
 
 // NewExpertStore builds a store over st, bounding resident expert weights to
@@ -45,6 +59,7 @@ func NewExpertStore(b engine.Backend, st *safetensors.File, groupSize, bits int,
 	return &ExpertStore{
 		b: b, sw: sw, st: st, groupSize: groupSize, bits: bits, budget: budgetBytes,
 		cache: map[exKey]*list.Element{}, lru: list.New(),
+		readSem: make(chan struct{}, moeReadConcurrency),
 	}
 }
 
@@ -62,6 +77,14 @@ func (s *ExpertStore) Expert(layer int, proj string, e int) (*QuantLinear, error
 	if err != nil {
 		return nil, err
 	}
+	s.insert(k, lin, sz)
+	return lin, nil
+}
+
+// insert pins lin into the cache under k and evicts LRU entries once the byte
+// budget is exceeded (keeping a minimum floor so a token's own working set
+// cannot evict itself mid-assembly).
+func (s *ExpertStore) insert(k exKey, lin *QuantLinear, sz int64) {
 	if s.sw != nil { // pin so the decode loop's per-step Sweep won't free it
 		s.sw.Pin(lin.Weight, lin.Scales, lin.Biases)
 	}
@@ -78,7 +101,78 @@ func (s *ExpertStore) Expert(layer int, proj string, e int) (*QuantLinear, error
 			s.sw.Unpin(ent.lin.Weight, ent.lin.Scales, ent.lin.Biases)
 		}
 	}
-	return lin, nil
+}
+
+// moeProjs are the three projections of one expert's SwiGLU FFN.
+var moeProjs = [3]string{"gate_proj", "up_proj", "down_proj"}
+
+// EnsureCached materializes every (projection, expert) pair the current token
+// needs into the GPU cache, reading ALL missing rows — across projections and
+// tensors — in one bounded-parallel batch. After it returns, Stack calls for
+// these experts are pure cache hits: no disk reads, no host-to-device upload.
+// This is what converts the 40-60% token-to-token expert overlap of top-8
+// routing into saved IO instead of repeated fetches.
+func (s *ExpertStore) EnsureCached(layer int, experts []int) error {
+	var miss [3][]int
+	for pi, proj := range moeProjs {
+		for _, e := range experts {
+			if _, ok := s.cache[exKey{layer, proj, e}]; !ok {
+				miss[pi] = append(miss[pi], e)
+			}
+		}
+	}
+	if len(miss[0])+len(miss[1])+len(miss[2]) == 0 {
+		return nil
+	}
+
+	var reads [3][3]stackedRows // [projection][weight, scales, biases]
+	var errs [3][3]error
+	var wg sync.WaitGroup
+	start := time.Now()
+	for pi, proj := range moeProjs {
+		if len(miss[pi]) == 0 {
+			continue
+		}
+		base := fmt.Sprintf("model.layers.%d.mlp.switch_mlp.%s", layer, proj)
+		for ti, suffix := range [3]string{".weight", ".scales", ".biases"} {
+			wg.Add(1)
+			go func(pi, ti int, name string, experts []int) {
+				defer wg.Done()
+				reads[pi][ti], errs[pi][ti] = s.readRows(name, experts)
+			}(pi, ti, base+suffix, miss[pi])
+		}
+	}
+	wg.Wait()
+	s.readNanos.Add(time.Since(start).Nanoseconds())
+	for pi := range moeProjs {
+		for ti := range errs[pi] {
+			if err := errs[pi][ti]; err != nil {
+				return err
+			}
+		}
+	}
+
+	// Upload + insert sequentially — the backend is single-threaded.
+	for pi, proj := range moeProjs {
+		for mi, e := range miss[pi] {
+			var ts [3]engine.Tensor
+			var sz int64
+			for ti := range ts {
+				r := reads[pi][ti]
+				edt, err := stDType(r.dt)
+				if err != nil {
+					return fmt.Errorf("expert layer %d %s: %w", layer, proj, err)
+				}
+				ts[ti] = s.b.FromRaw(edt, r.rows[mi], r.rowShape...)
+				sz += int64(len(r.rows[mi]))
+			}
+			lin := &QuantLinear{Weight: ts[0], Scales: ts[1], Biases: ts[2],
+				GroupSize: s.groupSize, Bits: s.bits}
+			s.insert(exKey{layer, proj, e}, lin, sz)
+			s.Misses++
+		}
+	}
+	return nil
 }
 
 // Resident reports the current resident expert-weight byte count.
@@ -91,35 +185,133 @@ func (s *ExpertStore) Resident() int64 { return s.bytes }
 // so peak memory is just the transient per-token stacks (~tens of MB); hot
 // experts stay fast via the OS page cache. This is the path that fits in 16 GB.
 func (s *ExpertStore) StackRaw(layer int, proj string, experts []int) (w, sc, bi engine.Tensor, err error) {
-	base := fmt.Sprintf("model.layers.%d.mlp.switch_mlp.%s", layer, proj)
-	if w, err = s.stackTensor(base+".weight", experts); err != nil {
-		return
+	ps, err := s.StackProjs(layer, experts, proj)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	if sc, err = s.stackTensor(base+".scales", experts); err != nil {
-		return
-	}
-	bi, err = s.stackTensor(base+".biases", experts)
-	return
+	return ps[0].W, ps[0].S, ps[0].B, nil
 }
 
-func (s *ExpertStore) stackTensor(name string, experts []int) (engine.Tensor, error) {
-	var dt string
-	var rowShape []int
-	var buf []byte
-	for _, e := range experts {
-		d, shp, raw, err := s.st.StackedRow(name, e)
-		if err != nil {
-			return nil, err
+// StackedProj is one projection's stacked weight/scales/biases tensors.
+type StackedProj struct {
+	W, S, B engine.Tensor
+}
+
+// StackProjs gathers the active experts for several projections of one layer.
+// Every tensor's rows (3 per projection) fetch in one concurrent read phase, so
+// cold misses across projections share the SSD queue instead of arriving in
+// three serial batches. The upload phase stays sequential — the backend may not
+// be called from multiple goroutines.
+func (s *ExpertStore) StackProjs(layer int, experts []int, projs ...string) ([]StackedProj, error) {
+	names := make([]string, 0, len(projs)*3)
+	for _, p := range projs {
+		base := fmt.Sprintf("model.layers.%d.mlp.switch_mlp.%s", layer, p)
+		names = append(names, base+".weight", base+".scales", base+".biases")
+	}
+
+	reads := make([]stackedRows, len(names))
+	errs := make([]error, len(names))
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i, name := range names {
+		wg.Add(1)
+		go func(i int, name string) {
+			defer wg.Done()
+			reads[i], errs[i] = s.readRows(name, experts)
+		}(i, name)
+	}
+	wg.Wait()
+	s.readNanos.Add(time.Since(start).Nanoseconds())
+	for i, e := range errs {
+		if e != nil {
+			return nil, fmt.Errorf("expert %s: %w", names[i], e)
 		}
-		dt, rowShape = d, shp
-		buf = append(buf, raw...)
 	}
-	edt, err := stDType(dt)
+
+	out := make([]StackedProj, len(projs))
+	for i := range projs {
+		var p StackedProj
+		var err error
+		if p.W, err = s.upload(reads[i*3], len(experts)); err != nil {
+			return nil, fmt.Errorf("expert %s: %w", names[i*3], err)
+		}
+		if p.S, err = s.upload(reads[i*3+1], len(experts)); err != nil {
+			return nil, fmt.Errorf("expert %s: %w", names[i*3+1], err)
+		}
+		if p.B, err = s.upload(reads[i*3+2], len(experts)); err != nil {
+			return nil, fmt.Errorf("expert %s: %w", names[i*3+2], err)
+		}
+		out[i] = p
+	}
+	return out, nil
+}
+
+// stackedRows is one tensor's rows for the active experts, in expert order.
+type stackedRows struct {
+	dt       string
+	rowShape []int
+	rows     [][]byte
+}
+
+// readRows fetches one row per expert with bounded parallel preads, so cold
+// rows come off the SSD concurrently instead of queueing behind each other.
+// Hot rows still resolve from the OS page cache at memcpy speed.
+func (s *ExpertStore) readRows(name string, experts []int) (stackedRows, error) {
+	out := stackedRows{rows: make([][]byte, len(experts))}
+	errs := make([]error, len(experts))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var bytes int64
+	for i, e := range experts {
+		wg.Add(1)
+		s.readSem <- struct{}{}
+		go func(i, e int) {
+			defer wg.Done()
+			defer func() { <-s.readSem }()
+			dt, shp, raw, err := s.st.StackedRow(name, e)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			out.rows[i] = raw
+			atomic.AddInt64(&bytes, int64(len(raw)))
+			mu.Lock()
+			out.dt, out.rowShape = dt, shp
+			mu.Unlock()
+		}(i, e)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return stackedRows{}, err
+		}
+	}
+	s.readBytes.Add(bytes)
+	return out, nil
+}
+
+// upload assembles ordered rows into one stacked device tensor.
+func (s *ExpertStore) upload(r stackedRows, nExperts int) (engine.Tensor, error) {
+	edt, err := stDType(r.dt)
 	if err != nil {
-		return nil, fmt.Errorf("expert %s: %w", name, err)
+		return nil, err
 	}
-	shape := append([]int{len(experts)}, rowShape...)
+	var buf []byte
+	if len(r.rows) > 0 {
+		buf = make([]byte, 0, len(r.rows)*len(r.rows[0]))
+	}
+	for _, row := range r.rows {
+		buf = append(buf, row...)
+	}
+	shape := append([]int{nExperts}, r.rowShape...)
 	return s.b.FromRaw(edt, buf, shape...), nil
+}
+
+// IOStats reports cumulative expert-stream reads: total bytes and wall time
+// spent awaiting row fetches. Wall time counts each readRows batch once, not
+// per row, so it approximates the decode loop's actual IO stall.
+func (s *ExpertStore) IOStats() (bytes int64, dur time.Duration) {
+	return s.readBytes.Load(), time.Duration(s.readNanos.Load())
 }
 
 // Stack returns the active experts' weight/scales/biases stacked along a new
@@ -177,7 +369,8 @@ type MoEBlock struct {
 // LoadMoEBlock loads the router for one layer; experts come from the shared store.
 func LoadMoEBlock(b engine.Backend, st *safetensors.File, layer int, cfg Config, store *ExpertStore) (*MoEBlock, error) {
 	prefix := fmt.Sprintf("model.layers.%d.mlp.gate", layer)
-	router, err := LoadQuantLinear(b, st, prefix, cfg.GroupSize, cfg.Bits, false)
+	gs, bits := cfg.QuantFor(prefix)
+	router, err := LoadQuantLinear(b, st, prefix, gs, bits, false)
 	if err != nil {
 		return nil, fmt.Errorf("load router layer %d: %w", layer, err)
 	}
@@ -260,19 +453,38 @@ func (m *MoEBlock) Forward(b engine.Backend, x engine.Tensor) engine.Tensor {
 		}
 	}
 
-	// Materialize the layer's unique experts ONCE, then one fused
-	// GatherQuantMatmul over the whole sequence per projection.
-	gW, gS, gB, err := m.Store.StackRaw(m.Layer, "gate_proj", uniq)
-	if err != nil {
-		panic(err)
+	// Materialize the layer's unique experts, then one fused GatherQuantMatmul
+	// over the whole sequence per projection.
+	//
+	// Single-token steps prefer the persistent slot cache: hits skip both the
+	// disk read and the host-to-device upload, and misses land via ONE batched
+	// ScatterRows per tensor, keeping the op count flat. (A per-expert cache
+	// assembled with Concat chains was measured 20x slower — 24 small MLX ops
+	// per layer per token dwarf the saved reads.) Multi-token chunks touch too
+	// many experts to cache and use transient per-chunk stacks.
+	var gW, gS, gB, uW, uS, uB, dW, dS, dB engine.Tensor
+	slotted := false
+	if nTok == 1 && slotCacheEnabled() {
+		if projs, slotIdx, ok, serr := m.Store.SlotStack(m.Layer, uniq); serr != nil {
+			panic(serr)
+		} else if ok {
+			for j := range ri {
+				ri[j] = slotIdx[ri[j]]
+			}
+			gW, gS, gB = projs[0].W, projs[0].S, projs[0].B
+			uW, uS, uB = projs[1].W, projs[1].S, projs[1].B
+			dW, dS, dB = projs[2].W, projs[2].S, projs[2].B
+			slotted = true
+		}
 	}
-	uW, uS, uB, err := m.Store.StackRaw(m.Layer, "up_proj", uniq)
-	if err != nil {
-		panic(err)
-	}
-	dW, dS, dB, err := m.Store.StackRaw(m.Layer, "down_proj", uniq)
-	if err != nil {
-		panic(err)
+	if !slotted {
+		ps, err := m.Store.StackProjs(m.Layer, uniq, "gate_proj", "up_proj", "down_proj")
+		if err != nil {
+			panic(err)
+		}
+		gW, gS, gB = ps[0].W, ps[0].S, ps[0].B
+		uW, uS, uB = ps[1].W, ps[1].S, ps[1].B
+		dW, dS, dB = ps[2].W, ps[2].S, ps[2].B
 	}
 	gs, bits := m.Store.groupSize, m.Store.bits
 	hidden := shp[nd-1]

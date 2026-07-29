@@ -42,7 +42,27 @@ type Config struct {
 	SparseStep      int  // every Nth layer is MoE (1 = all)
 	NormTopk        bool // renormalize the top-k router scores
 
+	// QuantOverrides maps a tensor name to its quantization when it differs
+	// from the global GroupSize/Bits — mlx-community MoE checkpoints quantize
+	// the per-layer routers at 8-bit while everything else is 4-bit.
+	QuantOverrides map[string]QuantSpec
+
 	EosTokens []int32 // end-of-sequence token ids (stop tokens)
+}
+
+// QuantSpec is one tensor's affine-quantization parameters.
+type QuantSpec struct {
+	GroupSize int `json:"group_size"`
+	Bits      int `json:"bits"`
+}
+
+// QuantFor resolves the quantization for a named tensor: its override if the
+// checkpoint declares one, else the global defaults.
+func (c Config) QuantFor(name string) (groupSize, bits int) {
+	if q, ok := c.QuantOverrides[name]; ok {
+		return q.GroupSize, q.Bits
+	}
+	return c.GroupSize, c.Bits
 }
 
 // rawConfig mirrors the HF config.json fields we consume.
@@ -69,10 +89,7 @@ type rawConfig struct {
 		HighFreqFactor                float64 `json:"high_freq_factor"`
 		OriginalMaxPositionEmbeddings int     `json:"original_max_position_embeddings"`
 	} `json:"rope_scaling"`
-	Quantization struct {
-		GroupSize int `json:"group_size"`
-		Bits      int `json:"bits"`
-	} `json:"quantization"`
+	Quantization json.RawMessage `json:"quantization"`
 	NumExperts          int   `json:"num_experts"`
 	NumExpertsPerTok    int   `json:"num_experts_per_tok"`
 	MoeIntermediateSize int   `json:"moe_intermediate_size"`
@@ -89,6 +106,34 @@ func LoadConfig(modelDir string) (Config, error) {
 	var r rawConfig
 	if err := json.Unmarshal(raw, &r); err != nil {
 		return Config{}, fmt.Errorf("parse config.json: %w", err)
+	}
+
+	// The quantization object holds global group_size/bits plus optional
+	// per-tensor overrides as sibling keys whose values are objects:
+	//   {"group_size":64, "bits":4, "model.layers.0.mlp.gate":{"group_size":64,"bits":8}}
+	var globalQ QuantSpec
+	var quantOverrides map[string]QuantSpec
+	if len(r.Quantization) > 0 {
+		if err := json.Unmarshal(r.Quantization, &globalQ); err != nil {
+			return Config{}, fmt.Errorf("parse quantization: %w", err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(r.Quantization, &fields); err != nil {
+			return Config{}, fmt.Errorf("parse quantization: %w", err)
+		}
+		for name, v := range fields {
+			if len(v) == 0 || v[0] != '{' {
+				continue
+			}
+			var q QuantSpec
+			if err := json.Unmarshal(v, &q); err != nil || q.Bits == 0 {
+				continue
+			}
+			if quantOverrides == nil {
+				quantOverrides = map[string]QuantSpec{}
+			}
+			quantOverrides[name] = q
+		}
 	}
 
 	headDim := r.HeadDim
@@ -112,8 +157,9 @@ func LoadConfig(modelDir string) (Config, error) {
 		Intermediate:       r.IntermediateSize,
 		RopeBase:           float32(r.RopeTheta),
 		RMSEps:             float32(r.RMSNormEps),
-		GroupSize:          r.Quantization.GroupSize,
-		Bits:               r.Quantization.Bits,
+		GroupSize:          globalQ.GroupSize,
+		Bits:               globalQ.Bits,
+		QuantOverrides:     quantOverrides,
 		TieWordEmbeddings:  tie,
 		AttentionBias:      r.ModelType == "qwen2", // qwen2 always has q/k/v bias
 		QKNorm:             r.ModelType == "qwen3" || r.ModelType == "qwen3_moe",

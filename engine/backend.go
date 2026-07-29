@@ -58,6 +58,18 @@ type Freer interface {
 	Free(ts ...Tensor)
 }
 
+// RowScatterer is implemented by backends that can replace selected leading-
+// axis rows of a stacked tensor in one fused op. MoE expert slot caches use it
+// to land a token's missed experts into persistent [slots, ...] tensors — one
+// scatter per tensor instead of per-row updates or concat chains, which is
+// what keeps the op count flat as the cache fills. Optional; callers fall back
+// to rebuilding transient stacks per token.
+type RowScatterer interface {
+	// ScatterRows returns dst with dst[indices[i]] = updates[i] along axis 0.
+	// updates is [len(indices), ...] with trailing dims equal to dst's.
+	ScatterRows(dst Tensor, indices []int32, updates Tensor) Tensor
+}
+
 // Backend records a tensor graph and evaluates it. Implementations wrap a
 // kernel library; model code depends only on this interface.
 //

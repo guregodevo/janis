@@ -213,6 +213,25 @@ func (b *Backend) Concat(a, bb engine.Tensor, axis int) engine.Tensor {
 }
 
 // Slice keeps [start:end] along axis, full extent elsewhere.
+// ScatterRows returns dst with the rows at the given leading-axis indices
+// replaced by the rows of updates ([len(indices), ...dst.shape[1:]]).
+func (b *Backend) ScatterRows(dst engine.Tensor, indices []int32, updates engine.Tensor) engine.Tensor {
+	td, tu := as(dst), as(updates)
+	out := newTensor(td.dt, td.shape...)
+	copy(out.data, td.data)
+	if td.u32 != nil {
+		out.u32 = append([]uint32(nil), td.u32...)
+	}
+	rowLen := numel(td.shape[1:])
+	for i, idx := range indices {
+		if out.u32 != nil {
+			copy(out.u32[int(idx)*rowLen:(int(idx)+1)*rowLen], tu.u32[i*rowLen:(i+1)*rowLen])
+		}
+		copy(out.data[int(idx)*rowLen:(int(idx)+1)*rowLen], tu.data[i*rowLen:(i+1)*rowLen])
+	}
+	return out
+}
+
 func (b *Backend) Slice(x engine.Tensor, axis, start, end int) engine.Tensor {
 	tx := as(x)
 	if axis < 0 {

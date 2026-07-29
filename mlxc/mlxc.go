@@ -353,6 +353,28 @@ func (b *Backend) Reshape(x engine.Tensor, shape ...int) engine.Tensor {
 	return b.newT(out, cloneShape(shape))
 }
 
+// ScatterRows replaces dst's rows at the given leading-axis indices with the
+// rows of updates ([len(indices), ...dst.shape[1:]]) in one mlx_scatter_single.
+// MLX scatter semantics want updates shaped indices.shape + dst.shape with the
+// scattered axis collapsed to 1, so updates reshapes to [M, 1, ...].
+func (b *Backend) ScatterRows(dst engine.Tensor, indices []int32, updates engine.Tensor) engine.Tensor {
+	td, tu := dst.(*tensor), updates.(*tensor)
+	idxShape := []int{len(indices)}
+	cs, _ := cShape(idxShape)
+	idxArr := C.mlx_array_new_data(unsafe.Pointer(&indices[0]), &cs[0], C.int(len(cs)), C.MLX_INT32)
+	defer C.mlx_array_free(idxArr)
+
+	upShape := append([]int{len(indices), 1}, td.shape[1:]...)
+	ucs, _ := cShape(upShape)
+	reshaped := C.mlx_array_new()
+	C.mlx_reshape(&reshaped, tu.arr, &ucs[0], C.size_t(len(ucs)), b.stream)
+	defer C.mlx_array_free(reshaped)
+
+	out := C.mlx_array_new()
+	C.mlx_scatter_single(&out, td.arr, idxArr, reshaped, 0, b.stream)
+	return b.newT(out, cloneShape(td.shape))
+}
+
 func (b *Backend) Transpose(x engine.Tensor, axes ...int) engine.Tensor {
 	tx := x.(*tensor)
 	ca := make([]C.int, len(axes))

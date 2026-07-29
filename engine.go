@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"memdoor/llm/chat"
 	"memdoor/llm/engine"
@@ -86,6 +87,7 @@ type Engine struct {
 	mtype       string
 	stops       map[int32]bool
 	vocab       int
+	experts     *qwen.ExpertStore // non-nil for MoE models (streamed experts)
 	// tokTable is a lazily-built id→text table for grammar-constrained decoding:
 	// the sampler tests the grammar against many candidate tokens each step, so it
 	// needs O(1) token text, not a per-candidate cgo tokenizer call. Built once,
@@ -116,6 +118,7 @@ func Open(modelDir string) (*Engine, error) {
 			return nil, err
 		}
 		sm = m
+		e.experts = m.Experts
 	case "gemma2":
 		m, err := gemma.LoadModel(b, st, cfg)
 		if err != nil {
@@ -143,6 +146,17 @@ func Open(modelDir string) (*Engine, error) {
 
 // ModelType reports the loaded architecture (qwen2/qwen3/llama/gemma2).
 func (e *Engine) ModelType() string { return e.mtype }
+
+// ExpertIOStats reports cumulative streamed-expert reads for MoE models:
+// total bytes fetched and wall time blocked awaiting them. ok is false for
+// dense models, which have no streamed experts.
+func (e *Engine) ExpertIOStats() (bytes int64, dur time.Duration, ok bool) {
+	if e.experts == nil {
+		return 0, 0, false
+	}
+	bytes, dur = e.experts.IOStats()
+	return bytes, dur, true
+}
 
 // tokenText returns the decoded text of a single token via a table built once on
 // first use. Grammar-constrained decoding vets many candidate tokens per step, so
