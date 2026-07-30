@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -235,6 +236,31 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 				onDelta(full[len(emitted):])
 				emitted = full
 			}
+		}
+	}
+
+	if opts.ToolCallGrammar {
+		// Whitespace-runaway guard: grammar-forced decoding on some models
+		// (live: Qwen3-Coder-30B) emits a complete tool call and then endless
+		// whitespace instead of the closing tag, burning the whole token budget
+		// in silence. 16 consecutive whitespace-only tokens is pathological in
+		// any real output — stop there. Free-text turns are unaffected (the
+		// repetition penalty covers those).
+		var wsRun int
+		prevOnToken := p.OnToken
+		p.OnToken = func(tok int32) {
+			if strings.TrimSpace(e.tokenText(tok)) == "" {
+				wsRun++
+			} else {
+				wsRun = 0
+			}
+			if prevOnToken != nil {
+				prevOnToken(tok)
+			}
+		}
+		prevCancel := p.Cancel
+		p.Cancel = func() bool {
+			return wsRun >= 16 || (prevCancel != nil && prevCancel())
 		}
 	}
 
