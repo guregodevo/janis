@@ -480,6 +480,52 @@ func (m *MoEBlock) Forward(b engine.Backend, x engine.Tensor) engine.Tensor {
 	// expert matmuls batch into the single per-token eval, reclaimed by the
 	// decode loop's per-step Sweep.
 	if nTok == 1 && slotCacheEnabled() {
+		// IO/compute overlap: gather the cache-hit partition from the CURRENT
+		// slot tensors and start its evaluation asynchronously, so the GPU
+		// crunches hits while the CPU reads the miss experts off SSD. The
+		// scatter below produces NEW slot tensors (MLX arrays are immutable),
+		// so the in-flight hit gather keeps valid inputs. Both partitions run
+		// K-wide with the other side's scores zeroed, summed at the end.
+		if asyncOverlapEnabled() {
+			if projsOld, slotIdx, ok := m.Store.SlotHits(m.Layer, uniq); ok {
+				hasHit, hasMiss := false, false
+				for _, si := range slotIdx {
+					if si >= 0 {
+						hasHit = true
+					} else {
+						hasMiss = true
+					}
+				}
+				if hasHit && hasMiss {
+					riHit := make([]int32, len(ri))
+					scHit := make([]float32, len(scores))
+					for j, p := range ri {
+						if slotIdx[p] >= 0 {
+							riHit[j], scHit[j] = slotIdx[p], scores[j]
+						}
+					}
+					outHit, _ := moeApply(projsOld, riHit, scHit)
+					if ae, aok := b.(engine.AsyncEvaler); aok {
+						ae.AsyncEval(outHit)
+					}
+					projsNew, slotIdxNew, ok2, serr := m.Store.slotStackFill(m.Layer, uniq, false)
+					if serr != nil {
+						panic(serr)
+					}
+					if ok2 {
+						riMiss := make([]int32, len(ri))
+						scMiss := make([]float32, len(scores))
+						for j, p := range ri {
+							if slotIdx[p] < 0 {
+								riMiss[j], scMiss[j] = slotIdxNew[p], scores[j]
+							}
+						}
+						outMiss, _ := moeApply(projsNew, riMiss, scMiss)
+						return b.Add(outHit, outMiss)
+					}
+				}
+			}
+		}
 		if projs, slotIdx, ok, serr := m.Store.SlotStack(m.Layer, uniq); serr != nil {
 			panic(serr)
 		} else if ok {

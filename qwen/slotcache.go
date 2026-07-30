@@ -15,6 +15,11 @@ import (
 // MEMDOOR_MOE_SLOT_CACHE=0 as the escape hatch back to transient stacks.
 func slotCacheEnabled() bool { return os.Getenv("MEMDOOR_MOE_SLOT_CACHE") != "0" }
 
+// asyncOverlapEnabled gates the decode IO/compute overlap (hit gather
+// async-evaluated while miss reads run). Opt-in while being validated:
+// MEMDOOR_MOE_ASYNC_OVERLAP=1.
+func asyncOverlapEnabled() bool { return os.Getenv("MEMDOOR_MOE_ASYNC_OVERLAP") == "1" }
+
 // slotsPerLayer is the expert-slot count per MoE layer. 16 slots hold two
 // tokens' top-8 sets; with 40-60% token-to-token expert reuse that converts
 // most of the overlap into cache hits while pinning only
@@ -46,6 +51,13 @@ type layerSlots struct {
 // (aligned with the experts argument). ok is false when the backend cannot
 // scatter rows (caller falls back to transient stacks).
 func (s *ExpertStore) SlotStack(layer int, experts []int) (projs [3]StackedProj, slotIdx []int32, ok bool, err error) {
+	return s.slotStackFill(layer, experts, true)
+}
+
+// slotStackFill is SlotStack's implementation; countHits=false suppresses hit
+// accounting for callers that already counted them via SlotHits (the async-
+// overlap decode path probes first, then fills).
+func (s *ExpertStore) slotStackFill(layer int, experts []int, countHits bool) (projs [3]StackedProj, slotIdx []int32, ok bool, err error) {
 	sc, scOK := s.b.(engine.RowScatterer)
 	if !scOK {
 		return projs, nil, false, nil
@@ -70,7 +82,9 @@ func (s *ExpertStore) SlotStack(layer int, experts []int) (projs [3]StackedProj,
 				slotIdx[i] = int32(sl)
 				ls.freq[sl]++
 				ls.lastUse[sl] = ls.tick
-				s.Hits++
+				if countHits {
+					s.Hits++
+				}
 			} else {
 				missPos = append(missPos, i)
 			}
