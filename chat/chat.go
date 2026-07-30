@@ -28,10 +28,13 @@ func ApplyTemplate(modelType string, msgs []Message) string {
 		return gemma(msgs)
 	case "llama":
 		return llama3(msgs)
-	case "qwen3":
-		// Qwen3 is a reasoning model: prime the assistant turn with an empty
-		// think block to skip the <think>…</think> generation (the official
-		// enable_thinking=false behavior) unless thinking is explicitly enabled.
+	case "qwen3", "qwen3_moe":
+		// Qwen3 (dense and MoE) is a reasoning family: prime the assistant turn
+		// with an empty think block to skip the <think>…</think> generation (the
+		// official enable_thinking=false behavior) unless thinking is explicitly
+		// enabled. Without this, a 30B-A3B agent turn spent its entire decode
+		// budget inside <think>, the provider stripped it, and the agent went
+		// silent (live: "Agent produced empty final text").
 		return chatml(msgs, !thinkingEnabled())
 	default: // qwen2 -> ChatML (no reasoning)
 		return chatml(msgs, false)
