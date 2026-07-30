@@ -2,6 +2,7 @@ package qwen
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"strconv"
@@ -142,7 +143,22 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 			return nil
 		}
 	}
-	tok := sampleToken(b.Floats(logits), p, rng, nil) // last-position logits; no history yet
+	floats := b.Floats(logits) // last-position logits; no history yet
+	tok := sampleToken(floats, p, rng, nil)
+	if p.Stop[tok] && nGen > 0 {
+		// A turn that ends before it begins is never the right outcome: on the
+		// full 8k-token agent prompt the streamed 30B sampled <|im_end|> as its
+		// FIRST token, producing zero-token "empty final text" turns after 25
+		// minutes of prefill. Mask every stop token for the first position and
+		// resample — the model must say something; downstream absorbers can
+		// handle whatever that is.
+		for id := range p.Stop {
+			if int(id) >= 0 && int(id) < len(floats) {
+				floats[id] = float32(math.Inf(-1))
+			}
+		}
+		tok = sampleToken(floats, p, rng, nil)
+	}
 	if sw != nil {
 		sw.Unpin(logits)
 		pinCaches(sw, s.Caches)
