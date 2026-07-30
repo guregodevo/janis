@@ -332,9 +332,21 @@ func (m *Model) GenerateSampled(b engine.Backend, prompt []int32, nGen int, p Sa
 func (m *Model) NewSession() *Session {
 	s := &Session{NLayers: m.Cfg.Layers, Vocab: m.Cfg.Vocab, Forward: m.forwardCachedT}
 	if m.Cfg.NumExperts > 0 {
-		s.PrefillChunk = 1
+		s.PrefillChunk = moePrefillChunk()
 	}
 	return s
+}
+
+// moePrefillChunk is the MoE prefill row-group size. 1 (the measured default)
+// prefills each prompt token through the stream-free decode path; a moderate
+// chunk amortizes per-layer eval and batches expert reads across rows at the
+// cost of touching more experts per step. MEMDOOR_MOE_PREFILL_CHUNK overrides
+// for measurement.
+func moePrefillChunk() int {
+	if n, _ := strconv.Atoi(os.Getenv("MEMDOOR_MOE_PREFILL_CHUNK")); n > 0 {
+		return n
+	}
+	return 1
 }
 
 // ForwardFunc computes logits [1, seqLen, vocab] for a device index tensor
