@@ -453,17 +453,32 @@ func (m *MoEBlock) Forward(b engine.Backend, x engine.Tensor) engine.Tensor {
 		}
 	}
 
-	// Materialize the layer's unique experts, then one fused GatherQuantMatmul
-	// over the whole sequence per projection.
-	//
-	// Single-token steps prefer the persistent slot cache: hits skip both the
-	// disk read and the host-to-device upload, and misses land via ONE batched
+	gs, bits := m.Store.groupSize, m.Store.bits
+	hidden := shp[nd-1]
+	// moeApply runs the fused gather-SwiGLU-reduce over one stacked expert
+	// source. mlx-lm convention: x -> [..lead.., 1, 1, hidden] (double expand);
+	// each gather_qmm yields [..lead.., K, 1, N]; squeeze the M=1 axis, then
+	// score-weighted sum over the K experts: mean(d*scores)*K. temps are the
+	// intermediates a prefill caller frees after its per-layer eval.
+	moeApply := func(p [3]StackedProj, ri []int32, scores []float32) (out engine.Tensor, temps []engine.Tensor) {
+		ridx := b.FromInt32(ri, append(append([]int{}, lead...), K)...)
+		xe := b.ExpandDims(b.ExpandDims(x, nd-1), nd-1)
+		g := b.GatherQuantMatmul(xe, p[0].W, p[0].S, p[0].B, ridx, true, gs, bits)
+		u := b.GatherQuantMatmul(xe, p[1].W, p[1].S, p[1].B, ridx, true, gs, bits)
+		hh := b.Mul(b.SiLU(g), u)
+		d := b.GatherQuantMatmul(hh, p[2].W, p[2].S, p[2].B, ridx, true, gs, bits)
+		d2 := b.Reshape(d, append(append([]int{}, lead...), K, hidden)...)
+		scT := b.FromFloats(scores, append(append([]int{}, lead...), K, 1)...)
+		return b.ScalarMul(b.Mean(b.Mul(d2, scT), nd-1), float32(K)), []engine.Tensor{g, u, hh, d}
+	}
+
+	// Decode (nTok==1): the persistent slot cache. Hits skip both the disk
+	// read and the host-to-device upload; misses land via ONE batched
 	// ScatterRows per tensor, keeping the op count flat. (A per-expert cache
 	// assembled with Concat chains was measured 20x slower — 24 small MLX ops
-	// per layer per token dwarf the saved reads.) Multi-token chunks touch too
-	// many experts to cache and use transient per-chunk stacks.
-	var gW, gS, gB, uW, uS, uB, dW, dS, dB engine.Tensor
-	slotted := false
+	// per layer per token dwarf the saved reads.) Stream-free and lazy: the
+	// expert matmuls batch into the single per-token eval, reclaimed by the
+	// decode loop's per-step Sweep.
 	if nTok == 1 && slotCacheEnabled() {
 		if projs, slotIdx, ok, serr := m.Store.SlotStack(m.Layer, uniq); serr != nil {
 			panic(serr)
@@ -471,49 +486,76 @@ func (m *MoEBlock) Forward(b engine.Backend, x engine.Tensor) engine.Tensor {
 			for j := range ri {
 				ri[j] = slotIdx[ri[j]]
 			}
-			gW, gS, gB = projs[0].W, projs[0].S, projs[0].B
-			uW, uS, uB = projs[1].W, projs[1].S, projs[1].B
-			dW, dS, dB = projs[2].W, projs[2].S, projs[2].B
-			slotted = true
+			out, _ := moeApply(projs, ri, scores)
+			return out
 		}
 	}
-	if !slotted {
-		ps, err := m.Store.StackProjs(m.Layer, uniq, "gate_proj", "up_proj", "down_proj")
-		if err != nil {
-			panic(err)
-		}
-		gW, gS, gB = ps[0].W, ps[0].S, ps[0].B
-		uW, uS, uB = ps[1].W, ps[1].S, ps[1].B
-		dW, dS, dB = ps[2].W, ps[2].S, ps[2].B
-	}
-	gs, bits := m.Store.groupSize, m.Store.bits
-	hidden := shp[nd-1]
-	// mlx-lm convention: x -> [..lead.., 1, 1, hidden] (double expand); each
-	// gather_qmm yields [..lead.., K, 1, N]; squeeze the M=1 axis at the end.
-	ridx := b.FromInt32(ri, append(append([]int{}, lead...), K)...)
-	xe := b.ExpandDims(b.ExpandDims(x, nd-1), nd-1)                // [..lead.., 1, 1, hidden]
-	g := b.GatherQuantMatmul(xe, gW, gS, gB, ridx, true, gs, bits) // [..lead.., K, 1, inter]
-	u := b.GatherQuantMatmul(xe, uW, uS, uB, ridx, true, gs, bits)
-	hh := b.Mul(b.SiLU(g), u)                                      // [..lead.., K, 1, inter]
-	d := b.GatherQuantMatmul(hh, dW, dS, dB, ridx, true, gs, bits) // [..lead.., K, 1, hidden]
-	// squeeze the M=1 axis -> [..lead.., K, hidden], then score-weighted sum
-	// over the K experts (axis nd-1): mean(d*scores)*K.
-	d2 := b.Reshape(d, append(append([]int{}, lead...), K, hidden)...)
-	scT := b.FromFloats(scores, append(append([]int{}, lead...), K, 1)...)
-	out := b.ScalarMul(b.Mean(b.Mul(d2, scT), nd-1), float32(K)) // [..lead.., hidden]
 
-	// Decode (nTok==1): stream-free. Don't eval or free here — the heavy expert
-	// matmuls stay lazy and batch into the single per-token eval, so there's no
-	// per-layer GPU sync. The ~900 MB of one token's 48 stacks stays tracked and
-	// is reclaimed by the decode loop's per-step Sweep. This is the hot path.
-	//
-	// Prefill (nTok>1): the lazy graph would otherwise hold all 48 layers' large
-	// per-sequence stacks at once -> OOM. Eval per layer and free its stacks to
-	// bound peak to one layer; a one-time cost on the prompt, not the hot path.
+	// Prefill (nTok>1) with a warm slot cache: HYBRID. Cache-resident experts
+	// gather straight from the pinned slot tensors (zero IO, zero upload);
+	// only the misses are read into a transient stack. The cache is never
+	// mutated — naive chunked prefill measured WORSE partly because it evicted
+	// decode's hot set. Both partitions run the full K-wide gather with the
+	// other side's scores zeroed (extra FLOPs are cheap; prefill is IO-bound).
+	if nTok > 1 && slotCacheEnabled() {
+		if slotProjs, slotIdx, ok := m.Store.SlotHits(m.Layer, uniq); ok {
+			var missUniq []int
+			missPos := make([]int32, len(uniq))
+			for p, e := range uniq {
+				if slotIdx[p] < 0 {
+					missPos[p] = int32(len(missUniq))
+					missUniq = append(missUniq, e)
+				}
+			}
+			if len(missUniq) < len(uniq) { // some hits — the hybrid pays off
+				riHit := make([]int32, len(ri))
+				scHit := make([]float32, len(scores))
+				riMiss := make([]int32, len(ri))
+				scMiss := make([]float32, len(scores))
+				for j, p := range ri {
+					if slotIdx[p] >= 0 {
+						riHit[j], scHit[j] = slotIdx[p], scores[j]
+					} else {
+						riMiss[j], scMiss[j] = missPos[p], scores[j]
+					}
+				}
+				out, temps := moeApply(slotProjs, riHit, scHit)
+				var missTemps []engine.Tensor
+				if len(missUniq) > 0 {
+					mps, err := m.Store.StackProjs(m.Layer, missUniq, "gate_proj", "up_proj", "down_proj")
+					if err != nil {
+						panic(err)
+					}
+					mp := [3]StackedProj{mps[0], mps[1], mps[2]}
+					mOut, mTemps := moeApply(mp, riMiss, scMiss)
+					out = b.Add(out, mOut)
+					missTemps = append(mTemps,
+						mp[0].W, mp[0].S, mp[0].B, mp[1].W, mp[1].S, mp[1].B, mp[2].W, mp[2].S, mp[2].B)
+				}
+				b.Eval(out)
+				if f, fok := b.(engine.Freer); fok {
+					f.Free(append(temps, missTemps...)...)
+				}
+				return out
+			}
+		}
+	}
+
+	// Transient fallback: materialize the layer's unique experts in one fused
+	// cross-projection read phase, gather, and (for prefill) eval per layer and
+	// free the stacks so peak memory stays at one layer instead of accumulating
+	// all of them until the per-step Sweep.
+	pss, err := m.Store.StackProjs(m.Layer, uniq, "gate_proj", "up_proj", "down_proj")
+	if err != nil {
+		panic(err)
+	}
+	ps := [3]StackedProj{pss[0], pss[1], pss[2]}
+	out, temps := moeApply(ps, ri, scores)
 	if nTok > 1 {
 		b.Eval(out)
-		if f, ok := b.(engine.Freer); ok {
-			f.Free(gW, gS, gB, uW, uS, uB, dW, dS, dB, g, u, hh, d)
+		if f, fok := b.(engine.Freer); fok {
+			f.Free(append(temps,
+				ps[0].W, ps[0].S, ps[0].B, ps[1].W, ps[1].S, ps[1].B, ps[2].W, ps[2].S, ps[2].B)...)
 		}
 	}
 	return out

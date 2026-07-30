@@ -268,6 +268,58 @@ func TestSlotStack(t *testing.T) {
 	}
 }
 
+// TestSlotHits checks the read-only cache probe prefill uses: hits map to
+// their slots, misses are -1, and probing mutates nothing — no insertions,
+// no evictions, no reads.
+func TestSlotHits(t *testing.T) {
+	t.Setenv("MEMDOOR_MOE_SLOTS", "4")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "model.safetensors")
+	const N = 8
+	ts := map[string]synTensor{}
+	for _, p := range []string{"gate_proj", "up_proj", "down_proj"} {
+		base := "model.layers.0.mlp.switch_mlp." + p
+		ts[base+".weight"] = synTensor{"U32", []int{N, 2, 1}, make([]byte, N*2*4)}
+		ts[base+".scales"] = synTensor{"F16", []int{N, 2, 1}, make([]byte, N*2*2)}
+		ts[base+".biases"] = synTensor{"F16", []int{N, 2, 1}, make([]byte, N*2*2)}
+	}
+	writeSyntheticST(t, path, ts)
+	st, err := safetensors.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	store := NewExpertStore(cpu.New(), st, 64, 4, 1<<20)
+
+	// No cache yet: not ok.
+	if _, _, ok := store.SlotHits(0, []int{1, 2}); ok {
+		t.Fatal("SlotHits should report ok=false before any SlotStack")
+	}
+
+	// Warm experts 5 and 2 via the decode path, then probe a mixed set.
+	if _, _, _, err := store.SlotStack(0, []int{5, 2}); err != nil {
+		t.Fatal(err)
+	}
+	bytesBefore, _ := store.IOStats()
+	_, idx, ok := store.SlotHits(0, []int{5, 7, 2})
+	if !ok {
+		t.Fatal("SlotHits should be ok after SlotStack warmed the layer")
+	}
+	if idx[0] < 0 || idx[2] < 0 {
+		t.Errorf("experts 5 and 2 should be hits, got %v", idx)
+	}
+	if idx[1] != -1 {
+		t.Errorf("expert 7 should be a miss (-1), got %d", idx[1])
+	}
+	if b, _ := store.IOStats(); b != bytesBefore {
+		t.Errorf("SlotHits read %d bytes; must be read-free", b-bytesBefore)
+	}
+	// The miss must NOT have been inserted.
+	if _, idx2, _ := store.SlotHits(0, []int{7}); idx2[0] != -1 {
+		t.Error("SlotHits must not insert misses into the cache")
+	}
+}
+
 // TestStackProjs checks the fused multi-projection fetch: one call yields
 // stacked W/S/B tensors per projection with the leading axis sized to the
 // active expert count.

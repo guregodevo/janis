@@ -171,6 +171,28 @@ func (s *ExpertStore) SlotStack(layer int, experts []int) (projs [3]StackedProj,
 	return ls.projs, slotIdx, true, nil
 }
 
+// SlotHits reports which of the given experts are resident in the layer's slot
+// cache, WITHOUT mutating the cache: no insertion, no eviction, no LFU decay —
+// prefill uses it to read only its cache misses while decode's hot set stays
+// intact. Returns the slot tensors, a per-expert slot index (-1 = miss), and
+// ok=false when the layer has no slot cache yet.
+func (s *ExpertStore) SlotHits(layer int, experts []int) (projs [3]StackedProj, slotIdx []int32, ok bool) {
+	ls := s.slots[layer]
+	if ls == nil {
+		return projs, nil, false
+	}
+	slotIdx = make([]int32, len(experts))
+	for i, e := range experts {
+		if sl, hit := ls.expertSlot[e]; hit {
+			slotIdx[i] = int32(sl)
+			s.Hits++
+		} else {
+			slotIdx[i] = -1
+		}
+	}
+	return ls.projs, slotIdx, true
+}
+
 // newLayerSlots allocates the persistent slot tensors for one layer, shaped
 // from the first read batch and zero-filled.
 func (s *ExpertStore) newLayerSlots(nSlots int, reads [3][3]stackedRows) *layerSlots {
