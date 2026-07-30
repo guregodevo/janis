@@ -37,7 +37,20 @@ type state struct {
 	inStr   bool // inside a JSON string literal
 	esc     bool // previous byte was a backslash escape (inside a string)
 	started bool // the JSON object's first '{' has been seen
+	ws      int  // consecutive whitespace bytes tolerated in the current wait state
 }
+
+// Whitespace budgets. Unbounded whitespace in a wait state is a live failure
+// mode, not a formatting nicety: at temp>0 the forced-open state let
+// Qwen3-Coder-30B emit whitespace forever instead of the tag (prose was
+// masked, whitespace was the only prose-like token left), and the close state
+// let it trail whitespace until the token budget died. A couple of newlines
+// is all real formatting needs; past the budget, whitespace becomes illegal
+// and the only legal bytes make progress.
+const (
+	forceOpenWSBudget = 2
+	closeWSBudget     = 8
+)
 
 // step consumes one byte, returning the next state and whether the byte is legal.
 // In phText every byte is legal (free text). In phJSON/phClose the byte is legal
@@ -61,11 +74,16 @@ func step(s state, b byte) (state, bool) {
 		return jsonStep(s, b)
 
 	case phClose:
-		// Allow whitespace between the JSON and the closing tag.
+		// Allow BOUNDED whitespace between the JSON and the closing tag.
 		if s.closed == 0 && isSpace(b) {
+			if s.ws >= closeWSBudget {
+				return s, false
+			}
+			s.ws++
 			return s, true
 		}
 		if b == closeLit[s.closed] {
+			s.ws = 0
 			s.closed++
 			if s.closed == len(closeLit) {
 				s = state{phase: phText} // call complete; back to free text
@@ -75,11 +93,15 @@ func step(s state, b byte) (state, bool) {
 		return s, false
 
 	case phForceOpen:
-		// Force the open: only bytes that continue "<tool_call>" are legal (leading
-		// whitespace tolerated before it starts), so the model cannot answer in prose
-		// or a ```json fence — it must open the envelope. Once open, it flows into the
-		// same phJSON path that guarantees valid, escaped JSON.
+		// Force the open: only bytes that continue "<tool_call>" are legal (BOUNDED
+		// leading whitespace tolerated before it starts), so the model cannot answer
+		// in prose or a ```json fence — it must open the envelope. Once open, it flows
+		// into the same phJSON path that guarantees valid, escaped JSON.
 		if s.open == 0 && isSpace(b) {
+			if s.ws >= forceOpenWSBudget {
+				return s, false
+			}
+			s.ws++
 			return s, true
 		}
 		if b == openLit[s.open] {

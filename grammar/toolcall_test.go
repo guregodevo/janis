@@ -140,3 +140,36 @@ func TestOpenLiteralAsSingleToken(t *testing.T) {
 		t.Fatal("after the closing token the grammar should be inactive")
 	}
 }
+
+// The live 30B runaway: unbounded whitespace in the forced-open and close
+// states let generation stall forever. Whitespace past the budget must be
+// ILLEGAL so the only legal bytes make progress.
+func TestForcedGrammarBoundsWhitespace(t *testing.T) {
+	g := NewToolCallForced(charDecoder)
+	ws := int32(' ')
+	for i := 0; i < forceOpenWSBudget; i++ {
+		if !g.Allows(ws) {
+			t.Fatalf("whitespace byte %d within budget must be legal", i)
+		}
+		g.Advance(ws)
+	}
+	if g.Allows(ws) {
+		t.Fatal("whitespace past the forced-open budget must be illegal")
+	}
+	if i := feed(g, "<tool_call>{\"name\":\"x\",\"arguments\":{}}"); i != -1 {
+		t.Fatalf("tag+json must stay legal after bounded whitespace, failed at %d", i)
+	}
+	nl := int32('\n')
+	for i := 0; i < closeWSBudget; i++ {
+		if !g.Allows(nl) {
+			t.Fatalf("close whitespace %d within budget must be legal", i)
+		}
+		g.Advance(nl)
+	}
+	if g.Allows(nl) {
+		t.Fatal("whitespace past the close budget must be illegal")
+	}
+	if i := feed(g, "</tool_call>"); i != -1 {
+		t.Fatalf("closing tag must stay legal, failed at %d", i)
+	}
+}
