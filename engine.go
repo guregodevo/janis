@@ -67,6 +67,11 @@ type Options struct {
 	// cannot answer in prose or a ```json fence. Only meaningful with ToolCallGrammar
 	// and tools present; set it for a turn where a tool call is expected.
 	ForceToolCall bool
+	// OnToken, if set, observes every committed token (id and its decoded text,
+	// which is empty for special tokens). Diagnostic hook: callers use it to
+	// reconstruct WHAT a model emitted when the decoded reply is empty or
+	// mangled — token-level ground truth the text reply cannot show.
+	OnToken func(id int32, text string)
 }
 
 type sessionMaker interface {
@@ -235,6 +240,16 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 			if len(full) > len(emitted) {
 				onDelta(full[len(emitted):])
 				emitted = full
+			}
+		}
+	}
+
+	if opts.OnToken != nil {
+		obs, prev := opts.OnToken, p.OnToken
+		p.OnToken = func(tok int32) {
+			obs(tok, e.tokenText(tok))
+			if prev != nil {
+				prev(tok)
 			}
 		}
 	}
