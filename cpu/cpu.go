@@ -118,6 +118,34 @@ func newTensor(dt engine.DType, shape ...int) *tensor {
 
 func as(t engine.Tensor) *tensor { return t.(*tensor) }
 
+// DTypeOf reports F32 for every non-quant tensor (engine.RawReader): the CPU
+// backend stores compute tensors as a float32 mirror regardless of the dtype
+// they were created with, so F32 is the honest round-trippable answer.
+func (b *Backend) DTypeOf(t engine.Tensor) engine.DType {
+	if as(t).u32 != nil {
+		return engine.U32
+	}
+	return engine.F32
+}
+
+// Bytes downloads the tensor's raw bytes (engine.RawReader), matching DTypeOf:
+// little-endian float32 (or the exact packed words for U32 quant tensors).
+func (b *Backend) Bytes(t engine.Tensor) []byte {
+	tt := as(t)
+	if tt.u32 != nil {
+		out := make([]byte, len(tt.u32)*4)
+		for i, v := range tt.u32 {
+			binary.LittleEndian.PutUint32(out[i*4:], v)
+		}
+		return out
+	}
+	out := make([]byte, len(tt.data)*4)
+	for i, v := range tt.data {
+		binary.LittleEndian.PutUint32(out[i*4:], math.Float32bits(v))
+	}
+	return out
+}
+
 // ---- creation ------------------------------------------------------------
 
 func (b *Backend) FromFloats(data []float32, shape ...int) engine.Tensor {

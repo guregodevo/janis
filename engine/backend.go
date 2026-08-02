@@ -31,6 +31,15 @@ type AsyncEvaler interface {
 	AsyncEval(ts ...Tensor)
 }
 
+// RawReader is implemented by backends that can report a tensor's dtype and
+// download its raw bytes at native precision. Needed to serialize KV caches
+// without a lossy/bloating float32 round trip; pairs with FromRaw on restore.
+// Optional capability interface (same pattern as Sweeper/AsyncEvaler).
+type RawReader interface {
+	DTypeOf(t Tensor) DType
+	Bytes(t Tensor) []byte
+}
+
 // Sweeper is implemented by backends that need manual array lifecycle (e.g. a
 // cgo backend over MLX). Backends with GC-managed memory (a pure-Go backend)
 // simply don't implement it; callers use it opportunistically.

@@ -98,10 +98,6 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 	suffix := newIDs[P:]
 	offset := P
 
-	if debugPrefill {
-		debugLog("prefill: total=%d reused=%d new=%d (chunk=%d)", len(newIDs), P, len(suffix), prefillChunk)
-	}
-
 	// Chunked prefill. Forwarding a long prompt in one pass holds EVERY layer's
 	// activations (~seq × intermediate × layers) live until the single eval —
 	// multiple GB at a few-thousand-token RAG prompt, which jetsam-kills the
@@ -114,6 +110,10 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 	chunkSize := prefillChunk
 	if s.PrefillChunk > 0 {
 		chunkSize = s.PrefillChunk
+	}
+
+	if debugPrefill {
+		debugLog("prefill: total=%d reused=%d new=%d (chunk=%d)", len(newIDs), P, len(suffix), chunkSize)
 	}
 	var logits engine.Tensor
 	for i := 0; i < len(suffix); i += chunkSize {

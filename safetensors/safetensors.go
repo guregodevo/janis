@@ -37,8 +37,23 @@ type shard struct {
 // File is an open safetensors model (one or more shards) with a parsed,
 // merged index.
 type File struct {
-	shards []shard
-	index  map[string]entry
+	shards   []shard
+	index    map[string]entry
+	metadata map[string]string
+}
+
+// Metadata returns the __metadata__ string map merged across shards (nil when
+// none was present).
+func (s *File) Metadata() map[string]string { return s.metadata }
+
+// Names returns the indexed tensor names in sorted order.
+func (s *File) Names() []string {
+	names := make([]string, 0, len(s.index))
+	for n := range s.index {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // Open parses a single .safetensors file's header and indexes its tensors
@@ -130,6 +145,18 @@ func (f *File) addShard(path string) error {
 	si := len(f.shards)
 	for name, msg := range raw {
 		if name == "__metadata__" {
+			// Retain the string map so callers can read invalidation headers
+			// (e.g. the KV-snapshot's model identity). Values that aren't
+			// plain strings are ignored, matching the safetensors spec.
+			if f.metadata == nil {
+				f.metadata = map[string]string{}
+			}
+			var md map[string]string
+			if json.Unmarshal(msg, &md) == nil {
+				for k, v := range md {
+					f.metadata[k] = v
+				}
+			}
 			continue
 		}
 		var e entry

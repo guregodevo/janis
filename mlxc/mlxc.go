@@ -615,6 +615,43 @@ func (b *Backend) Floats(t engine.Tensor) []float32 {
 	return out
 }
 
+// DTypeOf reports the tensor's element type (engine.RawReader).
+func (b *Backend) DTypeOf(t engine.Tensor) engine.DType {
+	switch C.mlx_array_dtype(t.(*tensor).arr) {
+	case C.MLX_FLOAT32:
+		return engine.F32
+	case C.MLX_FLOAT16:
+		return engine.F16
+	case C.MLX_BFLOAT16:
+		return engine.BF16
+	case C.MLX_INT32:
+		return engine.I32
+	case C.MLX_UINT32:
+		return engine.U32
+	default:
+		panic("mlxc.DTypeOf: unsupported dtype")
+	}
+}
+
+// Bytes downloads the tensor's raw bytes at native precision (engine.RawReader).
+// The array is forced contiguous first — mlx_array_data_uint8 reads the buffer
+// linearly, and a Concat/Slice result (a KV cache) may be a strided view.
+func (b *Backend) Bytes(t engine.Tensor) []byte {
+	tt := t.(*tensor)
+	cont := C.mlx_array_new()
+	C.mlx_contiguous(&cont, tt.arr, false, b.stream)
+	defer C.mlx_array_free(cont)
+	vec := C.mlx_vector_array_new()
+	defer C.mlx_vector_array_free(vec)
+	C.mlx_vector_array_append_value(vec, cont)
+	C.mlx_eval(vec)
+	n := int(C.mlx_array_nbytes(cont))
+	ptr := C.mlx_array_data_uint8(cont)
+	out := make([]byte, n)
+	copy(out, unsafe.Slice((*byte)(unsafe.Pointer(ptr)), n))
+	return out
+}
+
 func (b *Backend) Ints(t engine.Tensor) []int32 {
 	tt := t.(*tensor)
 	i32 := C.mlx_array_new()

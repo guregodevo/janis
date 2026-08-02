@@ -93,6 +93,7 @@ type Engine struct {
 	mtype       string
 	stops       map[int32]bool
 	vocab       int
+	modelDir    string            // snapshot dir the model loaded from — KV-snapshot identity
 	experts     *qwen.ExpertStore // non-nil for MoE models (streamed experts)
 	// tokTable is a lazily-built id→text table for grammar-constrained decoding:
 	// the sampler tests the grammar against many candidate tokens each step, so it
@@ -109,7 +110,7 @@ func Open(modelDir string) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	e := &Engine{bk: newBackend(), mtype: cfg.ModelType, stops: map[int32]bool{}, vocab: cfg.Vocab}
+	e := &Engine{bk: newBackend(), mtype: cfg.ModelType, stops: map[int32]bool{}, vocab: cfg.Vocab, modelDir: modelDir}
 	b := e.bk
 
 	st, err := safetensors.OpenModel(modelDir)
@@ -287,6 +288,35 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 
 // NumTokens returns the token count of text (for usage stats).
 func (e *Engine) NumTokens(text string) int { return len(e.tok.Encode(text)) }
+
+// SaveMainSession snapshots the main session's materialized KV prefix to path
+// (EXPERT_STREAMING.md step 0: a warmed prefix is deterministic in (model,
+// prompt bytes) — recomputing it on a streamed-MoE model costs 20-60 min per
+// restart; loading it costs seconds). Takes the compute lock: downloading
+// cache tensors while a generation mutates them would serialize garbage.
+// Returns the number of persisted prefix tokens.
+func (e *Engine) SaveMainSession(path string) (int, error) {
+	mlxComputeMu.Lock()
+	defer mlxComputeMu.Unlock()
+	n := len(e.session.IDs)
+	if err := e.session.Save(e.bk, path, e.modelDir); err != nil {
+		return 0, err
+	}
+	if c := e.session.Caches[0].Len(); c < n {
+		n = c
+	}
+	return n, nil
+}
+
+// LoadMainSession restores a SaveMainSession snapshot into the (fresh) main
+// session. Safe to call only between Open and the first Chat. A stale or
+// mismatched snapshot returns an error and leaves the session untouched —
+// the caller just proceeds cold. Returns the number of restored prefix tokens.
+func (e *Engine) LoadMainSession(path string) (int, error) {
+	mlxComputeMu.Lock()
+	defer mlxComputeMu.Unlock()
+	return e.session.Restore(e.bk, path, e.modelDir)
+}
 
 // Close releases the tokenizer and backend.
 // Close releases the tokenizer and backend. It first acquires the shared MLX
