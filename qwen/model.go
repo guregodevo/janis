@@ -337,11 +337,15 @@ func (m *Model) NewSession() *Session {
 	return s
 }
 
-// moePrefillChunk is the MoE prefill row-group size. 1 (the measured default)
-// prefills each prompt token through the stream-free decode path; a moderate
-// chunk amortizes per-layer eval and batches expert reads across rows at the
-// cost of touching more experts per step. MEMDOOR_MOE_PREFILL_CHUNK overrides
-// for measurement.
+// moePrefillChunk is the MoE prefill row-group size. 1 stays the default:
+// chunk=128 (TurboFieldfare's production number) prefills ~30% faster
+// (2.5 vs 1.9 tok/s measured on Qwen3-30B-A3B cold, 2026-08-03) by fetching
+// each layer's expert union once per chunk — but it leaves the decode slot
+// cache unwarmed (the hybrid path deliberately never writes it), and decode
+// after a from-scratch chunked prefill measured 0.10 tok/s vs ~3. The trade
+// only pays for generate-nothing calls (KV warmup, MaxTokens=1), so warmup
+// boots may set MEMDOOR_MOE_PREFILL_CHUNK=128 explicitly; interactive
+// sessions keep 1.
 func moePrefillChunk() int {
 	if n, _ := strconv.Atoi(os.Getenv("MEMDOOR_MOE_PREFILL_CHUNK")); n > 0 {
 		return n
