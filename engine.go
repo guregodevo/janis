@@ -281,7 +281,22 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 	}
 
 	mlxComputeMu.Lock()
+	// Generate-nothing calls (KV warmup, MaxTokens<=1) always prefill chunked:
+	// chunk=128 fetches each MoE layer's expert union once per chunk (~30%
+	// faster prefill, measured 2.5 vs 1.9 tok/s cold on Qwen3-30B-A3B), and
+	// the reason chunking is NOT the general default — it leaves the decode
+	// slot cache unwarmed (0.10 tok/s decode measured after a from-scratch
+	// chunked prefill) — cannot bite when nothing meaningful is decoded.
+	// Dense models ignore PrefillChunk overrides above the global chunk size.
+	restoreChunk := false
+	if maxTok <= 1 && sess.PrefillChunk == 1 {
+		sess.PrefillChunk = 128
+		restoreChunk = true
+	}
 	out := sess.Generate(e.bk, ids, maxTok, p)
+	if restoreChunk {
+		sess.PrefillChunk = 1
+	}
 	mlxComputeMu.Unlock()
 	return e.tok.Decode(out)
 }
