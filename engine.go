@@ -154,6 +154,10 @@ func Open(modelDir string) (*Engine, error) {
 // ModelType reports the loaded architecture (qwen2/qwen3/llama/gemma2).
 func (e *Engine) ModelType() string { return e.mtype }
 
+// ModelDir is the snapshot directory this engine's model loaded from — the
+// identity the KV-snapshot files are keyed by.
+func (e *Engine) ModelDir() string { return e.modelDir }
+
 // ExpertIOStats reports cumulative streamed-expert reads for MoE models:
 // total bytes fetched and wall time blocked awaiting them. ok is false for
 // dense models, which have no streamed experts.
