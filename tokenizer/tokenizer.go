@@ -1,5 +1,13 @@
+//go:build cgo
+
 // Package tokenizer wraps the HuggingFace tokenizers library (via cgo) so the
 // engine can convert between text and token IDs exactly as the reference does.
+//
+// The wrapped library is Rust behind cgo, with linker flags for darwin and
+// linux only. That made this package — and therefore local inference, and
+// therefore the whole binary — impossible to build for Windows or without
+// cgo. tokenizer_nocgo.go is the fallback that keeps the binary buildable
+// where the library cannot go; see it for what stops working.
 package tokenizer
 
 /*
