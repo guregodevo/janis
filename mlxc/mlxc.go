@@ -1,4 +1,4 @@
-//go:build darwin && arm64
+//go:build darwin && arm64 && cgo
 
 // Package mlxc implements engine.Backend on top of MLX's C API (mlx-c),
 // linking libmlxc/libmlx from Homebrew. It is the only package that calls
