@@ -89,12 +89,12 @@ type rawConfig struct {
 		HighFreqFactor                float64 `json:"high_freq_factor"`
 		OriginalMaxPositionEmbeddings int     `json:"original_max_position_embeddings"`
 	} `json:"rope_scaling"`
-	Quantization json.RawMessage `json:"quantization"`
-	NumExperts          int   `json:"num_experts"`
-	NumExpertsPerTok    int   `json:"num_experts_per_tok"`
-	MoeIntermediateSize int   `json:"moe_intermediate_size"`
-	DecoderSparseStep   int   `json:"decoder_sparse_step"`
-	NormTopkProb        *bool `json:"norm_topk_prob"`
+	Quantization        json.RawMessage `json:"quantization"`
+	NumExperts          int             `json:"num_experts"`
+	NumExpertsPerTok    int             `json:"num_experts_per_tok"`
+	MoeIntermediateSize int             `json:"moe_intermediate_size"`
+	DecoderSparseStep   int             `json:"decoder_sparse_step"`
+	NormTopkProb        *bool           `json:"norm_topk_prob"`
 }
 
 // LoadConfig reads config.json from a model directory.
@@ -136,6 +136,18 @@ func LoadConfig(modelDir string) (Config, error) {
 		}
 	}
 
+	// A field that decodes to zero is a config this engine cannot serve, not a
+	// number to divide by. Qwen3.5's multimodal layout nests every text field
+	// under "text_config", so the top-level heads read as zero and the old
+	// division PANICKED THE GATEWAY at boot (live, 2026-08-31: a pinned
+	// Qwen3.5-9B took the whole process down; the boot path degrades cleanly
+	// on an error, and the panic was the only thing that could bypass it).
+	if r.NumAttentionHeads == 0 || r.HiddenSize == 0 {
+		if hasNestedTextConfig(modelDir) {
+			return Config{}, fmt.Errorf("%s: multimodal config (fields nested under text_config) is not supported by this engine — pick a text-only model (`memdoor llm auto`)", modelDir)
+		}
+		return Config{}, fmt.Errorf("%s: config has no attention heads / hidden size — not a model this engine can load", modelDir)
+	}
 	headDim := r.HeadDim
 	if headDim == 0 {
 		headDim = r.HiddenSize / r.NumAttentionHeads
@@ -200,4 +212,18 @@ func Qwen25_3B() Config {
 		HeadDim: 128, Vocab: 151936, Intermediate: 11008, RopeBase: 1e6, RMSEps: 1e-6,
 		GroupSize: 64, Bits: 4, TieWordEmbeddings: true, AttentionBias: true,
 	}
+}
+
+// hasNestedTextConfig reports whether the model's config nests its text fields
+// under "text_config" — the multimodal layout, named in the error so the
+// reader learns why a real model from a real org refuses to load.
+func hasNestedTextConfig(modelDir string) bool {
+	b, err := os.ReadFile(filepath.Join(modelDir, "config.json"))
+	if err != nil {
+		return false
+	}
+	var probe struct {
+		TextConfig map[string]json.RawMessage `json:"text_config"`
+	}
+	return json.Unmarshal(b, &probe) == nil && len(probe.TextConfig) > 0
 }
