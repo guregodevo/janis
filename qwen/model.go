@@ -183,7 +183,7 @@ func SampledGenerate(b engine.Backend, prompt []int32, nGen, nLayers, vocab int,
 	if sw != nil {
 		sw.PinAll()
 	}
-	caches := make([]*KVCache, nLayers)
+	caches := make([]LayerCache, nLayers)
 	for i := range caches {
 		caches[i] = &KVCache{}
 	}
@@ -301,10 +301,10 @@ func (m *Model) Logits(b engine.Backend, ids []int32) engine.Tensor {
 // (length seqLen) through the KV caches at the given RoPE offset, returning
 // logits [1, seqLen, vocab]. Keeping ids on-device lets the decode loop feed
 // each predicted token straight back in without a host round-trip.
-func (m *Model) forwardCachedT(b engine.Backend, idsT engine.Tensor, seqLen, offset int, caches []*KVCache) engine.Tensor {
+func (m *Model) forwardCachedT(b engine.Backend, idsT engine.Tensor, seqLen, offset int, caches []LayerCache) engine.Tensor {
 	h := b.Reshape(m.Embed.Forward(b, idsT), 1, seqLen, m.Cfg.Hidden)
 	for i, blk := range m.Blocks {
-		h = blk.ForwardCached(b, h, caches[i], offset)
+		h = blk.ForwardCached(b, h, caches[i].(*KVCache), offset)
 	}
 	h = m.Norm.Forward(b, h)
 	// Only the last position's logits are ever used — project just that one.
@@ -354,8 +354,9 @@ func moePrefillChunk() int {
 }
 
 // ForwardFunc computes logits [1, seqLen, vocab] for a device index tensor
-// through per-layer caches at a RoPE offset.
-type ForwardFunc func(b engine.Backend, idsT engine.Tensor, seqLen, offset int, caches []*KVCache) engine.Tensor
+// through per-layer caches at a RoPE offset. Each architecture asserts its
+// own concrete cache types out of the slice.
+type ForwardFunc func(b engine.Backend, idsT engine.Tensor, seqLen, offset int, caches []LayerCache) engine.Tensor
 
 // GreedyGenerate is the shared device-resident decode loop, parameterized by an
 // architecture's forward function, so Qwen and Gemma reuse the same KV-cache /
@@ -367,7 +368,7 @@ func GreedyGenerate(b engine.Backend, prompt []int32, nGen, nLayers int, forward
 		sw.PinAll() // protect the weights
 	}
 
-	caches := make([]*KVCache, nLayers)
+	caches := make([]LayerCache, nLayers)
 	for i := range caches {
 		caches[i] = &KVCache{}
 	}
@@ -412,16 +413,16 @@ func GreedyGenerate(b engine.Backend, prompt []int32, nGen, nLayers int, forward
 	return b.Ints(acc)[:nGen]
 }
 
-func cacheTensors(caches []*KVCache) []engine.Tensor {
+func cacheTensors(caches []LayerCache) []engine.Tensor {
 	ts := make([]engine.Tensor, 0, 2*len(caches))
 	for _, c := range caches {
-		ts = append(ts, c.K, c.V)
+		ts = append(ts, c.Tensors()...)
 	}
 	return ts
 }
 
-func pinCaches(sw engine.Sweeper, caches []*KVCache) {
+func pinCaches(sw engine.Sweeper, caches []LayerCache) {
 	for _, c := range caches {
-		sw.Pin(c.K, c.V)
+		sw.Pin(c.Tensors()...)
 	}
 }

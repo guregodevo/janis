@@ -155,6 +155,34 @@ type Backend interface {
 	// Tanh applies elementwise hyperbolic tangent.
 	Tanh(x Tensor) Tensor
 
+	// Exp applies the elementwise natural exponential.
+	Exp(x Tensor) Tensor
+
+	// Sigmoid applies the elementwise logistic function 1/(1+exp(-x)).
+	Sigmoid(x Tensor) Tensor
+
+	// Softplus applies log(1+exp(x)) (numerically stable).
+	Softplus(x Tensor) Tensor
+
+	// Conv1dDepthwise is a depthwise 1-D convolution over x [B, L, C] with
+	// weight [C, K, 1] (one filter per channel, groups == C), stride 1, no
+	// padding -> [B, L-K+1, C]. The Gated DeltaNet front-end conv; callers
+	// prepend their own causal state/zeros to x.
+	Conv1dDepthwise(x, w Tensor) Tensor
+
+	// GatedDeltaScan runs the gated delta-rule recurrence over T steps in one
+	// fused pass (the qwen3_5 linear-attention core): per step and value head,
+	//   state = state * g_t
+	//   delta = (v_t - state·k_t) * beta_t
+	//   state = state + delta ⊗ k_t
+	//   y_t   = state·q_t
+	// Shapes (all f32): q,k [B,T,Hk,Dk] — Hk key heads serve Hv value heads by
+	// adjacent repetition (head hv uses hv/(Hv/Hk)) — v [B,T,Hv,Dv], g and
+	// beta [B,T,Hv], state [B,Hv,Dv,Dk]. Returns y [B,T,Hv,Dv] and the final
+	// state. A step's ops are tiny and sequential, so a graph-level loop costs
+	// thousands of nodes per prefill chunk; the fused pass is one node.
+	GatedDeltaScan(q, k, v, g, beta, state Tensor) (y, newState Tensor)
+
 	// Softmax is a numerically-precise softmax along axis.
 	Softmax(x Tensor, axis int) Tensor
 

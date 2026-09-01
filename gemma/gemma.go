@@ -193,7 +193,7 @@ func LoadModel(b engine.Backend, st *safetensors.File, cfg qwen.Config) (*Model,
 	return &Model{Embed: emb, Blocks: blocks, Norm: norm, Cfg: cfg, embScale: float32(math.Sqrt(float64(cfg.Hidden)))}, nil
 }
 
-func (m *Model) forwardCachedT(b engine.Backend, idsT engine.Tensor, seqLen, offset int, caches []*qwen.KVCache) engine.Tensor {
+func (m *Model) forwardCachedT(b engine.Backend, idsT engine.Tensor, seqLen, offset int, caches []qwen.LayerCache) engine.Tensor {
 	h := b.ScalarMul(m.Embed.Forward(b, idsT), m.embScale)
 	h = b.Reshape(h, 1, seqLen, m.Cfg.Hidden)
 
@@ -202,7 +202,7 @@ func (m *Model) forwardCachedT(b engine.Backend, idsT engine.Tensor, seqLen, off
 		mask = causalMask(b, seqLen)
 	}
 	for i, blk := range m.Blocks {
-		h = blk.forward(b, h, caches[i], offset, mask)
+		h = blk.forward(b, h, caches[i].(*qwen.KVCache), offset, mask)
 	}
 	h = m.Norm.Forward(b, h)
 	h = b.Slice(h, 1, seqLen-1, seqLen) // last position only

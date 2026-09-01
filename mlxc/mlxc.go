@@ -318,6 +318,42 @@ func (b *Backend) Erf(x engine.Tensor) engine.Tensor {
 	return b.newT(out, cloneShape(tx.shape))
 }
 
+func (b *Backend) Exp(x engine.Tensor) engine.Tensor {
+	tx := x.(*tensor)
+	out := C.mlx_array_new()
+	C.mlx_exp(&out, tx.arr, b.stream)
+	return b.newT(out, cloneShape(tx.shape))
+}
+
+func (b *Backend) Sigmoid(x engine.Tensor) engine.Tensor {
+	tx := x.(*tensor)
+	out := C.mlx_array_new()
+	C.mlx_sigmoid(&out, tx.arr, b.stream)
+	return b.newT(out, cloneShape(tx.shape))
+}
+
+// Softplus is log(1+exp(x)), computed as logaddexp(x, 0) — the stable form
+// (mlx.nn.softplus does the same).
+func (b *Backend) Softplus(x engine.Tensor) engine.Tensor {
+	tx := x.(*tensor)
+	zero := b.scalarLike(0, tx.arr)
+	out := C.mlx_array_new()
+	C.mlx_logaddexp(&out, tx.arr, zero, b.stream)
+	C.mlx_array_free(zero)
+	return b.newT(out, cloneShape(tx.shape))
+}
+
+func (b *Backend) Conv1dDepthwise(x, w engine.Tensor) engine.Tensor {
+	tx, tw := x.(*tensor), w.(*tensor)
+	channels := tw.shape[0]
+	kernel := tw.shape[1]
+	out := C.mlx_array_new()
+	C.mlx_conv1d(&out, tx.arr, tw.arr, C.int(1), C.int(0), C.int(1), C.int(channels), b.stream)
+	shape := cloneShape(tx.shape)
+	shape[1] -= kernel - 1
+	return b.newT(out, shape)
+}
+
 func (b *Backend) Mean(x engine.Tensor, axis int) engine.Tensor {
 	tx := x.(*tensor)
 	out := C.mlx_array_new()

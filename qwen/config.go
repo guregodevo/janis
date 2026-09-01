@@ -42,6 +42,18 @@ type Config struct {
 	SparseStep      int  // every Nth layer is MoE (1 = all)
 	NormTopk        bool // renormalize the top-k router scores
 
+	// qwen3_5 hybrid linear attention (zero/unset for pure-attention models).
+	// Every FullAttnInterval-th layer is softmax attention with a sigmoid
+	// output gate (q_proj emits [query, gate] per head); the rest are Gated
+	// DeltaNet linear-attention layers with a depthwise causal conv front-end.
+	FullAttnInterval int
+	LinearKHeads     int // linear_num_key_heads (q/k heads)
+	LinearVHeads     int // linear_num_value_heads
+	LinearKDim       int // linear_key_head_dim
+	LinearVDim       int // linear_value_head_dim
+	ConvKernel       int // linear_conv_kernel_dim
+	PartialRotary    float32 // fraction of head_dim RoPE rotates (0 = all)
+
 	// QuantOverrides maps a tensor name to its quantization when it differs
 	// from the global GroupSize/Bits — mlx-community MoE checkpoints quantize
 	// the per-layer routers at 8-bit while everything else is 4-bit.
@@ -95,6 +107,20 @@ type rawConfig struct {
 	MoeIntermediateSize int             `json:"moe_intermediate_size"`
 	DecoderSparseStep   int             `json:"decoder_sparse_step"`
 	NormTopkProb        *bool           `json:"norm_topk_prob"`
+
+	// qwen3_5 multimodal layout: the text fields above live nested here, and
+	// the hybrid linear-attention fields below live inside that nest.
+	TextConfig            json.RawMessage `json:"text_config"`
+	FullAttentionInterval int             `json:"full_attention_interval"`
+	LinearNumKeyHeads     int             `json:"linear_num_key_heads"`
+	LinearNumValueHeads   int             `json:"linear_num_value_heads"`
+	LinearKeyHeadDim      int             `json:"linear_key_head_dim"`
+	LinearValueHeadDim    int             `json:"linear_value_head_dim"`
+	LinearConvKernelDim   int             `json:"linear_conv_kernel_dim"`
+	RopeParameters        *struct {
+		RopeTheta           float64 `json:"rope_theta"`
+		PartialRotaryFactor float64 `json:"partial_rotary_factor"`
+	} `json:"rope_parameters"`
 }
 
 // LoadConfig reads config.json from a model directory.
@@ -106,6 +132,25 @@ func LoadConfig(modelDir string) (Config, error) {
 	var r rawConfig
 	if err := json.Unmarshal(raw, &r); err != nil {
 		return Config{}, fmt.Errorf("parse config.json: %w", err)
+	}
+
+	// Qwen3.5 is a multimodal checkpoint: the whole text stack nests under
+	// "text_config" (rope inside "rope_parameters"), while quantization and
+	// tie_word_embeddings stay top-level. Hoist the nest so the rest of the
+	// loader sees one flat config. Other text_config families (no engine
+	// support for their text stack) still refuse below.
+	if r.ModelType == "qwen3_5" && len(r.TextConfig) > 0 {
+		var tr rawConfig
+		if err := json.Unmarshal(r.TextConfig, &tr); err != nil {
+			return Config{}, fmt.Errorf("parse text_config: %w", err)
+		}
+		tr.ModelType = r.ModelType
+		tr.Quantization = r.Quantization
+		tr.TieWordEmbeddings = r.TieWordEmbeddings
+		if tr.RopeParameters != nil {
+			tr.RopeTheta = tr.RopeParameters.RopeTheta
+		}
+		r = tr
 	}
 
 	// The quantization object holds global group_size/bits plus optional
@@ -174,7 +219,7 @@ func LoadConfig(modelDir string) (Config, error) {
 		QuantOverrides:     quantOverrides,
 		TieWordEmbeddings:  tie,
 		AttentionBias:      r.ModelType == "qwen2", // qwen2 always has q/k/v bias
-		QKNorm:             r.ModelType == "qwen3" || r.ModelType == "qwen3_moe",
+		QKNorm:             r.ModelType == "qwen3" || r.ModelType == "qwen3_moe" || r.ModelType == "qwen3_5",
 		NumExperts:         r.NumExperts,
 		TopK:               r.NumExpertsPerTok,
 		MoeIntermediate:    r.MoeIntermediateSize,
@@ -183,6 +228,26 @@ func LoadConfig(modelDir string) (Config, error) {
 		AttnSoftcap:        float32(r.AttnLogitSoftcapping),
 		FinalSoftcap:       float32(r.FinalLogitSoftcapping),
 		QueryPreAttnScalar: float32(r.QueryPreAttnScalar),
+		FullAttnInterval:   r.FullAttentionInterval,
+		LinearKHeads:       r.LinearNumKeyHeads,
+		LinearVHeads:       r.LinearNumValueHeads,
+		LinearKDim:         r.LinearKeyHeadDim,
+		LinearVDim:         r.LinearValueHeadDim,
+		ConvKernel:         r.LinearConvKernelDim,
+	}
+	if r.RopeParameters != nil {
+		cfg.PartialRotary = float32(r.RopeParameters.PartialRotaryFactor)
+	}
+	if r.ModelType == "qwen3_5" {
+		// Fail fast on a hybrid config the model builder can't serve, rather
+		// than letting a zero dimension surface as a shape error mid-load.
+		if cfg.FullAttnInterval <= 0 || cfg.LinearKHeads <= 0 || cfg.LinearVHeads <= 0 ||
+			cfg.LinearKDim <= 0 || cfg.LinearVDim <= 0 || cfg.ConvKernel <= 0 {
+			return Config{}, fmt.Errorf("%s: qwen3_5 config is missing linear-attention dimensions", modelDir)
+		}
+		if cfg.LinearVHeads%cfg.LinearKHeads != 0 {
+			return Config{}, fmt.Errorf("%s: linear_num_value_heads (%d) not divisible by linear_num_key_heads (%d)", modelDir, cfg.LinearVHeads, cfg.LinearKHeads)
+		}
 	}
 	if raw := r.EosTokenID; len(raw) > 0 {
 		var single int32

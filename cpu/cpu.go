@@ -328,6 +328,91 @@ func (b *Backend) SiLU(x engine.Tensor) engine.Tensor {
 	return b.unary(x, func(v float32) float32 { return v / (1 + float32(math.Exp(float64(-v)))) })
 }
 
+func (b *Backend) Exp(x engine.Tensor) engine.Tensor {
+	return b.unary(x, func(v float32) float32 { return float32(math.Exp(float64(v))) })
+}
+
+func (b *Backend) Sigmoid(x engine.Tensor) engine.Tensor {
+	return b.unary(x, func(v float32) float32 { return 1 / (1 + float32(math.Exp(float64(-v)))) })
+}
+
+func (b *Backend) Softplus(x engine.Tensor) engine.Tensor {
+	return b.unary(x, func(v float32) float32 {
+		// log(1+exp(x)), stable at both tails.
+		if v > 20 {
+			return v
+		}
+		return float32(math.Log1p(math.Exp(float64(v))))
+	})
+}
+
+// GatedDeltaScan is the sequential reference for the gated delta-rule
+// recurrence (see engine.Backend); the MLX metal kernel is diff-tested
+// against this implementation.
+func (b *Backend) GatedDeltaScan(q, k, v, g, beta, state engine.Tensor) (engine.Tensor, engine.Tensor) {
+	tq, tk, tv, tg, tb, ts := as(q), as(k), as(v), as(g), as(beta), as(state)
+	B, T, Hk, Dk := tq.shape[0], tq.shape[1], tq.shape[2], tq.shape[3]
+	Hv, Dv := tv.shape[2], tv.shape[3]
+	rep := Hv / Hk
+
+	y := newTensor(engine.F32, B, T, Hv, Dv)
+	st := newTensor(engine.F32, B, Hv, Dv, Dk)
+	copy(st.data, ts.data)
+
+	for bi := 0; bi < B; bi++ {
+		for hv := 0; hv < Hv; hv++ {
+			hk := hv / rep
+			s := st.data[(bi*Hv+hv)*Dv*Dk : (bi*Hv+hv+1)*Dv*Dk]
+			for t := 0; t < T; t++ {
+				qt := tq.data[((bi*T+t)*Hk+hk)*Dk:][:Dk]
+				kt := tk.data[((bi*T+t)*Hk+hk)*Dk:][:Dk]
+				vt := tv.data[((bi*T+t)*Hv+hv)*Dv:][:Dv]
+				gt := tg.data[(bi*T+t)*Hv+hv]
+				bt := tb.data[(bi*T+t)*Hv+hv]
+				yt := y.data[((bi*T+t)*Hv+hv)*Dv:][:Dv]
+				for dv := 0; dv < Dv; dv++ {
+					row := s[dv*Dk : (dv+1)*Dk]
+					var kvMem float32
+					for i, kv := range kt {
+						row[i] *= gt
+						kvMem += row[i] * kv
+					}
+					delta := (vt[dv] - kvMem) * bt
+					var out float32
+					for i, kv := range kt {
+						row[i] += kv * delta
+						out += row[i] * qt[i]
+					}
+					yt[dv] = out
+				}
+			}
+		}
+	}
+	return y, st
+}
+
+// Conv1dDepthwise convolves x [B, L, C] with per-channel filters w [C, K, 1]
+// (stride 1, no padding) -> [B, L-K+1, C].
+func (b *Backend) Conv1dDepthwise(x, w engine.Tensor) engine.Tensor {
+	tx, tw := as(x), as(w)
+	B, L, C := tx.shape[0], tx.shape[1], tx.shape[2]
+	K := tw.shape[1]
+	outL := L - K + 1
+	out := newTensor(engine.F32, B, outL, C)
+	for bi := 0; bi < B; bi++ {
+		for t := 0; t < outL; t++ {
+			dst := out.data[(bi*outL+t)*C:]
+			for k := 0; k < K; k++ {
+				src := tx.data[(bi*L+t+k)*C:]
+				for c := 0; c < C; c++ {
+					dst[c] += src[c] * tw.data[c*K+k]
+				}
+			}
+		}
+	}
+	return out
+}
+
 // Gelu uses the tanh approximation, matching engine.Backend's contract.
 func (b *Backend) Gelu(x engine.Tensor) engine.Tensor {
 	const c = 0.7978845608028654 // sqrt(2/pi)

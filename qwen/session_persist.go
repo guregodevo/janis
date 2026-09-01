@@ -45,26 +45,36 @@ func (s *Session) Save(b engine.Backend, path, modelID string) error {
 	if !ok {
 		return fmt.Errorf("kv snapshot: backend does not implement RawReader")
 	}
-	if len(s.Caches) == 0 || s.Caches[0] == nil || s.Caches[0].K == nil {
+	kv := make([]*KVCache, len(s.Caches))
+	for i, c := range s.Caches {
+		k, isKV := c.(*KVCache)
+		if !isKV {
+			// A recurrent state is not a token-addressable prefix; snapshotting
+			// it would break the LCP contract Restore relies on.
+			return fmt.Errorf("kv snapshot: unsupported for hybrid linear-attention sessions")
+		}
+		kv[i] = k
+	}
+	if len(kv) == 0 || kv[0] == nil || kv[0].K == nil {
 		return fmt.Errorf("kv snapshot: session has no materialized cache")
 	}
 	// The last sampled token of a turn is recorded in IDs but never forwarded,
 	// so the cache is legitimately one shorter. Persist only the materialized
 	// prefix — claiming un-forwarded tokens would poison the next LCP.
-	t := s.Caches[0].Len()
+	t := kv[0].Len()
 	if t > len(s.IDs) {
 		return fmt.Errorf("kv snapshot: cache holds %d tokens but session ids only %d", t, len(s.IDs))
 	}
 	ids := s.IDs[:t]
 
-	tensors := make(map[string]safetensors.Entry, 2*len(s.Caches)+1)
+	tensors := make(map[string]safetensors.Entry, 2*len(kv)+1)
 	idRaw := make([]byte, len(ids)*4)
 	for i, id := range ids {
 		binary.LittleEndian.PutUint32(idRaw[i*4:], uint32(id))
 	}
 	tensors["ids"] = safetensors.Entry{Dtype: "I32", Shape: []int{len(ids)}, Raw: idRaw}
 
-	for i, c := range s.Caches {
+	for i, c := range kv {
 		if c == nil || c.K == nil || c.V == nil {
 			return fmt.Errorf("kv snapshot: layer %d cache empty", i)
 		}
@@ -83,7 +93,7 @@ func (s *Session) Save(b engine.Backend, path, modelID string) error {
 	}
 	meta := map[string]string{
 		snapMetaModel:  modelID,
-		snapMetaLayers: strconv.Itoa(len(s.Caches)),
+		snapMetaLayers: strconv.Itoa(len(kv)),
 	}
 	return safetensors.Write(path, tensors, meta)
 }
@@ -97,6 +107,9 @@ func (s *Session) Save(b engine.Backend, path, modelID string) error {
 func (s *Session) Restore(b engine.Backend, path, modelID string) (int, error) {
 	if len(s.Caches) != 0 {
 		return 0, fmt.Errorf("kv snapshot: session already has caches — restore only into a fresh session")
+	}
+	if s.NewCache != nil {
+		return 0, fmt.Errorf("kv snapshot: unsupported for hybrid linear-attention sessions")
 	}
 	f, err := safetensors.Open(path)
 	if err != nil {
@@ -121,7 +134,7 @@ func (s *Session) Restore(b engine.Backend, path, modelID string) (int, error) {
 		ids[i] = int32(binary.LittleEndian.Uint32(idRaw[i*4:]))
 	}
 
-	caches := make([]*KVCache, s.NLayers)
+	caches := make([]LayerCache, s.NLayers)
 	for i := 0; i < s.NLayers; i++ {
 		c := &KVCache{}
 		for name, dst := range map[string]*engine.Tensor{"k": &c.K, "v": &c.V} {

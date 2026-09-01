@@ -46,9 +46,10 @@ func TestSessionSaveRestoreRoundtrip(t *testing.T) {
 		}
 	}
 	for l := 0; l < nLayers; l++ {
+		srcKV, dstKV := src.Caches[l].(*KVCache), dst.Caches[l].(*KVCache)
 		for name, pair := range map[string][2]engine.Tensor{
-			"k": {src.Caches[l].K, dst.Caches[l].K},
-			"v": {src.Caches[l].V, dst.Caches[l].V},
+			"k": {srcKV.K, dstKV.K},
+			"v": {srcKV.V, dstKV.V},
 		} {
 			want, got := b.Floats(pair[0]), b.Floats(pair[1])
 			if len(want) != len(got) {
@@ -89,7 +90,7 @@ func TestSessionSaveTruncatesUnforwardedID(t *testing.T) {
 	s := &Session{
 		NLayers: 1,
 		IDs:     []int32{1, 2, 3, 4, 5}, // one more than the cache holds
-		Caches:  []*KVCache{{K: b.FromFloats(data, 1, 2, T, 3), V: b.FromFloats(data, 1, 2, T, 3)}},
+		Caches:  []LayerCache{&KVCache{K: b.FromFloats(data, 1, 2, T, 3), V: b.FromFloats(data, 1, 2, T, 3)}},
 	}
 	path := filepath.Join(t.TempDir(), "kv.safetensors")
 	if err := s.Save(b, path, "m"); err != nil {

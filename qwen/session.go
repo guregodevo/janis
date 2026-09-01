@@ -45,8 +45,19 @@ type Session struct {
 	// prompt's experts at once — ~3x faster prefill on Qwen3-30B-A3B.
 	PrefillChunk int
 
+	// NewCache builds layer i's cache. Nil means plain KV attention on every
+	// layer; hybrid architectures (qwen3_5) supply their own per-layer mix.
+	NewCache func(layer int) LayerCache
+
 	IDs    []int32 // tokens currently materialized in the caches
-	Caches []*KVCache
+	Caches []LayerCache
+}
+
+func (s *Session) newCache(layer int) LayerCache {
+	if s.NewCache != nil {
+		return s.NewCache(layer)
+	}
+	return &KVCache{}
 }
 
 func lcp(a, b []int32) int {
@@ -61,7 +72,7 @@ func lcp(a, b []int32) int {
 	return i
 }
 
-func cachedLen(caches []*KVCache) int {
+func cachedLen(caches []LayerCache) int {
 	if len(caches) == 0 || caches[0] == nil {
 		return 0
 	}
@@ -85,11 +96,21 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 		P = len(newIDs) - 1
 	}
 	if s.Caches == nil {
-		s.Caches = make([]*KVCache, s.NLayers)
+		s.Caches = make([]LayerCache, s.NLayers)
 		for i := range s.Caches {
-			s.Caches[i] = &KVCache{}
+			s.Caches[i] = s.newCache(i)
 		}
 	} else if P < cachedLen(s.Caches) {
+		// A recurrent (linear-attention) cache stores only its latest state, so
+		// it cannot be cut back to a mid-history prefix: when any layer can't
+		// truncate to P, the whole session resets and re-prefills from scratch.
+		// Prefix EXTENSION (the common multi-turn case) never lands here.
+		for _, c := range s.Caches {
+			if !c.CanTruncate(P) {
+				P = 0
+				break
+			}
+		}
 		for _, c := range s.Caches {
 			c.Truncate(b, P)
 		}

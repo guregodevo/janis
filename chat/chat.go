@@ -28,13 +28,14 @@ func ApplyTemplate(modelType string, msgs []Message) string {
 		return gemma(msgs)
 	case "llama":
 		return llama3(msgs)
-	case "qwen3", "qwen3_moe":
-		// Qwen3 (dense and MoE) is a reasoning family: prime the assistant turn
-		// with an empty think block to skip the <think>…</think> generation (the
-		// official enable_thinking=false behavior) unless thinking is explicitly
-		// enabled. Without this, a 30B-A3B agent turn spent its entire decode
-		// budget inside <think>, the provider stripped it, and the agent went
-		// silent (live: "Agent produced empty final text").
+	case "qwen3", "qwen3_moe", "qwen3_5":
+		// Qwen3/3.5 (dense, MoE, hybrid) are reasoning families: prime the
+		// assistant turn with an empty think block to skip the <think>…</think>
+		// generation (the official enable_thinking=false behavior — Qwen3.5's
+		// chat_template.jinja emits the same '<think>\n\n</think>\n\n' priming)
+		// unless thinking is explicitly enabled. Without this, a 30B-A3B agent
+		// turn spent its entire decode budget inside <think>, the provider
+		// stripped it, and the agent went silent ("empty final text").
 		return chatml(msgs, !thinkingEnabled())
 	default: // qwen2 -> ChatML (no reasoning)
 		return chatml(msgs, false)
@@ -60,6 +61,16 @@ func chatml(msgs []Message, noThink bool) string {
 		b.WriteString("<|im_start|>")
 		b.WriteString(m.Role)
 		b.WriteByte('\n')
+		if noThink && m.Role == "assistant" && !strings.Contains(m.Content, "<think>") {
+			// HISTORY assistant turns carry the same empty think block the live
+			// turn was primed with, so a follow-up prompt EXTENDS the cached
+			// token sequence instead of diverging at the first assistant turn.
+			// Without this, every multi-turn prompt truncated the KV prefix back
+			// to turn 1 — and a hybrid (qwen3_5) session, whose recurrent state
+			// cannot truncate at all, re-prefilled the whole conversation every
+			// turn (measured: turn 2 "reused=0" instead of the full prefix).
+			b.WriteString("<think>\n\n</think>\n\n")
+		}
 		b.WriteString(m.Content)
 		b.WriteString("<|im_end|>\n")
 	}

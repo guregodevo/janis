@@ -174,3 +174,68 @@ func TestCPUMatchesMLX(t *testing.T) {
 }
 
 var _ = engine.F32 // keep the engine import even if assertions change
+
+// The Gated DeltaNet ops (Qwen3.5 hybrid): elementwise gates and the depthwise
+// causal-conv front-end must match MLX exactly, or the recurrence drifts.
+func TestCPUMatchesMLXDeltaNetOps(t *testing.T) {
+	c := New()
+	m := mlxc.New()
+	defer m.Close()
+	const tol = 2e-3
+
+	u := rnd(3 * 5)
+	for _, op := range []struct {
+		name string
+		f    func(b engine.Backend, x engine.Tensor) engine.Tensor
+	}{
+		{"Exp", func(b engine.Backend, x engine.Tensor) engine.Tensor { return b.Exp(x) }},
+		{"Sigmoid", func(b engine.Backend, x engine.Tensor) engine.Tensor { return b.Sigmoid(x) }},
+		{"Softplus", func(b engine.Backend, x engine.Tensor) engine.Tensor { return b.Softplus(x) }},
+	} {
+		diffOK(t, op.name, tol,
+			c.Floats(op.f(c, c.FromFloats(u, 3, 5))),
+			m.Floats(op.f(m, m.FromFloats(u, 3, 5))))
+	}
+
+	// Depthwise conv: x [B=2, L=7, C=6], w [C=6, K=4, 1] -> [2, 4, 6]
+	xc, wc := rnd(2*7*6), rndSeed(6*4, 7)
+	cOut := c.Floats(c.Conv1dDepthwise(c.FromFloats(xc, 2, 7, 6), c.FromFloats(wc, 6, 4, 1)))
+	mOut := m.Floats(m.Conv1dDepthwise(m.FromFloats(xc, 2, 7, 6), m.FromFloats(wc, 6, 4, 1)))
+	diffOK(t, "Conv1dDepthwise", tol, cOut, mOut)
+	if got := len(cOut); got != 2*4*6 {
+		t.Errorf("Conv1dDepthwise output size = %d, want %d", got, 2*4*6)
+	}
+}
+
+// The fused metal GatedDeltaScan must reproduce the sequential pure-Go
+// recurrence: same y, same final state, including a warm (nonzero) incoming
+// state and Hv > Hk head mapping.
+func TestCPUMatchesMLXGatedDeltaScan(t *testing.T) {
+	c := New()
+	m := mlxc.New()
+	defer m.Close()
+	const B, T, Hk, Dk, Hv, Dv = 1, 5, 2, 32, 4, 32
+	const tol = 2e-3
+
+	q, k := rndSeed(B*T*Hk*Dk, 1), rndSeed(B*T*Hk*Dk, 2)
+	v := rndSeed(B*T*Hv*Dv, 3)
+	// g in (0,1) like a real decay, beta in (0,1) like a real sigmoid.
+	g, beta := rndSeed(B*T*Hv, 4), rndSeed(B*T*Hv, 5)
+	for i := range g {
+		g[i] = 0.5 + g[i]/4
+		beta[i] = 0.5 + beta[i]/4
+	}
+	st := rndSeed(B*Hv*Dv*Dk, 6)
+
+	run := func(b engine.Backend) ([]float32, []float32) {
+		y, ns := b.GatedDeltaScan(
+			b.FromFloats(q, B, T, Hk, Dk), b.FromFloats(k, B, T, Hk, Dk),
+			b.FromFloats(v, B, T, Hv, Dv), b.FromFloats(g, B, T, Hv),
+			b.FromFloats(beta, B, T, Hv), b.FromFloats(st, B, Hv, Dv, Dk))
+		return b.Floats(y), b.Floats(ns)
+	}
+	cy, cs := run(c)
+	my, ms := run(m)
+	diffOK(t, "GatedDeltaScan.y", tol, cy, my)
+	diffOK(t, "GatedDeltaScan.state", tol, cs, ms)
+}

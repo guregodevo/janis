@@ -16,6 +16,7 @@ import (
 	"memdoor/llm/gemma"
 	"memdoor/llm/grammar"
 	"memdoor/llm/qwen"
+	"memdoor/llm/qwen35"
 	"memdoor/llm/safetensors"
 	"memdoor/llm/tokenizer"
 )
@@ -132,6 +133,12 @@ func Open(modelDir string) (*Engine, error) {
 			return nil, err
 		}
 		sm = m
+	case "qwen3_5":
+		m, err := qwen35.LoadModel(b, st, cfg)
+		if err != nil {
+			return nil, err
+		}
+		sm = m
 	default:
 		return nil, fmt.Errorf("unsupported model_type %q", cfg.ModelType)
 	}
@@ -151,7 +158,7 @@ func Open(modelDir string) (*Engine, error) {
 	return e, nil
 }
 
-// ModelType reports the loaded architecture (qwen2/qwen3/llama/gemma2).
+// ModelType reports the loaded architecture (qwen2/qwen3/qwen3_5/llama/gemma2).
 func (e *Engine) ModelType() string { return e.mtype }
 
 // ModelDir is the snapshot directory this engine's model loaded from — the
