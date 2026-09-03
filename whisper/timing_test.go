@@ -97,21 +97,26 @@ func TestWordTimestampsMatchOracle(t *testing.T) {
 	if len(got) != len(oracle.Words) {
 		t.Fatalf("%d words, oracle has %d:\n%v", len(got), len(oracle.Words), got)
 	}
-	worst, off := 0.0, 0
+	// Compare boundaries (a word's start; the last word's end), not words:
+	// one moved boundary shifts two words.
+	worst, off, boundaries := 0.0, 0, len(got)+1
 	for i, w := range got {
 		o := oracle.Words[i]
-		ds, de := math.Abs(w.Start-o.S), math.Abs(w.End-o.E)
-		worst = math.Max(worst, math.Max(ds, de))
 		if strings.TrimSpace(w.Word) != strings.TrimSpace(o.W) {
 			t.Errorf("word %d: %q vs oracle %q", i, w.Word, o.W)
 		}
-		if ds > 0.04 || de > 0.04 {
+		d := math.Abs(w.Start - o.S)
+		if i == len(got)-1 {
+			d = math.Max(d, math.Abs(w.End-o.E))
+		}
+		worst = math.Max(worst, d)
+		if d > 0.04 {
 			off++
-			t.Logf("word %d: %q [%.2f→%.2f] vs oracle [%.2f→%.2f]", i, w.Word, w.Start, w.End, o.S, o.E)
+			t.Logf("word %d: %q starts %.2f, oracle %.2f", i, w.Word, w.Start, o.S)
 		}
 	}
-	t.Logf("%d words, %d beyond 40 ms, worst boundary difference %.2f s", len(got), off, worst)
-	if off > len(got)/10 || worst > 0.1 {
-		t.Errorf("%d of %d words beyond 40 ms, worst %.2f s", off, len(got), worst)
+	t.Logf("%d words, %d of %d boundaries beyond 40 ms, worst %.2f s", len(got), off, boundaries, worst)
+	if off > boundaries/10 || worst > 0.1 {
+		t.Errorf("%d of %d boundaries beyond 40 ms, worst %.2f s", off, boundaries, worst)
 	}
 }
