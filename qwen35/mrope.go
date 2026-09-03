@@ -188,12 +188,28 @@ func (m *Model) PrefillWithImages(b engine.Backend, ids []int32, features []engi
 	h = b.Reshape(h, 1, L, m.Cfg.Hidden)
 	pos, delta := MRoPEPositions(ids, grids)
 	cos, sin := MRoPECosSin(b, pos, m.Blocks[ropeLayer(m.Cfg)].Attn.RopeDims, m.Cfg.RopeBase)
+	// Evaluate per block and sweep the intermediates, keeping the running
+	// activation, the tables and the caches: left lazy across 32 blocks the
+	// prefill took 23 s (the backend's tensor list, as with the whisper
+	// encoder), per block it takes about a second.
+	sw, _ := b.(engine.Sweeper)
 	for i, blk := range m.Blocks {
 		var c qwen.LayerCache
 		if caches != nil {
 			c = caches[i]
 		}
 		h = blk.ForwardCachedMRoPE(b, h, c, cos, sin)
+		if sw != nil {
+			keep := []engine.Tensor{h, cos, sin}
+			for _, kc := range caches {
+				if kc != nil {
+					keep = append(keep, kc.Tensors()...)
+				}
+			}
+			b.Eval(keep...)
+			sw.Pin(keep...)
+			sw.Sweep()
+		}
 	}
 	h = m.Norm.Forward(b, h)
 	h = b.Slice(h, 1, L-1, L)

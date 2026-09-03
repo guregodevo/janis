@@ -102,6 +102,10 @@ type Engine struct {
 	// only when a grammar is first used (non-tool chats never pay for it).
 	tokTable     []string
 	tokTableOnce sync.Once
+	// q35 is the loaded Qwen3.5 text stack (nil for other families); its
+	// vision tower loads on the first See (engine_vision.go).
+	q35   *qwen35.Model
+	tower *qwen35.VisionTower
 }
 
 // Open loads the model from a local snapshot directory (config.json,
@@ -139,6 +143,7 @@ func Open(modelDir string) (*Engine, error) {
 			return nil, err
 		}
 		sm = m
+		e.q35 = m
 	default:
 		return nil, fmt.Errorf("unsupported model_type %q", cfg.ModelType)
 	}
