@@ -84,11 +84,44 @@ func PadOrTrim(samples []float32) []float32 {
 }
 
 // LogMel computes the [NFrames][NMels] log-mel spectrogram of exactly
-// ChunkSecs*SampleRate samples (use PadOrTrim first).
+// ChunkSecs*SampleRate samples (use PadOrTrim first) — whisper's decode
+// path, where silence is padded into the audio and lands at the floor.
 func LogMel(samples []float32) [][]float32 {
 	if len(samples) != ChunkSecs*SampleRate {
 		panic("LogMel: pass exactly 30 s of samples (PadOrTrim)")
 	}
+	return logMel(samples)
+}
+
+// LogMelAll is whisper's transcribe path: the spectrogram of the whole
+// recording followed by 30 s of silence, so the floor is computed once over
+// everything. Content frames are len(frames) - NFrames; feed the encoder
+// windows of it with ChunkMel.
+func LogMelAll(samples []float32) [][]float32 {
+	padded := make([]float32, len(samples)+ChunkSecs*SampleRate)
+	copy(padded, samples)
+	return logMel(padded)
+}
+
+// ChunkMel is one encoder input: frames[seek : seek+size] followed by zero
+// rows up to NFrames, as whisper's transcribe pads a window's mel (not its
+// audio) — the encoder sees zeros, not the floor, past the content.
+func ChunkMel(frames [][]float32, seek, size int) [][]float32 {
+	out := make([][]float32, NFrames)
+	for i := range out {
+		if i < size && seek+i < len(frames) {
+			out[i] = frames[seek+i]
+		} else {
+			out[i] = make([]float32, NMels)
+		}
+	}
+	return out
+}
+
+// logMel is the spectrogram of any length of audio: len/Hop frames (the
+// last one dropped, as whisper does).
+func logMel(samples []float32) [][]float32 {
+	nFrames := len(samples) / Hop
 	// Reflect-pad 200 samples each side, like torch.stft(center=True).
 	const pad = NFFT / 2
 	x := make([]float64, len(samples)+2*pad)
@@ -99,10 +132,9 @@ func LogMel(samples []float32) [][]float32 {
 	for i, s := range samples {
 		x[pad+i] = float64(s)
 	}
-	// whisper keeps all frames but the last: 3001 → 3000.
-	power := make([][]float64, NFrames)
+	power := make([][]float64, nFrames)
 	frame := make([]float64, NFFT)
-	for t := 0; t < NFrames; t++ {
+	for t := 0; t < nFrames; t++ {
 		off := t * Hop
 		for n := 0; n < NFFT; n++ {
 			frame[n] = x[off+n] * hann[n]
@@ -120,9 +152,9 @@ func LogMel(samples []float32) [][]float32 {
 		power[t] = p
 	}
 	// mel = filters @ power, then log10 with the whisper clamp/floor/scale.
-	out := make([][]float32, NFrames)
+	out := make([][]float32, nFrames)
 	maxv := math.Inf(-1)
-	for t := 0; t < NFrames; t++ {
+	for t := 0; t < nFrames; t++ {
 		row := make([]float32, NMels)
 		for m := 0; m < NMels; m++ {
 			var acc float64

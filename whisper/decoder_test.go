@@ -2,6 +2,7 @@ package whisper
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -31,6 +32,10 @@ func TestDecodeMatchesOracle(t *testing.T) {
 			S float64 `json:"s"`
 			E float64 `json:"e"`
 		} `json:"words"`
+		Segments []struct {
+			Start, End float64
+			Tokens     []int
+		} `json:"segments"`
 	}
 	if err := json.Unmarshal(raw, &oracle); err != nil {
 		t.Fatal(err)
@@ -39,7 +44,9 @@ func TestDecodeMatchesOracle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mel := LogMel(PadOrTrim(samples))
+	all := LogMelAll(samples)
+	content := len(all) - NFrames
+	mel := ChunkMel(all, 0, content)
 
 	b := mlxc.New()
 	defer b.Close()
@@ -67,7 +74,9 @@ func TestDecodeMatchesOracle(t *testing.T) {
 	audio := enc.Forward(b, mel)
 	t.Logf("encode in %s", time.Since(t0).Round(time.Millisecond))
 	t0 = time.Now()
-	res := DecodeChunk(b, dec, tok, audio, DecodeOptions{})
+	ds := dec.NewState(b, audio)
+	defer ds.Free(b)
+	res := DecodeChunk(b, dec, tok, ds, DecodeOptions{})
 	t.Logf("decode in %s: %d tokens, %d segments", time.Since(t0).Round(time.Millisecond), len(res.Tokens), len(res.Segments))
 	t.Logf("tokens: %s", tok.DecodeWithSpecial(res.Tokens))
 	for _, s := range res.Segments {
@@ -79,8 +88,12 @@ func TestDecodeMatchesOracle(t *testing.T) {
 	if got, want := normalize(res.Text), normalize(oracle.Text); got != want {
 		t.Errorf("text:\n got %q\nwant %q", got, want)
 	}
-	if len(res.Segments) == 0 || res.Segments[0].Start != 0 {
-		t.Errorf("first segment should start at 0: %+v", res.Segments)
+	var want []int
+	for _, s := range oracle.Segments {
+		want = append(want, s.Tokens...)
+	}
+	if fmt.Sprint(res.Tokens) != fmt.Sprint(want) {
+		t.Errorf("tokens differ from mlx_whisper's:\n got %v\nwant %v", res.Tokens, want)
 	}
 }
 

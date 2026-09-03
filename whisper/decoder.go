@@ -139,6 +139,64 @@ func (st *DecoderState) Reset(b engine.Backend) {
 	st.n = 0
 }
 
+// Free releases the state's cross-attention tensors and self cache.
+func (st *DecoderState) Free(b engine.Backend) {
+	st.Reset(b)
+	if sw, ok := b.(engine.Sweeper); ok {
+		sw.Unpin(st.crossK...)
+		sw.Unpin(st.crossV...)
+		sw.Sweep()
+	}
+}
+
+// ForwardAlign runs a whole token sequence without a cache — whisper's
+// alignment pass — and returns the logits of every position (F32,
+// [n*NVocab]) and, for each alignment layer (the last half of the blocks,
+// whisper's default), the cross-attention scores before softmax (F32,
+// [NHead*n*NCtxAudio]).
+func (d *Decoder) ForwardAlign(b engine.Backend, st *DecoderState, tokens []int) (logits []float32, cross [][]float32) {
+	n := len(tokens)
+	H, dh := d.cfg.NHead, d.cfg.NState/d.cfg.NHead
+	scale := float32(1 / math.Sqrt(float64(dh)))
+	scale4 := float32(math.Pow(float64(dh), -0.25)) // whisper scales q and k each
+	ids := make([]int32, n)
+	for i, t := range tokens {
+		ids[i] = int32(t)
+	}
+	x := b.TakeAxis(d.tokEmb, b.FromInt32(ids, n), 0)
+	x = b.Add(x, b.Slice(d.pos, 0, 0, n))
+	alignFrom := d.cfg.NLayer / 2
+	for i, blk := range d.blks {
+		h := blk.attnLN.forward(b, x)
+		q := splitHeads(b, blk.q.forward(b, h), n, H, dh)
+		k := splitHeads(b, blk.k.forward(b, h), n, H, dh)
+		v := splitHeads(b, blk.v.forward(b, h), n, H, dh)
+		o := b.SDPA(q, k, v, scale, n > 1)
+		x = b.Add(x, blk.out.forward(b, mergeHeads(b, o, n, H, dh)))
+
+		h = blk.crossLN.forward(b, x)
+		q = splitHeads(b, blk.cq.forward(b, h), n, H, dh)
+		if i >= alignFrom {
+			qs := b.ScalarMul(q, scale4)
+			ks := b.ScalarMul(st.crossK[i], scale4)
+			qk := b.Cast(b.MatMul(qs, b.Transpose(ks, 0, 1, 3, 2)), engine.F32) // [1, H, n, T]
+			w := b.Cast(b.Softmax(qk, 3), engine.F16)
+			o = b.MatMul(w, st.crossV[i])
+			cross = append(cross, b.Floats(qk))
+		} else {
+			o = b.SDPA(q, st.crossK[i], st.crossV[i], scale, false)
+		}
+		x = b.Add(x, blk.cout.forward(b, mergeHeads(b, o, n, H, dh)))
+		x = b.Add(x, blk.mlp2.forward(b, b.Gelu(blk.mlp1.forward(b, blk.mlpLN.forward(b, x)))))
+	}
+	x = d.ln.forward(b, x)
+	logits = b.Floats(b.Cast(b.MatMul(x, d.tokEmbT), engine.F32))
+	if sw, ok := b.(engine.Sweeper); ok {
+		sw.Sweep()
+	}
+	return logits, cross
+}
+
 // Step feeds tokens (the whole prompt on the first call, one token after)
 // and returns the next-token logits, F32 [NVocab].
 func (d *Decoder) Step(b engine.Backend, st *DecoderState, tokens []int) []float32 {

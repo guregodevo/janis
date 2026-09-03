@@ -17,8 +17,9 @@ import (
 // Segment is a timestamped span of the chunk.
 type Segment struct {
 	Start, End float64
-	Tokens     []int
+	Tokens     []int // text tokens only
 	Text       string
+	Words      []Word // filled by AddWordTimestamps
 }
 
 // ChunkResult is what DecodeChunk returns for one chunk.
@@ -52,9 +53,10 @@ func (d *Decoder) DetectLanguage(b engine.Backend, st *DecoderState) string {
 	return whisperLanguages[best]
 }
 
-// DecodeChunk transcribes one encoded chunk (the encoder output) greedily.
-func DecodeChunk(b engine.Backend, dec *Decoder, tok *Tokenizer, audio engine.Tensor, opt DecodeOptions) *ChunkResult {
-	st := dec.NewState(b, audio)
+// DecodeChunk transcribes one chunk greedily. The caller owns st (from
+// Decoder.NewState on the encoder output) so the alignment pass can reuse it.
+func DecodeChunk(b engine.Backend, dec *Decoder, tok *Tokenizer, st *DecoderState, opt DecodeOptions) *ChunkResult {
+	st.Reset(b)
 	lang := opt.Language
 	if lang == "" {
 		lang = dec.DetectLanguage(b, st)
@@ -85,11 +87,6 @@ func DecodeChunk(b engine.Backend, dec *Decoder, tok *Tokenizer, audio engine.Te
 		tokens = append(tokens, next)
 	}
 	st.Reset(b)
-	if sw, ok := b.(engine.Sweeper); ok {
-		sw.Unpin(st.crossK...)
-		sw.Unpin(st.crossV...)
-		sw.Sweep()
-	}
 	sampled := tokens[sampleBegin:]
 	return &ChunkResult{Language: lang, Tokens: sampled, Segments: segments(tok, sampled), Text: tok.Decode(sampled)}
 }
