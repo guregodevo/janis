@@ -381,6 +381,9 @@ func applyRotary(b engine.Backend, x, cos, sin engine.Tensor) engine.Tensor {
 }
 
 // Forward runs the tower: patches → merged image tokens [N/4, OutHidden].
+// It evaluates and sweeps per block, so every unpinned tensor the caller
+// holds on this backend is freed by the time it returns: pin what must
+// survive (earlier images' features, a session's caches).
 func (v *VisionTower) Forward(b engine.Backend, p Patches) engine.Tensor {
 	cfg := v.cfg
 	n := p.N()

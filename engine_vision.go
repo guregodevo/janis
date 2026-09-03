@@ -72,7 +72,16 @@ func (e *Engine) See(images []image.Image, question string, maxTokens int) (stri
 		}
 		p := qwen35.Preprocess(images[img], qwen35.Qwen35Vision)
 		img++
-		feats = append(feats, e.tower.Forward(b, p))
+		feat := e.tower.Forward(b, p)
+		// The tower sweeps per block, which frees every unpinned tensor on
+		// the backend — including the features of the images encoded before
+		// this one. Pinned here, unpinned when the call ends (live 2026-09-03:
+		// the eight-frame thumbnail judge died on "expected a non-empty
+		// mlx_array", the gateway with it).
+		if sw, ok := b.(engine.Sweeper); ok {
+			sw.Pin(feat)
+		}
+		feats = append(feats, feat)
 		grids = append(grids, qwen35.Grid{T: p.T, H: p.H / qwen35.Qwen35Vision.Merge, W: p.W / qwen35.Qwen35Vision.Merge})
 		for i := 0; i < p.Tokens(); i++ {
 			ids = append(ids, qwen35.ImageTokenID)

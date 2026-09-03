@@ -59,4 +59,15 @@ func TestEngineSees(t *testing.T) {
 	if !strings.HasPrefix(got, head) {
 		t.Errorf("answer %q does not open like the oracle %q", got, o.Text)
 	}
+	// Several images in one prompt (the thumbnail judge): the earlier
+	// images' features must survive the later encodes.
+	t0 = time.Now()
+	got, err = e.See([]image.Image{img, img, img}, "Which of these frames is the sharpest? Answer with its number and why.", 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("three frames in %s: %q", time.Since(t0).Round(time.Millisecond), got)
+	if got == "" {
+		t.Error("no answer for three frames")
+	}
 }
