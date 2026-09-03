@@ -17,6 +17,7 @@ import "C"
 import (
 	"os"
 	"strconv"
+	"sync"
 	"unsafe"
 
 	"memdoor/llm/engine"
@@ -611,7 +612,16 @@ func (b *Backend) Argmax(x engine.Tensor, axis int) engine.Tensor {
 
 // --- evaluation / readback ---
 
+// gpuMu serializes evaluation across every Backend in the process. Two
+// goroutines evaluating at once on the default Metal stream abort the
+// process ("A command encoder is already encoding to this command buffer"
+// — the whisper load racing the 9B's generation, live 2026-09-03 10:03).
+// Graph building stays lock-free; only the encode/commit is exclusive.
+var gpuMu sync.Mutex
+
 func (b *Backend) Eval(ts ...engine.Tensor) {
+	gpuMu.Lock()
+	defer gpuMu.Unlock()
 	vec := C.mlx_vector_array_new()
 	defer C.mlx_vector_array_free(vec)
 	for _, t := range ts {
@@ -625,6 +635,8 @@ func (b *Backend) Eval(ts ...engine.Tensor) {
 // AsyncEval schedules evaluation without blocking (mlx provides backpressure
 // when the async queue gets deep).
 func (b *Backend) AsyncEval(ts ...engine.Tensor) {
+	gpuMu.Lock()
+	defer gpuMu.Unlock()
 	vec := C.mlx_vector_array_new()
 	defer C.mlx_vector_array_free(vec)
 	for _, t := range ts {
@@ -636,6 +648,8 @@ func (b *Backend) AsyncEval(ts ...engine.Tensor) {
 }
 
 func (b *Backend) Floats(t engine.Tensor) []float32 {
+	gpuMu.Lock()
+	defer gpuMu.Unlock()
 	tt := t.(*tensor)
 	f32 := C.mlx_array_new()
 	C.mlx_astype(&f32, tt.arr, C.MLX_FLOAT32, b.stream)
@@ -673,6 +687,8 @@ func (b *Backend) DTypeOf(t engine.Tensor) engine.DType {
 // The array is forced contiguous first — mlx_array_data_uint8 reads the buffer
 // linearly, and a Concat/Slice result (a KV cache) may be a strided view.
 func (b *Backend) Bytes(t engine.Tensor) []byte {
+	gpuMu.Lock()
+	defer gpuMu.Unlock()
 	tt := t.(*tensor)
 	cont := C.mlx_array_new()
 	C.mlx_contiguous(&cont, tt.arr, false, b.stream)
@@ -689,6 +705,8 @@ func (b *Backend) Bytes(t engine.Tensor) []byte {
 }
 
 func (b *Backend) Ints(t engine.Tensor) []int32 {
+	gpuMu.Lock()
+	defer gpuMu.Unlock()
 	tt := t.(*tensor)
 	i32 := C.mlx_array_new()
 	C.mlx_astype(&i32, tt.arr, C.MLX_INT32, b.stream)
