@@ -59,6 +59,14 @@ func (e *Engine) See(images []image.Image, question string, maxTokens int) (stri
 		pinAll(b)
 		e.tower = tower
 	}
+	// The tower's 0.9 GB does not stay beside the brain between calls: on a
+	// 16 GB Mac the gateway was memory-killed twice during a demo with the
+	// brain, the eyes, whisper and a 4K encode all resident (2026-09-03).
+	// Loading again costs ~300 ms; the kernels stay warm in the process.
+	defer func() {
+		e.tower.Free(b)
+		e.tower = nil
+	}()
 
 	// The prompt: one <|vision_start|><|image_pad|><|vision_end|> per image,
 	// then the question, through the family's chat template (thinking off).

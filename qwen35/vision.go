@@ -188,7 +188,8 @@ type visionBlock struct {
 // VisionTower is the loaded tower.
 type VisionTower struct {
 	cfg      VisionConfig
-	patchW   engine.Tensor // [PatchDim, Hidden] in the patch vector's order
+	tensors  []engine.Tensor // everything loaded, for Free
+	patchW   engine.Tensor   // [PatchDim, Hidden] in the patch vector's order
 	patchB   engine.Tensor
 	posEmbed engine.Tensor // [PosGrid², Hidden]
 	blocks   []*visionBlock
@@ -254,7 +255,22 @@ func LoadVisionTower(b engine.Backend, st *safetensors.File, cfg VisionConfig) (
 	if v.mergeFC2, err = loadVisionLinear(b, st, "vision_tower.merger.linear_fc2"); err != nil {
 		return nil, err
 	}
+	v.tensors = append(v.tensors, v.patchW, v.patchB, v.posEmbed, v.mergeLN.w, v.mergeLN.bias,
+		v.mergeFC1.wT, v.mergeFC1.bias, v.mergeFC2.wT, v.mergeFC2.bias)
+	for _, blk := range v.blocks {
+		v.tensors = append(v.tensors, blk.norm1.w, blk.norm1.bias, blk.norm2.w, blk.norm2.bias,
+			blk.qkv.wT, blk.qkv.bias, blk.proj.wT, blk.proj.bias, blk.fc1.wT, blk.fc1.bias, blk.fc2.wT, blk.fc2.bias)
+	}
 	return v, nil
+}
+
+// Free releases the tower's weights (about 0.9 GB) on a sweeping backend;
+// the tower must not be used afterwards. Loading again takes ~300 ms.
+func (v *VisionTower) Free(b engine.Backend) {
+	if sw, ok := b.(engine.Sweeper); ok {
+		sw.Unpin(v.tensors...)
+		sw.Sweep()
+	}
 }
 
 // geluTanh is the tower's activation: 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³))).
