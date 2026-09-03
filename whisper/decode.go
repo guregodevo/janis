@@ -99,6 +99,9 @@ func DecodeChunk(b engine.Backend, dec *Decoder, tok *Tokenizer, st *DecoderStat
 	var sumLogprob float64
 	sampleLen := dec.cfg.NCtx / 2
 	for i := 0; i < sampleLen; i++ {
+		if len(tokens) >= dec.cfg.NCtx { // a long prompt plus a long sample: whisper stops at n_ctx
+			break
+		}
 		var logits []float32
 		if i == 0 {
 			rows := dec.StepRows(b, st, tokens, []int{sotIndex, len(tokens) - 1})
