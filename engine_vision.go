@@ -18,6 +18,16 @@ import (
 // each call prefills a throwaway cache set so the agent's conversational
 // session keeps its prefix.
 
+// How much of a frame the eyes take: about 400 image tokens for one frame
+// (a 9:16 short resizes to 480×832; the processor's own ceiling would make
+// it 1,605), a shared budget across a judge's candidates, and a floor a
+// frame never drops below.
+const (
+	seeVisionPixels    = 480 * 864
+	seeVisionPixelsAll = 1_200_000
+	seeVisionPixelsMin = 256 * 256
+)
+
 // CanSee reports whether the loaded model has a vision tower.
 func (e *Engine) CanSee() bool { return e.q35 != nil }
 
@@ -61,6 +71,15 @@ func (e *Engine) See(images []image.Image, question string, maxTokens int) (stri
 	raw := e.tok.EncodeSpecial(prompt)
 
 	// Encode the images and expand each single pad to the image's token count.
+	// Pixel budget per image: seeVisionPixels alone, shared when several
+	// frames sit in one prompt (the thumbnail judge), never under the floor.
+	budget := seeVisionPixels
+	if n := len(images); n > 1 && seeVisionPixelsAll/n < budget {
+		budget = seeVisionPixelsAll / n
+	}
+	if budget < seeVisionPixelsMin {
+		budget = seeVisionPixelsMin
+	}
 	var feats []engine.Tensor
 	var grids []qwen35.Grid
 	var ids []int32
@@ -70,7 +89,7 @@ func (e *Engine) See(images []image.Image, question string, maxTokens int) (stri
 			ids = append(ids, id)
 			continue
 		}
-		p := qwen35.Preprocess(images[img], qwen35.Qwen35Vision)
+		p := qwen35.PreprocessBudget(images[img], qwen35.Qwen35Vision, budget)
 		img++
 		feat := e.tower.Forward(b, p)
 		// The tower sweeps per block, which frees every unpinned tensor on

@@ -81,9 +81,21 @@ func (p Patches) Tokens() int { return p.N() / 4 }
 // row-major, the 2×2 patches inside each block row-major, and within a
 // patch channel, then temporal copy, then row, then column.
 func Preprocess(img image.Image, cfg VisionConfig) Patches {
+	return PreprocessBudget(img, cfg, visionMaxPixels)
+}
+
+// PreprocessBudget is Preprocess with a pixel ceiling below the processor's
+// 16.7M: a 960×1707 frame under the default ceiling is 6,420 patches and
+// 1,605 language tokens per image — the tower's attention over it and the
+// prefill behind it took the gateway down (live 2026-09-03 21:35, the
+// `see` check on a finished short). A judge does not need that many.
+func PreprocessBudget(img image.Image, cfg VisionConfig, maxPixels int) Patches {
 	b := img.Bounds()
 	factor := cfg.Patch * cfg.Merge
-	rh, rw := smartResize(b.Dy(), b.Dx(), factor, visionMinPixels, visionMaxPixels)
+	if maxPixels <= 0 || maxPixels > visionMaxPixels {
+		maxPixels = visionMaxPixels
+	}
+	rh, rw := smartResize(b.Dy(), b.Dx(), factor, visionMinPixels, maxPixels)
 	rgba := image.NewRGBA(image.Rect(0, 0, rw, rh))
 	if rh == b.Dy() && rw == b.Dx() {
 		draw.Draw(rgba, rgba.Bounds(), img, b.Min, draw.Src)

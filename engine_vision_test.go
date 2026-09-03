@@ -9,6 +9,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/image/draw"
+
+	"memdoor/llm/qwen35"
 )
 
 // The engine answers a question about a frame with its own tower: the
@@ -70,4 +74,19 @@ func TestEngineSees(t *testing.T) {
 	if got == "" {
 		t.Error("no answer for three frames")
 	}
+	// A tall 9:16 frame is budgeted down to about four hundred tokens (the
+	// default ceiling would make it 1,605).
+	tall := image.NewRGBA(image.Rect(0, 0, 1080, 1920))
+	draw.CatmullRom.Scale(tall, tall.Bounds(), img, img.Bounds(), draw.Src, nil)
+	p := qwen35.PreprocessBudget(tall, qwen35.Qwen35Vision, seeVisionPixels)
+	t.Logf("1080×1920 frame → %dx%d, %d tokens", p.ResizedW, p.ResizedH, p.Tokens())
+	if p.Tokens() > 420 {
+		t.Errorf("a tall frame must stay near 400 tokens for the eyes, got %d", p.Tokens())
+	}
+	t0 = time.Now()
+	got, err = e.See([]image.Image{tall}, "What is the person wearing?", 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("tall frame in %s: %q", time.Since(t0).Round(time.Millisecond), got)
 }
