@@ -200,6 +200,13 @@ func (d *Decoder) ForwardAlign(b engine.Backend, st *DecoderState, tokens []int)
 // Step feeds tokens (the whole prompt on the first call, one token after)
 // and returns the next-token logits, F32 [NVocab].
 func (d *Decoder) Step(b engine.Backend, st *DecoderState, tokens []int) []float32 {
+	return d.StepRows(b, st, tokens, []int{len(tokens) - 1})[0]
+}
+
+// StepRows is Step returning the logits at several of the fed positions
+// (whisper reads the no-speech probability at the <|startoftranscript|>
+// position of the first step).
+func (d *Decoder) StepRows(b engine.Backend, st *DecoderState, tokens []int, rows []int) [][]float32 {
 	n := len(tokens)
 	H, dh := d.cfg.NHead, d.cfg.NState/d.cfg.NHead
 	scale := float32(1 / math.Sqrt(float64(dh)))
@@ -232,8 +239,11 @@ func (d *Decoder) Step(b engine.Backend, st *DecoderState, tokens []int) []float
 		x = b.Add(x, blk.mlp2.forward(b, b.Gelu(blk.mlp1.forward(b, blk.mlpLN.forward(b, x)))))
 	}
 	x = d.ln.forward(b, x)
-	last := b.Slice(x, 0, n-1, n) // [1, D]
-	logits := b.Floats(b.Cast(b.MatMul(last, d.tokEmbT), engine.F32))
+	out := make([][]float32, len(rows))
+	for i, r := range rows {
+		row := b.Slice(x, 0, r, r+1) // [1, D]
+		out[i] = b.Floats(b.Cast(b.MatMul(row, d.tokEmbT), engine.F32))
+	}
 	st.n += n
 	if sw, ok := b.(engine.Sweeper); ok {
 		sw.Unpin(old...)
@@ -241,5 +251,5 @@ func (d *Decoder) Step(b engine.Backend, st *DecoderState, tokens []int) []float
 		sw.Pin(st.selfV...)
 		sw.Sweep()
 	}
-	return logits
+	return out
 }

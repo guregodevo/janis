@@ -1,7 +1,10 @@
 package whisper
 
 import (
+	"bytes"
+	"compress/zlib"
 	"math"
+	"math/rand"
 	"sort"
 	"strings"
 
@@ -14,12 +17,15 @@ import (
 // beats every text token). This is whisper's DecodingTask at temperature 0;
 // the temperature fallback of its transcribe loop is not ported yet.
 
-// Segment is a timestamped span of the chunk.
+// Segment is a timestamped span of the recording.
 type Segment struct {
 	Start, End float64
-	Tokens     []int // text tokens only
+	Tokens     []int // the segment's tokens, timestamps included
 	Text       string
 	Words      []Word // filled by AddWordTimestamps
+
+	// Whisper's per-window quality signals, copied to each of its segments.
+	Temperature, AvgLogprob, CompressionRatio, NoSpeechProb float64
 }
 
 // ChunkResult is what DecodeChunk returns for one chunk.
@@ -28,13 +34,21 @@ type ChunkResult struct {
 	Tokens   []int // the sampled tokens (after the prompt), specials included
 	Segments []Segment
 	Text     string
+
+	Temperature      float64
+	AvgLogprob       float64 // mean log-probability of the sampled tokens (EOT included)
+	CompressionRatio float64 // zlib ratio of the text: high means it loops
+	NoSpeechProb     float64 // <|nospeech|> at the start-of-transcript position
 }
 
-// DecodeOptions steer DecodeChunk. The zero value detects the language and
-// allows the first timestamp up to 1 s in, as whisper does.
+// DecodeOptions steer DecodeChunk. The zero value detects the language,
+// decodes greedily and allows the first timestamp up to 1 s in, as whisper.
 type DecodeOptions struct {
 	Language            string  // ISO code; "" detects
+	Prompt              []int   // previous text (and any initial prompt); the last NCtx/2-1 are used
+	Temperature         float64 // 0 is greedy
 	MaxInitialTimestamp float64 // seconds; 0 means whisper's 1.0
+	Seed                int64   // for Temperature > 0
 }
 
 var negInf = float32(math.Inf(-1))
@@ -53,7 +67,7 @@ func (d *Decoder) DetectLanguage(b engine.Backend, st *DecoderState) string {
 	return whisperLanguages[best]
 }
 
-// DecodeChunk transcribes one chunk greedily. The caller owns st (from
+// DecodeChunk transcribes one chunk. The caller owns st (from
 // Decoder.NewState on the encoder output) so the alignment pass can reuse it.
 func DecodeChunk(b engine.Backend, dec *Decoder, tok *Tokenizer, st *DecoderState, opt DecodeOptions) *ChunkResult {
 	st.Reset(b)
@@ -61,26 +75,46 @@ func DecodeChunk(b engine.Backend, dec *Decoder, tok *Tokenizer, st *DecoderStat
 	if lang == "" {
 		lang = dec.DetectLanguage(b, st)
 	}
-	prompt := []int{TokSOT, LangToken(lang), TokTranscribe}
-	sampleBegin := len(prompt)
-	tokens := append([]int(nil), prompt...)
+	var initial []int
+	if len(opt.Prompt) > 0 {
+		p := opt.Prompt
+		if max := dec.cfg.NCtx/2 - 1; len(p) > max {
+			p = p[len(p)-max:]
+		}
+		initial = append([]int{TokStartOfPrev}, p...)
+	}
+	sotIndex := len(initial)
+	initial = append(initial, TokSOT, LangToken(lang), TokTranscribe)
+	sampleBegin := len(initial)
+	tokens := append([]int(nil), initial...)
 	suppress := tok.nonSpeechTokens()
 	maxInit := opt.MaxInitialTimestamp
 	if maxInit == 0 {
 		maxInit = 1.0
 	}
 	maxInitIdx := int(math.Round(maxInit / 0.02))
+	rng := rand.New(rand.NewSource(opt.Seed))
 
+	res := &ChunkResult{Language: lang, Temperature: opt.Temperature}
+	var sumLogprob float64
 	sampleLen := dec.cfg.NCtx / 2
 	for i := 0; i < sampleLen; i++ {
 		var logits []float32
 		if i == 0 {
-			logits = dec.Step(b, st, tokens)
+			rows := dec.StepRows(b, st, tokens, []int{sotIndex, len(tokens) - 1})
+			res.NoSpeechProb = softmaxAt(rows[0], TokNoSpeech)
+			logits = rows[1]
 		} else {
 			logits = dec.Step(b, st, tokens[len(tokens)-1:])
 		}
 		applyRules(logits, tokens, sampleBegin, suppress, tok, maxInitIdx)
-		next := argmax(logits)
+		var next int
+		if opt.Temperature > 0 {
+			next = sample(logits, opt.Temperature, rng)
+		} else {
+			next = argmax(logits)
+		}
+		sumLogprob += float64(logits[next] - logSumExp(logits))
 		if next == TokEOT {
 			break
 		}
@@ -88,7 +122,56 @@ func DecodeChunk(b engine.Backend, dec *Decoder, tok *Tokenizer, st *DecoderStat
 	}
 	st.Reset(b)
 	sampled := tokens[sampleBegin:]
-	return &ChunkResult{Language: lang, Tokens: sampled, Segments: segments(tok, sampled), Text: tok.Decode(sampled)}
+	res.Tokens = sampled
+	res.Text = tok.Decode(sampled)
+	res.Segments = segments(tok, sampled)
+	res.AvgLogprob = sumLogprob / float64(len(sampled)+1)
+	res.CompressionRatio = compressionRatio(res.Text)
+	return res
+}
+
+// softmaxAt is the probability of one token under the logits.
+func softmaxAt(logits []float32, tok int) float64 {
+	return math.Exp(float64(logits[tok] - logSumExp(logits)))
+}
+
+// sample draws from softmax(logits / temperature).
+func sample(logits []float32, temperature float64, rng *rand.Rand) int {
+	m := negInf
+	for _, v := range logits {
+		if v > m {
+			m = v
+		}
+	}
+	probs := make([]float64, len(logits))
+	var sum float64
+	for i, v := range logits {
+		if v == negInf {
+			continue
+		}
+		probs[i] = math.Exp(float64(v-m) / temperature)
+		sum += probs[i]
+	}
+	r := rng.Float64() * sum
+	for i, p := range probs {
+		r -= p
+		if r <= 0 && p > 0 {
+			return i
+		}
+	}
+	return argmax(logits)
+}
+
+// compressionRatio is whisper's loop detector: text bytes over their zlib size.
+func compressionRatio(text string) float64 {
+	var buf bytes.Buffer
+	w := zlib.NewWriter(&buf)
+	w.Write([]byte(text))
+	w.Close()
+	if buf.Len() == 0 {
+		return 0
+	}
+	return float64(len(text)) / float64(buf.Len())
 }
 
 // applyRules is whisper's SuppressBlank + SuppressTokens + ApplyTimestampRules.
@@ -195,11 +278,13 @@ func segments(tok *Tokenizer, sampled []int) []Segment {
 		}
 		body := sampled[i+1 : j]
 		end := float64(ChunkSecs)
+		raw := sampled[i:j]
 		if j < len(sampled) {
 			end = Timestamp(sampled[j])
+			raw = sampled[i : j+1]
 		}
 		if len(body) > 0 {
-			out = append(out, Segment{Start: start, End: end, Tokens: body, Text: tok.Decode(body)})
+			out = append(out, Segment{Start: start, End: end, Tokens: raw, Text: tok.Decode(body)})
 		}
 		i = j + 1
 	}
