@@ -10,9 +10,13 @@ import (
 	"testing"
 	"time"
 
+	"strings"
+
 	"memdoor/llm/engine"
 	"memdoor/llm/mlxc"
+	"memdoor/llm/qwen"
 	"memdoor/llm/safetensors"
+	"memdoor/llm/tokenizer"
 )
 
 func qwen35Dir(t *testing.T) string {
@@ -146,5 +150,86 @@ func TestVisionTowerMatchesOracle(t *testing.T) {
 	t.Logf("tower out vs oracle: min row cosine %.5f, max abs %.4f over %d tokens", c, maxAbs, o.NImageTokens)
 	if c < 0.99 {
 		t.Fatalf("tower output min row cosine %.5f", c)
+	}
+}
+
+// Milestone 3: the language model reads the Go tower's tokens — the first
+// token after the prompt is mlx-vlm's, and greedy decoding continues in its
+// words.
+func TestVisionPrefillMatchesOracle(t *testing.T) {
+	o, p := loadVisionOracle(t)
+	wantLogits := readF32(t, "vision_logits_last.f32")
+	dir := qwen35Dir(t)
+	cfg, err := qwen.LoadConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := mlxc.New()
+	defer b.Close()
+	st, err := safetensors.OpenModel(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	t0 := time.Now()
+	model, err := LoadModel(b, st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tower, err := LoadVisionTower(b, st, Qwen35Vision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sw, ok := any(b).(engine.Sweeper); ok {
+		sw.PinAll()
+	}
+	t.Logf("model + tower loaded in %s", time.Since(t0).Round(time.Millisecond))
+
+	ids := make([]int32, len(o.InputIDs))
+	for i, v := range o.InputIDs {
+		ids[i] = int32(v)
+	}
+	grid := Grid{T: p.T, H: p.H / Qwen35Vision.Merge, W: p.W / Qwen35Vision.Merge}
+	t0 = time.Now()
+	feat := tower.Forward(b, p)
+	caches := model.newCaches()
+	logits, delta := model.PrefillWithImages(b, ids, []engine.Tensor{feat}, []Grid{grid}, caches)
+	got := b.Floats(b.Cast(logits, engine.F32))
+	t.Logf("image prefill of %d tokens (%d image) in %s; rope delta %d", len(ids), o.NImageTokens, time.Since(t0).Round(time.Millisecond), delta)
+	argmax := func(v []float32) int {
+		best := 0
+		for i, x := range v {
+			if x > v[best] {
+				best = i
+			}
+		}
+		return best
+	}
+	c, _ := rowCosine(got, wantLogits, len(wantLogits))
+	t.Logf("logits vs oracle: cosine %.5f, argmax %d (oracle %d)", c, argmax(got), o.FirstToken)
+	if argmax(got) != o.FirstToken {
+		t.Fatalf("first token %d, oracle %d", argmax(got), o.FirstToken)
+	}
+
+	// Greedy decode a few tokens with the text path, positions continuing
+	// from the prompt's last mRoPE position.
+	var out []int32
+	tok := int32(argmax(got))
+	offset := len(ids) + delta
+	for i := 0; i < 24; i++ {
+		out = append(out, tok)
+		lg := model.forwardCachedT(b, b.FromInt32([]int32{tok}, 1), 1, offset, caches)
+		tok = int32(argmax(b.Floats(b.Cast(lg, engine.F32))))
+		offset++
+	}
+	tk, err := tokenizer.New(dir)
+	if err != nil {
+		t.Skip("tokenizer:", err)
+	}
+	defer tk.Close()
+	text := tk.Decode(out)
+	t.Logf("greedy: %q\noracle: %q", text, o.Text)
+	if !strings.HasPrefix(o.Text, strings.TrimSpace(text)[:min(24, len(strings.TrimSpace(text)))]) {
+		t.Errorf("decoded text diverges from the oracle's opening")
 	}
 }
