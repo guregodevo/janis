@@ -1,3 +1,5 @@
+//go:build darwin && arm64 && cgo
+
 // Command llmoracle drives the engine over RAW token ids — no chat template,
 // no stop tokens — and prints the greedy continuation. Its output is diffed
 // against a reference implementation (mlx-lm in Python) running the same ids,
