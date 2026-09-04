@@ -17,7 +17,19 @@ import (
 
 // The engine answers a question about a frame with its own tower: the
 // answer opens with the mlx-vlm oracle's words for the same frame.
+//
+// Gated like every other live test in this package, and for a harder
+// reason than slowness: it loads the 9B and its tower, about 6 GB, which
+// on the 16 GB dogfood machine is the difference between a green suite and
+// a memory kill. Ungated it also outran the 10-minute package timeout, so
+// `go test ./...` failed here every time — a test that cannot pass is
+// worse than one that says how to run it.
+//
+//	MLX_VISION_E2E=1 go test ./llm/ -run TestEngineSees -v
 func TestEngineSees(t *testing.T) {
+	if os.Getenv("MLX_VISION_E2E") != "1" {
+		t.Skip("set MLX_VISION_E2E=1 to run (loads the 9B and its vision tower)")
+	}
 	home, _ := os.UserHomeDir()
 	m, _ := filepath.Glob(filepath.Join(home, ".cache/huggingface/hub/models--mlx-community--Qwen3.5-9B-MLX-4bit/snapshots/*/config.json"))
 	if len(m) == 0 {
