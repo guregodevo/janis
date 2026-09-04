@@ -47,11 +47,11 @@ type Config struct {
 	// output gate (q_proj emits [query, gate] per head); the rest are Gated
 	// DeltaNet linear-attention layers with a depthwise causal conv front-end.
 	FullAttnInterval int
-	LinearKHeads     int // linear_num_key_heads (q/k heads)
-	LinearVHeads     int // linear_num_value_heads
-	LinearKDim       int // linear_key_head_dim
-	LinearVDim       int // linear_value_head_dim
-	ConvKernel       int // linear_conv_kernel_dim
+	LinearKHeads     int     // linear_num_key_heads (q/k heads)
+	LinearVHeads     int     // linear_num_value_heads
+	LinearKDim       int     // linear_key_head_dim
+	LinearVDim       int     // linear_value_head_dim
+	ConvKernel       int     // linear_conv_kernel_dim
 	PartialRotary    float32 // fraction of head_dim RoPE rotates (0 = all)
 
 	// QuantOverrides maps a tensor name to its quantization when it differs
