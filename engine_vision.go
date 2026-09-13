@@ -116,8 +116,14 @@ func (e *Engine) See(images []image.Image, question string, maxTokens int) (stri
 	}
 
 	caches := e.q35.NewCaches()
+	// What a step pins (the caches' tensors and its logits) is released
+	// at the next step and at the end: pinning each step's tensors for
+	// good leaked a KV cache and a logits row per generated token (the
+	// whisper encoder's defect, found 2026-09-13).
+	var pinned []engine.Tensor
 	defer func() {
 		if sw, ok := b.(engine.Sweeper); ok {
+			sw.Unpin(pinned...)
 			for _, c := range caches {
 				sw.Unpin(c.Tensors()...)
 			}
@@ -138,10 +144,12 @@ func (e *Engine) See(images []image.Image, question string, maxTokens int) (stri
 			for _, c := range caches {
 				keep = append(keep, c.Tensors()...)
 			}
-			b.Eval(append(keep, lg)...)
+			keep = append(keep, lg)
+			b.Eval(keep...)
+			sw.Unpin(pinned...)
 			sw.Pin(keep...)
-			sw.Pin(lg)
 			sw.Sweep()
+			pinned = keep
 		}
 		tok = argmax32(b.Floats(b.Cast(lg, engine.F32)))
 	}

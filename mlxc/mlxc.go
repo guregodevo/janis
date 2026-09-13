@@ -24,12 +24,14 @@ import (
 )
 
 // tensor wraps an mlx_array handle. shape is tracked Go-side; pinned protects it
-// from Sweep; backing pins host bytes for arrays built from Go memory.
+// from Sweep. No host copy is kept: mlx_array_new_data copies the buffer
+// (mlx/c/array.h), and keeping the Go bytes beside every weight doubled a
+// model's memory for its whole life — 1.5 GB for whisper, measured
+// 2026-09-13 while hunting the gateway deaths.
 type tensor struct {
-	arr     C.mlx_array
-	shape   []int
-	pinned  bool
-	backing []byte
+	arr    C.mlx_array
+	shape  []int
+	pinned bool
 }
 
 func (t *tensor) Shape() []int { return t.shape }
@@ -199,7 +201,21 @@ func (b *Backend) Version() string {
 	return C.GoString(C.mlx_string_data(s))
 }
 
-func (b *Backend) Close() { C.mlx_stream_free(b.stream) }
+// Close releases everything the backend still holds — pinned weights
+// included — and returns MLX's reuse cache to the OS. Freeing only the
+// stream left a whisper model's 1.5 GB of weights resident on every idle
+// unload, and the next load added another (measured 2026-09-13).
+func (b *Backend) Close() {
+	for _, t := range b.tracked {
+		if t.arr.ctx != nil {
+			C.mlx_array_free(t.arr)
+			t.arr.ctx = nil
+		}
+	}
+	b.tracked = nil
+	C.mlx_stream_free(b.stream)
+	C.mlx_clear_cache()
+}
 
 // PeakMemoryMB reports MLX's peak memory in MB (diagnostic).
 func (b *Backend) PeakMemoryMB() float64 {
@@ -267,9 +283,7 @@ func (b *Backend) FromInt32(data []int32, shape ...int) engine.Tensor {
 func (b *Backend) FromRaw(dt engine.DType, raw []byte, shape ...int) engine.Tensor {
 	cs, _ := cShape(shape)
 	arr := C.mlx_array_new_data(unsafe.Pointer(&raw[0]), &cs[0], C.int(len(cs)), mlxDType(dt))
-	t := b.newT(arr, cloneShape(shape))
-	t.backing = raw
-	return t
+	return b.newT(arr, cloneShape(shape))
 }
 
 // --- ops ---

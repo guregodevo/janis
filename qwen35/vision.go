@@ -420,13 +420,19 @@ func (v *VisionTower) Forward(b engine.Backend, p Patches) engine.Tensor {
 	x := b.Add(v.PatchEmbed(b, p), v.posEmbedFor(b, p))
 	cos, sin := v.rotary(b, p)
 	b.Eval(x, cos, sin)
+	sw, _ := b.(engine.Sweeper)
 	pin := func(ts ...engine.Tensor) {
-		if sw, ok := b.(engine.Sweeper); ok {
+		if sw != nil {
 			sw.Pin(ts...)
 			sw.Sweep()
 		}
 	}
 	pin(x, cos, sin)
+	// Each block's output is pinned across the sweep and the previous
+	// block's released: pinning every block's x for good leaked the whole
+	// tower's activations per image (the same defect as whisper's encoder,
+	// found 2026-09-13).
+	prev := x
 	for _, blk := range v.blocks {
 		h := blk.norm1.forward(b, x)
 		qkv := b.Reshape(blk.qkv.forward(b, h), n, 3, H, dh) // [N, 3, H, dh]
@@ -441,10 +447,20 @@ func (v *VisionTower) Forward(b engine.Backend, p Patches) engine.Tensor {
 		x = b.Add(x, blk.proj.forward(b, o))
 		x = b.Add(x, blk.fc2.forward(b, geluTanh(b, blk.fc1.forward(b, blk.norm2.forward(b, x)))))
 		b.Eval(x)
-		pin(x, cos, sin)
+		if sw != nil {
+			sw.Pin(x)
+			sw.Unpin(prev)
+			sw.Sweep()
+		}
+		prev = x
 	}
 	m := b.Reshape(v.mergeLN.forward(b, x), n/(cfg.Merge*cfg.Merge), cfg.Hidden*cfg.Merge*cfg.Merge)
 	out := v.mergeFC2.forward(b, b.Gelu(v.mergeFC1.forward(b, m)))
 	b.Eval(out)
+	// The features are the caller's (engine_vision pins them); the last
+	// block's x and the rotary tables go with the caller's next sweep.
+	if sw != nil {
+		sw.Unpin(x, cos, sin)
+	}
 	return out
 }

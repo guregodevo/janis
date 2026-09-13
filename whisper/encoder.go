@@ -240,6 +240,8 @@ func (e *Encoder) Forward(b engine.Backend, mel [][]float32) engine.Tensor {
 	x = b.Gelu(e.conv1.forward(b, x, 1))
 	x = b.Gelu(e.conv2.forward(b, x, 2))
 	x = b.Add(x, e.pos)
+	sw, _ := b.(engine.Sweeper)
+	var prev engine.Tensor
 	for _, blk := range e.blks {
 		x = b.Add(x, blk.attention(b, blk.attnLN.forward(b, x), e.cfg))
 		h := blk.mlp2.forward(b, b.Gelu(blk.mlp1.forward(b, blk.mlpLN.forward(b, x))))
@@ -248,14 +250,28 @@ func (e *Encoder) Forward(b engine.Backend, mel [][]float32) engine.Tensor {
 		// backend tracks every tensor it creates until a Sweep, and the cost
 		// of a block grew from 140 ms to over a second as that list grew
 		// (profiled 2026-09-03). Pin x, sweep the rest — the decode loop's rule.
+		// The PREVIOUS block's x is unpinned first: pinning every block's
+		// output and never releasing it leaked 32 × [1500, 1280] f16 per
+		// 30 s chunk — ~300 MB per minute of audio, kept until the process
+		// died (measured 2026-09-13: three silent gateway deaths that day).
 		b.Eval(x)
-		if sw, ok := b.(engine.Sweeper); ok {
+		if sw != nil {
 			sw.Pin(x)
+			if prev != nil {
+				sw.Unpin(prev)
+			}
 			sw.Sweep()
 		}
+		prev = x
 	}
 	x = e.lnPost.forward(b, x)
 	b.Eval(x)
+	// The result is the caller's, alive until its next Sweep (NewState
+	// takes its cross-attention from it and sweeps); the last block's x
+	// goes with that sweep too.
+	if sw != nil && prev != nil {
+		sw.Unpin(prev)
+	}
 	return x
 }
 
