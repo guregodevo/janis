@@ -45,6 +45,7 @@ type ChunkResult struct {
 // decodes greedily and allows the first timestamp up to 1 s in, as whisper.
 type DecodeOptions struct {
 	Language            string  // ISO code; "" detects
+	Translate           bool    // whisper's translate task: output in English
 	Prompt              []int   // previous text (and any initial prompt); the last NCtx/2-1 are used
 	Temperature         float64 // 0 is greedy
 	MaxInitialTimestamp float64 // seconds; 0 means whisper's 1.0
@@ -84,7 +85,11 @@ func DecodeChunk(b engine.Backend, dec *Decoder, tok *Tokenizer, st *DecoderStat
 		initial = append([]int{TokStartOfPrev}, p...)
 	}
 	sotIndex := len(initial)
-	initial = append(initial, TokSOT, LangToken(lang), TokTranscribe)
+	task := TokTranscribe
+	if opt.Translate {
+		task = TokTranslate
+	}
+	initial = append(initial, TokSOT, LangToken(lang), task)
 	sampleBegin := len(initial)
 	tokens := append([]int(nil), initial...)
 	suppress := tok.nonSpeechTokens()

@@ -57,6 +57,10 @@ type TranscribeOptions struct {
 	Language       string
 	InitialPrompt  string // vocabulary or style hint; whisper's initial_prompt
 	WordTimestamps bool
+	// Translate runs whisper's translate task: the segments come out in
+	// English whatever the language spoken. Segment timestamps stay valid;
+	// word timestamps are not meaningful across languages and are skipped.
+	Translate bool
 
 	Temperatures              []float64
 	CompressionRatioThreshold float64
@@ -257,7 +261,7 @@ func (m *Model) Transcribe(samples []float32, opt TranscribeOptions) (*Result, e
 func (m *Model) decodeWithFallback(st *DecoderState, lang string, prompt []int, opt TranscribeOptions) *ChunkResult {
 	var r *ChunkResult
 	for i, t := range opt.Temperatures {
-		r = DecodeChunk(m.B, m.Dec, m.Tok, st, DecodeOptions{Language: lang, Prompt: prompt, Temperature: t, Seed: int64(i)})
+		r = DecodeChunk(m.B, m.Dec, m.Tok, st, DecodeOptions{Language: lang, Translate: opt.Translate, Prompt: prompt, Temperature: t, Seed: int64(i)})
 		if lang == "" {
 			lang = r.Language
 		}
