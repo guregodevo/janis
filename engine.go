@@ -106,6 +106,8 @@ type Engine struct {
 	// vision tower loads on the first See (engine_vision.go).
 	q35   *qwen35.Model
 	tower *qwen35.VisionTower
+
+	decideState
 }
 
 // Open loads the model from a local snapshot directory (config.json,
@@ -150,6 +152,7 @@ func Open(modelDir string) (*Engine, error) {
 	pinAll(e.bk) // protect the weights across requests (no-op on GC backends)
 	e.session = sm.NewSession()
 	e.utilSession = sm.NewSession()
+	e.decideSession = sm.NewSession()
 
 	if e.tok, err = tokenizer.New(modelDir); err != nil {
 		return nil, err
@@ -304,14 +307,11 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 	// slot cache unwarmed (0.10 tok/s decode measured after a from-scratch
 	// chunked prefill) — cannot bite when nothing meaningful is decoded.
 	// Dense models ignore PrefillChunk overrides above the global chunk size.
-	restoreChunk := false
-	if maxTok <= 1 && sess.PrefillChunk == 1 {
-		sess.PrefillChunk = 128
-		restoreChunk = true
-	}
-	out := sess.Generate(e.bk, ids, maxTok, p)
-	if restoreChunk {
-		sess.PrefillChunk = 1
+	var out []int32
+	if maxTok <= 1 {
+		withGenerateNothingChunking(sess, func() { out = sess.Generate(e.bk, ids, maxTok, p) })
+	} else {
+		out = sess.Generate(e.bk, ids, maxTok, p)
 	}
 	mlxComputeMu.Unlock()
 	return e.tok.Decode(out)

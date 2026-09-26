@@ -79,13 +79,11 @@ func cachedLen(caches []LayerCache) int {
 	return caches[0].Len()
 }
 
-// Generate decodes a reply for the full prompt newIDs, reusing the cached prefix
-// it shares with the previous turn.
-func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleParams) []int32 {
-	if len(newIDs) == 0 {
-		return nil
-	}
-	rng := rand.New(rand.NewSource(int64(p.Seed)))
+// prefill runs the chunked prefill of newIDs over the reused prefix and returns
+// the last-position logits on the host; false means cancel fired first. The
+// caller owns s.IDs: Prefill records the whole prompt, Generate appends the
+// reply to it.
+func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) ([]float32, bool) {
 	sw, _ := b.(engine.Sweeper)
 	old := cacheTensors(s.Caches) // previous turn's caches, to be freed
 
@@ -156,15 +154,56 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 			sw.Unpin(prev...)
 			sw.Sweep()
 		}
-		if p.Cancel != nil && p.Cancel() {
+		if cancel != nil && cancel() {
 			// Cancelled mid-prefill: the cache now holds `offset` tokens, so record
 			// that exact prefix as the session state — keeps the next turn's KV
 			// prefix-reuse consistent instead of claiming the full prompt is cached.
 			s.IDs = append([]int32(nil), newIDs[:offset]...)
-			return nil
+			return nil, false
 		}
 	}
-	floats := b.Floats(logits) // last-position logits; no history yet
+	floats := b.Floats(logits) // last-position logits
+	if sw != nil {
+		sw.Unpin(logits)
+		pinCaches(sw, s.Caches)
+		sw.Unpin(old...)
+		sw.Sweep()
+	}
+	return floats, true
+}
+
+// Prefill materializes newIDs into the session's caches (reusing the cached
+// prefix it shares with the previous call) and returns the last-position
+// logits on the host, or nil when cancel fired mid-prefill. No token is
+// sampled and nothing is decoded: this is the read-only half of Generate, for
+// callers that consume the next-token distribution directly (Engine.Decide).
+// The full prompt is recorded as the session state, so a second call sharing
+// its prefix (same state, different question) prefills only the suffix.
+func (s *Session) Prefill(b engine.Backend, newIDs []int32, cancel func() bool) []float32 {
+	if len(newIDs) == 0 {
+		return nil
+	}
+	floats, ok := s.prefill(b, newIDs, cancel)
+	if !ok {
+		return nil
+	}
+	s.IDs = append([]int32(nil), newIDs...)
+	return floats
+}
+
+// Generate decodes a reply for the full prompt newIDs, reusing the cached prefix
+// it shares with the previous turn.
+func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleParams) []int32 {
+	if len(newIDs) == 0 {
+		return nil
+	}
+	rng := rand.New(rand.NewSource(int64(p.Seed)))
+	sw, _ := b.(engine.Sweeper)
+	floats, ok := s.prefill(b, newIDs, p.Cancel)
+	if !ok {
+		return nil
+	}
+	offset := len(newIDs)
 	tok := sampleToken(floats, p, rng, nil)
 	if p.Stop[tok] && nGen > 0 {
 		// A turn that ends before it begins is never the right outcome: on the
@@ -180,14 +219,9 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 		}
 		tok = sampleToken(floats, p, rng, nil)
 	}
-	if sw != nil {
-		sw.Unpin(logits)
-		pinCaches(sw, s.Caches)
-		sw.Unpin(old...)
-		sw.Sweep()
-	}
 
 	var gen []int32
+	var logits engine.Tensor
 	for {
 		if p.Stop[tok] {
 			break
