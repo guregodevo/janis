@@ -102,10 +102,8 @@ type Engine struct {
 	// only when a grammar is first used (non-tool chats never pay for it).
 	tokTable     []string
 	tokTableOnce sync.Once
-	// q35 is the loaded Qwen3.5 text stack (nil for other families); its
-	// vision tower loads on the first See (engine_vision.go).
-	q35   *qwen35.Model
-	tower *qwen35.VisionTower
+	// q35 is the loaded Qwen3.5 text stack (nil for other families).
+	q35 *qwen35.Model
 
 	decideState
 }

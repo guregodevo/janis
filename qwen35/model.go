@@ -168,12 +168,3 @@ func (m *Model) NewSession() *qwen.Session {
 		NewCache: m.newCache,
 	}
 }
-
-// NewCaches builds a fresh cache set (one entry per layer).
-func (m *Model) NewCaches() []qwen.LayerCache { return m.newCaches() }
-
-// Step feeds one token at the given rope position and returns its logits
-// [1, 1, vocab] — the decode step after PrefillWithImages.
-func (m *Model) Step(b engine.Backend, tok int32, offset int, caches []qwen.LayerCache) engine.Tensor {
-	return m.forwardCachedT(b, b.FromInt32([]int32{tok}, 1), 1, offset, caches)
-}
