@@ -8,8 +8,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"memdoor/llm/mlxc"
 )
 
 // TestTranscribeLongForm compares the Go loop with a Python word cache on a
@@ -46,7 +44,7 @@ func TestTranscribeLongForm(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := mlxc.New()
+	b := newTestBackend(t)
 	defer b.Close()
 	m, err := Load(b, turboWeights(t))
 	if err != nil {

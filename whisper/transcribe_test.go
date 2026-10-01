@@ -7,8 +7,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"memdoor/llm/mlxc"
 )
 
 // Milestone 5 receipt: the long-form loop on the oracle clip gives
@@ -38,7 +36,7 @@ func TestTranscribeOracleClip(t *testing.T) {
 		t.Fatal(err)
 	}
 	samples, _ := ReadWAV16k(wav)
-	b := mlxc.New()
+	b := newTestBackend(t)
 	defer b.Close()
 	t0 := time.Now()
 	m, err := Load(b, turboWeights(t))

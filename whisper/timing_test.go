@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"memdoor/llm/mlxc"
 	"memdoor/llm/safetensors"
 )
 
@@ -72,7 +71,7 @@ func TestWordTimestampsMatchOracle(t *testing.T) {
 	all := LogMelAll(samples)
 	content := len(all) - NFrames
 	mel := ChunkMel(all, 0, content)
-	b := mlxc.New()
+	b := newTestBackend(t)
 	defer b.Close()
 	st, err := safetensors.Open(turboWeights(t))
 	if err != nil {
@@ -82,7 +81,9 @@ func TestWordTimestampsMatchOracle(t *testing.T) {
 	enc, _ := LoadEncoder(b, st, TurboEncoder)
 	dec, _ := LoadDecoder(b, st, TurboDecoder)
 	tok, _ := NewTokenizer()
-	b.PinAll()
+	if sw, ok := any(b).(interface{ PinAll() }); ok {
+		sw.PinAll()
+	}
 	audio := enc.Forward(b, mel)
 	ds := dec.NewState(b, audio)
 	defer ds.Free(b)

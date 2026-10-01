@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"memdoor/llm/mlxc"
 	"memdoor/llm/safetensors"
 )
 
@@ -48,7 +47,7 @@ func TestDecodeMatchesOracle(t *testing.T) {
 	content := len(all) - NFrames
 	mel := ChunkMel(all, 0, content)
 
-	b := mlxc.New()
+	b := newTestBackend(t)
 	defer b.Close()
 	st, err := safetensors.Open(turboWeights(t))
 	if err != nil {

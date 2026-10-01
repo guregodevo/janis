@@ -1,3 +1,5 @@
+//go:build darwin && arm64 && cgo
+
 package whisper
 
 import (
@@ -7,6 +9,10 @@ import (
 
 	"memdoor/llm/mlxc"
 )
+
+// The test below reads the MLX allocator's active/cache numbers
+// (mlxc.MemoryStatsMB); on the CPU backend there is no GPU memory to
+// account for, so it runs on Apple Silicon only.
 
 // A transcript must not leave anything behind on the GPU: the encoder
 // pinned every block's output and never released it, and Close freed

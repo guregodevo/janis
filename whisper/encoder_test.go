@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"memdoor/llm/engine"
-	"memdoor/llm/mlxc"
 	"memdoor/llm/safetensors"
 )
 
@@ -39,7 +38,7 @@ func TestEncoderMatchesOracle(t *testing.T) {
 	}
 	mel := LogMel(PadOrTrim(samples))
 
-	b := mlxc.New()
+	b := newTestBackend(t)
 	defer b.Close()
 	st, err := safetensors.Open(turboWeights(t))
 	if err != nil {
