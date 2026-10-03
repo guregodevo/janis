@@ -3,7 +3,7 @@ package whisper
 import (
 	"testing"
 
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/engine"
 )
 
 // newTestBackend returns the backend the whisper receipt tests run against:

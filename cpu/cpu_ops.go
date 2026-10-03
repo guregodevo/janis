@@ -3,7 +3,7 @@ package cpu
 import (
 	"math"
 
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/engine"
 )
 
 // MatMul is batched matrix multiply with NumPy broadcasting on the batch dims.

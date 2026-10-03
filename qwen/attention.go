@@ -3,8 +3,8 @@ package qwen
 import (
 	"math"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // Attention is a Qwen2 grouped-query attention block: quantized q/k/v/o

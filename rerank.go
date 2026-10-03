@@ -4,10 +4,10 @@ import (
 	"os"
 	"strconv"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/reranker"
-	"memdoor/llm/safetensors"
-	"memdoor/llm/tokenizer"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/reranker"
+	"github.com/guregodevo/janis/safetensors"
+	"github.com/guregodevo/janis/tokenizer"
 )
 
 // XLM-RoBERTa special token ids (shared by bge-m3 and bge-reranker).

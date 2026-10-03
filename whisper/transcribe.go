@@ -5,8 +5,8 @@ import (
 	"math"
 	"strings"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // The long-form loop of whisper's transcribe(): 30 s windows over the

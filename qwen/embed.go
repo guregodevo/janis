@@ -6,8 +6,8 @@ package qwen
 import (
 	"fmt"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // stDType maps a safetensors dtype string to an engine.DType.

@@ -3,7 +3,7 @@ package cpu
 import (
 	"math"
 
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/engine"
 )
 
 // RoPE applies rotary position embedding to the last `dims` features of x,

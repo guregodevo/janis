@@ -5,9 +5,9 @@ package llm
 import (
 	"os"
 
-	"memdoor/llm/cpu"
-	"memdoor/llm/engine"
-	"memdoor/llm/mlxc"
+	"github.com/guregodevo/janis/cpu"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/mlxc"
 )
 
 // newBackend returns the Apple-Silicon MLX backend by default. Setting

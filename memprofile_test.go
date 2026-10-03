@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"memdoor/llm/mlxc"
+	"github.com/guregodevo/janis/mlxc"
 )
 
 // TestGatewayMemoryProfile reproduces the gateway's exact MLX workload in

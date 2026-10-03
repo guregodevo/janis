@@ -38,7 +38,7 @@ import (
 	"strings"
 	"time"
 
-	"memdoor/llm"
+	"github.com/guregodevo/janis"
 )
 
 type turnStat struct {

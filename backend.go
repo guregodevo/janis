@@ -1,6 +1,6 @@
 package llm
 
-import "memdoor/llm/engine"
+import "github.com/guregodevo/janis/engine"
 
 // pinAll / sweep drive the OPTIONAL engine.Sweeper: the MLX backend needs manual
 // array lifecycle (Pin/Sweep), while the pure-Go CPU backend is GC-managed and

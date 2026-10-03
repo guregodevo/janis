@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"math"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/qwen"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/qwen"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // The audio encoder of whisper-large-v3-turbo on engine.Backend: two

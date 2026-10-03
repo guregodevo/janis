@@ -13,7 +13,7 @@ import (
 	"sync"
 	"unsafe"
 
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/engine"
 )
 
 // gatedDeltaSource is mlx-lm's gated_delta_step metal kernel (models/

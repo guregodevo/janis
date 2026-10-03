@@ -20,7 +20,7 @@ import (
 	"sync"
 	"unsafe"
 
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/engine"
 )
 
 // tensor wraps an mlx_array handle. shape is tracked Go-side; pinned protects it

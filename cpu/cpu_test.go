@@ -5,7 +5,7 @@ import (
 	"math"
 	"testing"
 
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/engine"
 )
 
 func approx(a, b float32) bool { return math.Abs(float64(a-b)) < 1e-4 }

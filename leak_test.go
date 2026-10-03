@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"memdoor/llm/mlxc"
+	"github.com/guregodevo/janis/mlxc"
 )
 
 // TestEmbedMemoryGrowth probes whether MLX's buffer-reuse cache grows unbounded

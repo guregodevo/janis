@@ -3,7 +3,7 @@ package cpu
 import (
 	"math"
 
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/engine"
 )
 
 // Floats forces evaluation (no-op here, already eager) and returns a copy.

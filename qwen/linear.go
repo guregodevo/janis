@@ -1,8 +1,8 @@
 package qwen
 
 import (
-	"memdoor/llm/engine"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // QuantLinear is an affine-quantized linear layer (QuantizedLinear): a packed

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strconv"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // Snapshot metadata keys. model_id must match exactly on restore — KV is a

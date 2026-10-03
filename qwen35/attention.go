@@ -3,9 +3,9 @@ package qwen35
 import (
 	"math"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/qwen"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/qwen"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // Attention is Qwen3.5's gated softmax attention (every

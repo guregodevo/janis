@@ -20,7 +20,7 @@ import (
 	"runtime"
 	"sync"
 
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/engine"
 )
 
 // parallelFor splits [0,n) into one contiguous chunk per CPU and runs fn on each

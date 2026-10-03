@@ -3,8 +3,8 @@
 package whisper
 
 import (
-	"memdoor/llm/cpu"
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/cpu"
+	"github.com/guregodevo/janis/engine"
 )
 
 func testBackend() engine.Backend { return cpu.New() }

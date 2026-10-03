@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // Milestone 3 receipt: the Go decoder's greedy transcript of the oracle clip

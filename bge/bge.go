@@ -10,9 +10,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/qwen"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/qwen"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // Config holds the XLM-RoBERTa dimensions.

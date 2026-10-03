@@ -13,8 +13,8 @@ import (
 	"math/rand"
 	"testing"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/mlxc"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/mlxc"
 )
 
 func rnd(n int) []float32 {

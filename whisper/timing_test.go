@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 func TestDTWDiagonal(t *testing.T) {

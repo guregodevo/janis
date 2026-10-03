@@ -12,9 +12,9 @@ package gemma
 import (
 	"math"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/qwen"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/qwen"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // loadNorm loads a Gemma RMSNorm: its stored weight is offset by +1 so the

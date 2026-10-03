@@ -3,8 +3,8 @@ package qwen
 import (
 	"fmt"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // feedForward is the per-layer FFN: a dense MLP or a sparse MoEBlock.

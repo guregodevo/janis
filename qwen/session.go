@@ -7,7 +7,7 @@ import (
 	"os"
 	"strconv"
 
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/engine"
 )
 
 // debugPrefill logs the prefix-reuse split per generation (MLX_DEBUG_PREFILL=1)

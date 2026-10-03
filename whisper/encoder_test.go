@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 func turboWeights(t *testing.T) string {

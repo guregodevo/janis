@@ -1,6 +1,6 @@
 package qwen
 
-import "memdoor/llm/engine"
+import "github.com/guregodevo/janis/engine"
 
 // LayerCache is one decoder layer's cross-step state. KV attention layers
 // cache keys/values [B, n_kv_heads, T, head_dim]; linear-attention layers

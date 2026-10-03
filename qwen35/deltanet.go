@@ -9,9 +9,9 @@ package qwen35
 import (
 	"math"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/qwen"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/qwen"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // LinearCache is a Gated DeltaNet layer's cross-step state: the causal-conv

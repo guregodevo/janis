@@ -1,8 +1,8 @@
 package qwen
 
 import (
-	"memdoor/llm/engine"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // MLP is the Qwen2 SwiGLU feed-forward: down(silu(gate(x)) * up(x)). All three

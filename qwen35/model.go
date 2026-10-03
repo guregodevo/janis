@@ -3,9 +3,9 @@ package qwen35
 import (
 	"fmt"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/qwen"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/qwen"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // prefix is the multimodal checkpoint's text-stack root; the vision tower

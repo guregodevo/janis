@@ -1,8 +1,8 @@
 package qwen
 
 import (
-	"memdoor/llm/engine"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // RMSNorm is a Qwen2 RMS normalization layer (a learned per-channel weight

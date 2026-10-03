@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/engine"
 )
 
 // Word timestamps, whisper's way (timing.py): a second decoder pass over

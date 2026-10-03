@@ -1,10 +1,10 @@
 package llm
 
 import (
-	"memdoor/llm/bge"
-	"memdoor/llm/engine"
-	"memdoor/llm/safetensors"
-	"memdoor/llm/tokenizer"
+	"github.com/guregodevo/janis/bge"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/safetensors"
+	"github.com/guregodevo/janis/tokenizer"
 )
 
 // Embedder is a loaded embedding model (bge-m3 / XLM-RoBERTa) that turns text

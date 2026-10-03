@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"memdoor/llm/cpu"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/cpu"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 type synTensor struct {

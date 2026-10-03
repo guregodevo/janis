@@ -7,8 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"memdoor/llm/engine"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/safetensors"
 )
 
 // moeReadConcurrency bounds in-flight expert-row preads per store. Apple SSDs

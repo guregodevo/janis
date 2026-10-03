@@ -11,14 +11,14 @@ import (
 	"sync"
 	"time"
 
-	"memdoor/llm/chat"
-	"memdoor/llm/engine"
-	"memdoor/llm/gemma"
-	"memdoor/llm/grammar"
-	"memdoor/llm/qwen"
-	"memdoor/llm/qwen35"
-	"memdoor/llm/safetensors"
-	"memdoor/llm/tokenizer"
+	"github.com/guregodevo/janis/chat"
+	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/gemma"
+	"github.com/guregodevo/janis/grammar"
+	"github.com/guregodevo/janis/qwen"
+	"github.com/guregodevo/janis/qwen35"
+	"github.com/guregodevo/janis/safetensors"
+	"github.com/guregodevo/janis/tokenizer"
 )
 
 // Repetition-penalty defaults for local decoding, tunable via env. 1.1 over the

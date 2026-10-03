@@ -15,11 +15,11 @@ import (
 	"strconv"
 	"strings"
 
-	"memdoor/llm/qwen"
-	"memdoor/llm/qwen35"
-	"memdoor/llm/safetensors"
+	"github.com/guregodevo/janis/qwen"
+	"github.com/guregodevo/janis/qwen35"
+	"github.com/guregodevo/janis/safetensors"
 
-	"memdoor/llm/mlxc"
+	"github.com/guregodevo/janis/mlxc"
 )
 
 func main() {

@@ -7,7 +7,7 @@ import (
 	"runtime"
 	"testing"
 
-	"memdoor/llm/mlxc"
+	"github.com/guregodevo/janis/mlxc"
 )
 
 // The test below reads the MLX allocator's active/cache numbers

@@ -3,8 +3,8 @@
 package llm
 
 import (
-	"memdoor/llm/cpu"
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/cpu"
+	"github.com/guregodevo/janis/engine"
 )
 
 // newBackend returns the portable pure-Go CPU backend (Linux, Intel Mac).

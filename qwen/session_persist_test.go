@@ -4,8 +4,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"memdoor/llm/cpu"
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/cpu"
+	"github.com/guregodevo/janis/engine"
 )
 
 // TestSessionSaveRestoreRoundtrip verifies that a session's KV prefix survives

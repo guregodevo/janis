@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/engine"
 )
 
 // slotCacheEnabled gates the decode-path expert slot cache — on by default

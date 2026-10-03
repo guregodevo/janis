@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	"memdoor/llm/engine"
+	"github.com/guregodevo/janis/engine"
 )
 
 // Greedy decoding of one 30 s chunk with whisper's logit rules: blank and

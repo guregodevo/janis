@@ -6,8 +6,8 @@ import (
 	"strings"
 	"sync"
 
-	"memdoor/llm/chat"
-	"memdoor/llm/qwen"
+	"github.com/guregodevo/janis/chat"
+	"github.com/guregodevo/janis/qwen"
 )
 
 // Decide is the engine's decision primitive: typed questions about one piece
