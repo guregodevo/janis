@@ -2,7 +2,6 @@ package llm
 
 import (
 	"os"
-	"sort"
 	"strconv"
 
 	"memdoor/llm/engine"
@@ -82,22 +81,6 @@ func (r *Reranker) Score(query, passage string) float32 {
 	s := r.scoreLocked(query, passage)
 	sweep(r.bk)
 	return s
-}
-
-// Rank scores every passage against the query and returns indices sorted best
-// first, paired with their scores.
-func (r *Reranker) Rank(query string, passages []string) (order []int, scores []float32) {
-	mlxComputeMu.Lock()
-	defer mlxComputeMu.Unlock()
-	scores = make([]float32, len(passages))
-	order = make([]int, len(passages))
-	for i, p := range passages {
-		scores[i] = r.scoreLocked(query, p)
-		order[i] = i
-		sweep(r.bk)
-	}
-	sort.SliceStable(order, func(a, b int) bool { return scores[order[a]] > scores[order[b]] })
-	return order, scores
 }
 
 // scoreLocked assembles the XLM-RoBERTa pair (<s> query </s></s> passage </s>),

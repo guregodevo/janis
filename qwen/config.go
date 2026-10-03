@@ -269,16 +269,6 @@ func LoadConfig(modelDir string) (Config, error) {
 	return cfg, nil
 }
 
-// Qwen25_3B returns the configuration for Qwen2.5-3B-Instruct (4-bit), kept for
-// the rung-validation commands that diff against the 3B oracle.
-func Qwen25_3B() Config {
-	return Config{
-		ModelType: "qwen2", Hidden: 2048, Layers: 36, NHeads: 16, NKVHeads: 2,
-		HeadDim: 128, Vocab: 151936, Intermediate: 11008, RopeBase: 1e6, RMSEps: 1e-6,
-		GroupSize: 64, Bits: 4, TieWordEmbeddings: true, AttentionBias: true,
-	}
-}
-
 // hasNestedTextConfig reports whether the model's config nests its text fields
 // under "text_config" — the multimodal layout, named in the error so the
 // reader learns why a real model from a real org refuses to load.
