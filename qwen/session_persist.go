@@ -39,7 +39,7 @@ func dtString(dt engine.DType) (string, error) {
 // K/V at native precision) as a single safetensors file. The point: a warmed
 // prefix is a deterministic function of (model, prompt bytes), and on a
 // streamed-MoE model recomputing it costs 20-60 minutes per gateway restart —
-// while loading ~2 GB from disk costs seconds (EXPERT_STREAMING.md step 0).
+// while loading ~2 GB from disk costs seconds.
 func (s *Session) Save(b engine.Backend, path, modelID string) error {
 	rr, ok := b.(engine.RawReader)
 	if !ok {

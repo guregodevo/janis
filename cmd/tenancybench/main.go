@@ -4,7 +4,7 @@
 // Why it exists: with idle pause arithmetically excluded at every price we sell
 // and the batch/CI market retracted, multi-tenancy is the only lever that makes
 // a GPU-hour cheaper than tokens for a workload that idles ~98% of the time
-// (docs/internal/CAPACITY_MODEL.md). `pool.DefaultPerMember = 40` is an M/M/1
+// . `pool.DefaultPerMember = 40` is an M/M/1
 // guess its own comment calls "the single most commercially important open
 // number". This measures it.
 //
@@ -119,7 +119,7 @@ func main() {
 		}
 		fmt.Printf("MEASURED: %d concurrent sessions hold the %.1fs p95 TTFT bar.\n", lastGood, *ttftBar)
 		fmt.Printf("At a 2%% duty cycle that is ~%d developers per rental (50%% safety).\n", lastGood*50/2)
-		fmt.Println("Compare pool.DefaultPerMember, and see docs/internal/CAPACITY_MODEL.md.")
+		fmt.Println("Compare pool.DefaultPerMember.")
 	}
 }
 

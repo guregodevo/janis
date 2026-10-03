@@ -319,7 +319,7 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 func (e *Engine) NumTokens(text string) int { return len(e.tok.Encode(text)) }
 
 // SaveMainSession snapshots the main session's materialized KV prefix to path
-// (EXPERT_STREAMING.md step 0: a warmed prefix is deterministic in (model,
+// (a warmed prefix is deterministic in (model,
 // prompt bytes) — recomputing it on a streamed-MoE model costs 20-60 min per
 // restart; loading it costs seconds). Takes the compute lock: downloading
 // cache tensors while a generation mutates them would serialize garbage.
