@@ -31,10 +31,14 @@ CGO_ENABLED=0 go build ./...
 
 `lib/` holds the HuggingFace tokenizers static library per platform
 (`lib/libtokenizers.a` on macOS, `lib/linux-<arch>/` on Linux). It is
-gitignored; `make tokenizer-lib` fetches or builds it.
+gitignored; `make tokenizer-lib` fetches or builds it. A program that imports
+janis from Go's module cache has no `lib/`: `make install-lib` copies the
+archive to `/opt/homebrew/lib` (macOS) or `/usr/local/lib` (Linux), which the
+tokenizer also searches — the same place mlx-c comes from.
 
 ## Used by
 
 [Memdoor](https://memdoor.ai), the terminal coding agent, behind
-`MEMDOOR_SHOW=local`. Memdoor imports janis as a module; to work on both at
-once, a `go.work` in the Memdoor checkout points at `../janis`.
+`MEMDOOR_SHOW=local`. Memdoor imports janis as a module (its `make janis`
+runs `install-lib`); to edit both at once, a `go.work` in the Memdoor
+checkout points at `../janis`.

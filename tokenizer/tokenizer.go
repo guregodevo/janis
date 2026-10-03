@@ -11,9 +11,12 @@
 package tokenizer
 
 /*
-#cgo darwin LDFLAGS: -L${SRCDIR}/../lib
-#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/../lib/linux-amd64
-#cgo linux,arm64 LDFLAGS: -L${SRCDIR}/../lib/linux-arm64
+// lib/ in a checkout first; then the system library dir (`make install-lib`
+// puts it there), which is what a build from Go's module cache finds — the
+// module ships without the archive, the way mlx-c comes from Homebrew.
+#cgo darwin LDFLAGS: -L${SRCDIR}/../lib -L/opt/homebrew/lib
+#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/../lib/linux-amd64 -L/usr/local/lib
+#cgo linux,arm64 LDFLAGS: -L${SRCDIR}/../lib/linux-arm64 -L/usr/local/lib
 */
 import "C"
 
