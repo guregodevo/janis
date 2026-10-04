@@ -9,7 +9,9 @@ elsewhere, and what it takes to run a model on the machine in front of you.
 - **whisper, bge, reranker** — speech-to-text, embeddings, reranking.
 - **grammar** — constrained decoding for tool calls.
 - **hostfit** — which model fits this host's RAM, and how well it will run.
-- **mlxc, cpu, safetensors, tokenizer** — the backends and the loaders.
+- **mlxc, cpu, safetensors, gguf, tokenizer** — the backends and the loaders.
+  `gguf` is a container reader only (format, not architecture): it reads the
+  GGML quantization types and leaves model-specific meaning to the caller.
 
 Weights come from `huggingface.co/mlx-community` into `~/.cache/huggingface/`.
 
