@@ -12,21 +12,21 @@ import (
 
 // slotCacheEnabled gates the decode-path expert slot cache — on by default
 // (measured 2.0 → 3.7 tok/s on a 16 GB M4 streaming Qwen3-30B-A3B), with
-// MEMDOOR_MOE_SLOT_CACHE=0 as the escape hatch back to transient stacks.
-func slotCacheEnabled() bool { return os.Getenv("MEMDOOR_MOE_SLOT_CACHE") != "0" }
+// JANIS_MOE_SLOT_CACHE=0 as the escape hatch back to transient stacks.
+func slotCacheEnabled() bool { return os.Getenv("JANIS_MOE_SLOT_CACHE") != "0" }
 
 // asyncOverlapEnabled gates the decode IO/compute overlap (hit gather
 // async-evaluated while miss reads run). Opt-in while being validated:
-// MEMDOOR_MOE_ASYNC_OVERLAP=1.
-func asyncOverlapEnabled() bool { return os.Getenv("MEMDOOR_MOE_ASYNC_OVERLAP") == "1" }
+// JANIS_MOE_ASYNC_OVERLAP=1.
+func asyncOverlapEnabled() bool { return os.Getenv("JANIS_MOE_ASYNC_OVERLAP") == "1" }
 
 // slotsPerLayer is the expert-slot count per MoE layer. 16 slots hold two
 // tokens' top-8 sets; with 40-60% token-to-token expert reuse that converts
 // most of the overlap into cache hits while pinning only
 // slots × layers × expert-size bytes (~2 GB on a 48-layer 30B-A3B).
-// MEMDOOR_MOE_SLOTS overrides for tuning.
+// JANIS_MOE_SLOTS overrides for tuning.
 func slotsPerLayer() int {
-	if n, _ := strconv.Atoi(os.Getenv("MEMDOOR_MOE_SLOTS")); n > 0 {
+	if n, _ := strconv.Atoi(os.Getenv("JANIS_MOE_SLOTS")); n > 0 {
 		return n
 	}
 	return 16

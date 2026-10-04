@@ -23,10 +23,10 @@ import (
 
 // Repetition-penalty defaults for local decoding, tunable via env. 1.1 over the
 // last 64 tokens is the llama.cpp default — mild enough not to distort code, strong
-// enough to break a runaway repeat loop. MEMDOOR_REPEAT_PENALTY=1 disables it.
+// enough to break a runaway repeat loop. JANIS_REPEAT_PENALTY=1 disables it.
 var (
-	repeatPenalty = envFloat32("MEMDOOR_REPEAT_PENALTY", 1.1)
-	repeatLastN   = envInt("MEMDOOR_REPEAT_LAST_N", 64)
+	repeatPenalty = envFloat32("JANIS_REPEAT_PENALTY", 1.1)
+	repeatLastN   = envInt("JANIS_REPEAT_LAST_N", 64)
 )
 
 func envFloat32(key string, def float32) float32 {

@@ -21,10 +21,10 @@ const (
 	defaultRerankMaxTok = 512
 )
 
-// rerankMaxTokEnv returns the pair-length cap, MEMDOOR_RERANK_MAXTOK overriding
+// rerankMaxTokEnv returns the pair-length cap, JANIS_RERANK_MAXTOK overriding
 // the 512 default. Zero or invalid falls back to the default.
 func rerankMaxTokEnv() int {
-	if v := os.Getenv("MEMDOOR_RERANK_MAXTOK"); v != "" {
+	if v := os.Getenv("JANIS_RERANK_MAXTOK"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}
@@ -53,7 +53,7 @@ func OpenReranker(modelDir string) (*Reranker, error) {
 	// model's full position budget: v2-m3 advertises 8194, but scoring 8k-token
 	// passages is ~16x slower for no precision gain — relevance is decided by the
 	// page head (title/summary/opening), and a uniform cap keeps models
-	// comparable. Override with MEMDOOR_RERANK_MAXTOK. Room kept for <s> </s></s> </s>.
+	// comparable. Override with JANIS_RERANK_MAXTOK. Room kept for <s> </s></s> </s>.
 	maxTok := cfg.MaxPos - 4
 	if cap := rerankMaxTokEnv(); cap > 0 && cap-4 < maxTok {
 		maxTok = cap - 4

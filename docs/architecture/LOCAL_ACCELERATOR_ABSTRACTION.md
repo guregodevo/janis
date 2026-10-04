@@ -43,7 +43,7 @@ Selection is build-tagged so non-Apple builds never link the MLX cgo:
 - `llm/backend_mlx.go` (`//go:build darwin && arm64`) → `mlxc.New()`
 - `llm/backend_cpu.go` (everything else) → `cpu.New()`
 - `newBackend()` is the only constructor the high-level `llm` package calls.
-- `MEMDOOR_BACKEND=cpu` forces the CPU backend on a Mac (validation + fallback).
+- `JANIS_BACKEND=cpu` forces the CPU backend on a Mac (validation + fallback).
 - `Accelerated()` reports GPU vs CPU (true on MLX, false on CPU) — used to size
   the model (below).
 

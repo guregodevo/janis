@@ -236,9 +236,9 @@ type Model struct {
 // default (2.5 GB ≈ 16 hot experts per layer on a 48-layer 30B-A3B, mirroring
 // TurboFieldfare's validated slot count) balances two consumers of the same
 // RAM: a bigger cache raises the hit rate, but starves the OS page cache that
-// makes the remaining misses cheap. MEMDOOR_MOE_CACHE_MB overrides for tuning.
+// makes the remaining misses cheap. JANIS_MOE_CACHE_MB overrides for tuning.
 func moeExpertBudget() int64 {
-	if mb, _ := strconv.Atoi(os.Getenv("MEMDOOR_MOE_CACHE_MB")); mb > 0 {
+	if mb, _ := strconv.Atoi(os.Getenv("JANIS_MOE_CACHE_MB")); mb > 0 {
 		return int64(mb) << 20
 	}
 	return 2500 << 20
@@ -344,10 +344,10 @@ func (m *Model) NewSession() *Session {
 // cache unwarmed (the hybrid path deliberately never writes it), and decode
 // after a from-scratch chunked prefill measured 0.10 tok/s vs ~3. The trade
 // only pays for generate-nothing calls (KV warmup, MaxTokens=1), so warmup
-// boots may set MEMDOOR_MOE_PREFILL_CHUNK=128 explicitly; interactive
+// boots may set JANIS_MOE_PREFILL_CHUNK=128 explicitly; interactive
 // sessions keep 1.
 func moePrefillChunk() int {
-	if n, _ := strconv.Atoi(os.Getenv("MEMDOOR_MOE_PREFILL_CHUNK")); n > 0 {
+	if n, _ := strconv.Atoi(os.Getenv("JANIS_MOE_PREFILL_CHUNK")); n > 0 {
 		return n
 	}
 	return 1

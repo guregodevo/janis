@@ -196,7 +196,7 @@ func TestEnsureCached(t *testing.T) {
 // expert evicts the least-frequently-used victim, and the slot tensors carry
 // the right rows (verified through the CPU backend's exact U32 words).
 func TestSlotStack(t *testing.T) {
-	t.Setenv("MEMDOOR_MOE_SLOTS", "3")
+	t.Setenv("JANIS_MOE_SLOTS", "3")
 	dir := t.TempDir()
 	path := filepath.Join(dir, "model.safetensors")
 	const N = 8
@@ -272,7 +272,7 @@ func TestSlotStack(t *testing.T) {
 // their slots, misses are -1, and probing mutates nothing — no insertions,
 // no evictions, no reads.
 func TestSlotHits(t *testing.T) {
-	t.Setenv("MEMDOOR_MOE_SLOTS", "4")
+	t.Setenv("JANIS_MOE_SLOTS", "4")
 	dir := t.TempDir()
 	path := filepath.Join(dir, "model.safetensors")
 	const N = 8

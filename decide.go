@@ -134,7 +134,7 @@ const decideSystem = "You are a precise classifier. You will be shown some conte
 // distributions from instruct models are overconfident (a fitted T of 3-15 on
 // public tasks for Qwen3 0.6B-4B); a per-deployment temperature is the cheap
 // fix until a calibrated head exists. 1 = raw.
-var decideTemp = envFloat32("MEMDOOR_DECIDE_TEMP", 1.0)
+var decideTemp = envFloat32("JANIS_DECIDE_TEMP", 1.0)
 
 func renderQuestion(q Question) string {
 	var b strings.Builder

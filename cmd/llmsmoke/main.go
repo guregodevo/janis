@@ -2,7 +2,7 @@
 // from the HF cache and run one chat, no subprocess/HTTP.
 //
 // Usage: llmsmoke [model-name-substring] [prompt]
-// Defaults to Qwen2.5-3B-Instruct-4bit. Set MEMDOOR_BACKEND=cpu (on a Mac) to
+// Defaults to Qwen2.5-3B-Instruct-4bit. Set JANIS_BACKEND=cpu (on a Mac) to
 // run the pure-Go CPU backend instead of MLX — running it both ways on the same
 // model at temp=0 is how we verify the CPU forward matches MLX end-to-end.
 package main
@@ -35,7 +35,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	backend := os.Getenv("MEMDOOR_BACKEND")
+	backend := os.Getenv("JANIS_BACKEND")
 	if backend == "" {
 		backend = "mlx (default)"
 	}
@@ -48,8 +48,8 @@ func main() {
 	defer eng.Close()
 	fmt.Println("loaded:", eng.ModelType())
 
-	// MEMDOOR_CPUPROFILE=path writes a CPU profile around the generation.
-	if p := os.Getenv("MEMDOOR_CPUPROFILE"); p != "" {
+	// JANIS_CPUPROFILE=path writes a CPU profile around the generation.
+	if p := os.Getenv("JANIS_CPUPROFILE"); p != "" {
 		f, ferr := os.Create(p)
 		if ferr != nil {
 			panic(ferr)
@@ -59,7 +59,7 @@ func main() {
 	}
 
 	maxTok := 32
-	if v := os.Getenv("MEMDOOR_MAXTOK"); v != "" {
+	if v := os.Getenv("JANIS_MAXTOK"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			maxTok = n
 		}
