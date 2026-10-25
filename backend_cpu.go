@@ -3,12 +3,19 @@
 package llm
 
 import (
+	"os"
+
 	"github.com/guregodevo/janis/cpu"
 	"github.com/guregodevo/janis/engine"
 )
 
 // newBackend returns the portable pure-Go CPU backend (Linux, Intel Mac).
-func newBackend() engine.Backend { return cpu.New() }
+func newBackend() engine.Backend {
+	if os.Getenv("JANIS_BACKEND") == "ggml" && ggmlBackend != nil {
+		return ggmlBackend()
+	}
+	return cpu.New()
+}
 
 // Accelerated reports whether the active backend is GPU-accelerated. Always
 // false here — the CPU backend runs on the cores. Callers use this to size the

@@ -16,8 +16,13 @@ import (
 // other value (or unset) keeps MLX. mlxc is imported only here, so non-darwin
 // builds never pull in its cgo.
 func newBackend() engine.Backend {
-	if os.Getenv("JANIS_BACKEND") == "cpu" {
+	switch os.Getenv("JANIS_BACKEND") {
+	case "cpu":
 		return cpu.New()
+	case "ggml":
+		if ggmlBackend != nil {
+			return ggmlBackend()
+		}
 	}
 	return mlxc.New()
 }
@@ -31,8 +36,13 @@ func Accelerated() bool { return os.Getenv("JANIS_BACKEND") != "cpu" }
 // EngineInfo describes the auto-detected inference path for this host (for
 // `llm status`).
 func EngineInfo() string {
-	if os.Getenv("JANIS_BACKEND") == "cpu" {
+	switch os.Getenv("JANIS_BACKEND") {
+	case "cpu":
 		return "CPU backend (forced), SIMD: " + cpu.SIMDInfo()
+	case "ggml":
+		if ggmlBackend != nil {
+			return "ggml backend (forced): " + ggmlBackend().Version()
+		}
 	}
 	return "MLX backend (Metal GPU)"
 }
