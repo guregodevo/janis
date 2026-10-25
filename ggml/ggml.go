@@ -392,6 +392,13 @@ func (b *Backend) flushLocked() {
 			}
 			if bad > 0 {
 				fmt.Fprintf(os.Stderr, "ggml check: %d of %d values NaN/Inf in a result of %s %v\n", bad, n, p.where, p.shape)
+				var at []int
+				for i, v := range vals {
+					if (math.IsNaN(float64(v)) || math.IsInf(float64(v), 0)) && len(at) < 12 {
+						at = append(at, i)
+					}
+				}
+				fmt.Fprintf(os.Stderr, "ggml check:   first bad indices %v (node type %d, op %d, contiguous %v)\n", at, int(p.t._type), int(p.t.op), bool(C.ggml_is_contiguous(p.t)))
 				for _, d := range p.deps {
 					if d != nil && d.dt == engine.F32 && d.t != nil && d.t.data != nil {
 						dv := make([]float32, numel(d.shape))
@@ -407,7 +414,13 @@ func (b *Backend) flushLocked() {
 								maxAbs = math.Abs(f)
 							}
 						}
-						fmt.Fprintf(os.Stderr, "ggml check:   input %v: %d NaN/Inf, max |v| %.4g\n", d.shape, dbad, maxAbs)
+						var atv []float32
+						for _, i := range at {
+							if i < len(dv) {
+								atv = append(atv, dv[i])
+							}
+						}
+						fmt.Fprintf(os.Stderr, "ggml check:   input %v: %d NaN/Inf, max |v| %.4g, values at the bad indices %v\n", d.shape, dbad, maxAbs, atv)
 					}
 				}
 				os.Exit(3)
