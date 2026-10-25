@@ -161,10 +161,10 @@ type tensor struct {
 	deps  []*tensor               // the inputs a recorded node reads, held until it is computed
 	shape []int
 	dt    engine.DType
-	where string  // the op's call site, kept when tracing or checking
+	where string     // the op's call site, kept when tracing or checking
 	quant *quantCall // set on a QuantMatmul result: what a dump needs to replay it
-	q4    *tensor // the Q4_1 repack of a packed weight, built once
-	pin   bool    // survives Sweep
+	q4    *tensor    // the Q4_1 repack of a packed weight, built once
+	pin   bool       // survives Sweep
 	freed bool
 	// gathered: rows of this packed weight were taken (the embedding), so
 	// its words stay after the repack; a weight only ever multiplied keeps
