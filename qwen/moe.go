@@ -3,6 +3,7 @@ package qwen
 import (
 	"container/list"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +35,14 @@ type exEntry struct {
 // StackedRow + FromRaw instead of loading all 16.8 GB (which OOMs). The cache is
 // keyed per (layer, projection, expert) so a hot expert is materialized once.
 type ExpertStore struct {
+	// resident: every expert of a layer is stacked once and kept on the
+	// device (JANIS_MOE_RESIDENT=1, a GPU with room for the whole model);
+	// the gather then indexes the full stack by global expert id. No
+	// streaming, no slot cache, no per-token uploads: llama.cpp's and
+	// mlx-lm's shape of MoE on a big device.
+	resident     bool
+	fullMu       sync.Mutex
+	full         map[int][3]StackedProj // per layer
 	b            engine.Backend
 	sw           engine.Sweeper // non-nil on MLX: cached experts must be pinned
 	st           *safetensors.File
@@ -57,7 +66,9 @@ type ExpertStore struct {
 func NewExpertStore(b engine.Backend, st *safetensors.File, groupSize, bits int, budgetBytes int64) *ExpertStore {
 	sw, _ := b.(engine.Sweeper)
 	return &ExpertStore{
-		b: b, sw: sw, st: st, groupSize: groupSize, bits: bits, budget: budgetBytes,
+		resident: os.Getenv("JANIS_MOE_RESIDENT") == "1",
+		full:     map[int][3]StackedProj{},
+		b:        b, sw: sw, st: st, groupSize: groupSize, bits: bits, budget: budgetBytes,
 		cache: map[exKey]*list.Element{}, lru: list.New(),
 		readSem: make(chan struct{}, moeReadConcurrency),
 	}
@@ -190,6 +201,33 @@ func (s *ExpertStore) StackRaw(layer int, proj string, experts []int) (w, sc, bi
 		return nil, nil, nil, err
 	}
 	return ps[0].W, ps[0].S, ps[0].B, nil
+}
+
+// FullStacks is the layer's every expert, stacked once per projection
+// (gate, up, down) and pinned; built on first use from one concurrent read
+// of all the experts' rows.
+func (s *ExpertStore) FullStacks(layer, numExperts int) ([3]StackedProj, error) {
+	s.fullMu.Lock()
+	defer s.fullMu.Unlock()
+	if ps, ok := s.full[layer]; ok {
+		return ps, nil
+	}
+	all := make([]int, numExperts)
+	for i := range all {
+		all[i] = i
+	}
+	pss, err := s.StackProjs(layer, all, "gate_proj", "up_proj", "down_proj")
+	if err != nil {
+		return [3]StackedProj{}, err
+	}
+	ps := [3]StackedProj{pss[0], pss[1], pss[2]}
+	if sw, ok := s.b.(engine.Sweeper); ok {
+		for _, p := range ps {
+			sw.Pin(p.W, p.S, p.B)
+		}
+	}
+	s.full[layer] = ps
+	return ps, nil
 }
 
 // StackedProj is one projection's stacked weight/scales/biases tensors.
@@ -472,6 +510,19 @@ func (m *MoEBlock) Forward(b engine.Backend, x engine.Tensor) engine.Tensor {
 		return b.ScalarMul(b.Mean(b.Mul(d2, scT), nd-1), float32(K)), []engine.Tensor{g, u, hh, d}
 	}
 
+	// Resident experts: the full stack, indexed by global expert id.
+	if m.Store.resident {
+		ps, err := m.Store.FullStacks(m.Layer, m.NumExperts)
+		if err != nil {
+			panic(err)
+		}
+		global := make([]int32, len(ri))
+		for j, p := range ri {
+			global[j] = int32(uniq[p])
+		}
+		out, _ := moeApply(ps, global, scores)
+		return out
+	}
 	// Decode (nTok==1): the persistent slot cache. Hits skip both the disk
 	// read and the host-to-device upload; misses land via ONE batched
 	// ScatterRows per tensor, keeping the op count flat. (A per-expert cache

@@ -234,8 +234,20 @@ func numel(shape []int) int {
 	return n
 }
 
+// ne is ggml's dimension list for a janis shape: the same list reversed
+// (ne0 innermost). ggml has four dimensions; a janis shape with more (the
+// MoE gather's [lead…, K, 1, out]) folds its leading dims into ne3, which
+// is right for every elementwise op and reshape, the only ops such tensors
+// meet.
 func ne(shape []int) [4]C.int64_t {
 	out := [4]C.int64_t{1, 1, 1, 1}
+	if len(shape) > 4 {
+		lead := 1
+		for _, d := range shape[:len(shape)-3] {
+			lead *= d
+		}
+		shape = append([]int{lead}, shape[len(shape)-3:]...)
+	}
 	for i, d := range shape {
 		out[len(shape)-1-i] = C.int64_t(d)
 	}
@@ -259,9 +271,6 @@ const ctxMem = 64 * 1024 // tensors and graph metadata, no data (no_alloc)
 
 // newFrom allocates a tensor of dt/shape in its own buffer and fills it.
 func (b *Backend) newFrom(dt engine.DType, shape []int, raw unsafe.Pointer, size int) *tensor {
-	if len(shape) > 4 {
-		panic(fmt.Sprintf("ggml: %d-d tensors are not supported", len(shape)))
-	}
 	ctx := C.janis_ctx(ctxMem)
 	n := ne(shape)
 	t := C.janis_new(ctx, ggmlType(dt), n[0], n[1], n[2], n[3])
@@ -1101,9 +1110,30 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 	})
 }
 
-// GatherQuantMatmul (MoE) is not in the spike: one QuantMatmul per expert.
+// GatherQuantMatmul is the MoE expert matmul on ggml_mul_mat_id: w, scales
+// and biases are the stack [E, out, in] (repacked once to Q4_1, ne =
+// (in, out, E)), x is [lead…, A, 1, in] with A one vector shared by the K
+// slots or one per slot, rhsIndices [lead…, K] the expert per slot; the
+// result is [lead…, K, 1, out], as the CPU and MLX backends give it.
 func (b *Backend) GatherQuantMatmul(x, w, scales, biases, rhsIndices engine.Tensor, transpose bool, groupSize, bits int) engine.Tensor {
-	panic("ggml: GatherQuantMatmul (MoE experts) is not implemented in the spike")
+	if !transpose {
+		panic("ggml: GatherQuantMatmul without transpose is not used by the models")
+	}
+	tx, ti := as(x), as(rhsIndices)
+	q := b.q4_1(as(w), as(scales), as(biases), groupSize, bits)
+	xs, rs := tx.shape, ti.shape
+	in, A := xs[len(xs)-1], xs[len(xs)-3]
+	K := rs[len(rs)-1]
+	nTok := numel(rs) / K
+	out := q.shape[1]
+	shape := append(append([]int(nil), rs...), 1, out)
+	return b.op(engine.F32, shape, []*tensor{tx, ti, q, as(w)}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		xb := C.ggml_reshape_3d(ctx, f32(ctx, tx), C.int64_t(in), C.int64_t(A), C.int64_t(nTok))
+		ids := C.ggml_reshape_2d(ctx, ti.t, C.int64_t(K), C.int64_t(nTok))
+		r := C.ggml_mul_mat_id(ctx, q.t, xb, ids) // ne (out, K, nTok)
+		m := ne(shape)
+		return C.ggml_cont(ctx, C.ggml_reshape_4d(ctx, r, m[0], m[1], m[2], m[3]))
+	})
 }
 
 // Conv1dDepthwise and GatedDeltaScan belong to the Qwen3.5 hybrid; not in
