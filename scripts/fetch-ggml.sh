@@ -21,8 +21,12 @@ if [ "${1:-}" = "--cuda" ]; then
 	tmp=$(mktemp -d)
 	curl -fsSL "https://github.com/ggml-org/llama.cpp/archive/refs/tags/$TAG.tar.gz" | tar -xz -C "$tmp"
 	src=$(echo "$tmp"/llama.cpp-*)
-	cmake -S "$src/ggml" -B "$tmp/build" -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release >/dev/null
-	cmake --build "$tmp/build" --config Release -j"$(nproc)" 2>&1 | tail -3
+	# ggml's own CMake does not configure standalone inside the llama.cpp
+	# tree (no ggml.pc.in there); the root configures with everything but
+	# ggml switched off, and only the ggml targets are built.
+	cmake -S "$src" -B "$tmp/build" -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release \
+		-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF >/dev/null
+	cmake --build "$tmp/build" --config Release -j"$(nproc)" --target ggml ggml-base ggml-cpu ggml-cuda 2>&1 | tail -3
 	find "$tmp/build" -name 'libggml*.so*' -exec cp -a {} "$DEST/lib/" \;
 	cp "$src"/ggml/include/*.h "$DEST/include/"
 	rm -rf "$tmp"
