@@ -80,3 +80,50 @@ func TestEightBitWeightsMatchCPU(t *testing.T) {
 		g.Floats(g.QuantMatmul(g.FromFloats(x, 1, 3, in), gW, gS, gB, true, gs, bits)),
 		c.Floats(c.QuantMatmul(c.FromFloats(x, 1, 3, in), cW, cS, cB, true, gs, bits)))
 }
+
+// The MoE block as moeApply runs it, at the 30B's widths: gate and up
+// gathers on one token, SiLU, the product, the down gather, the weighted
+// mean. Against the CPU backend, so a device's kernels are tested too.
+func TestMoEBlockMatchesCPU(t *testing.T) {
+	g := New()
+	defer g.Close()
+	c := cpu.New()
+	t.Log(g.Version())
+	const E, hidden, inter, gs, bits, K = 16, 2048, 768, 64, 4, 8
+	mk := func(rows, in int, seed int64) (engine.Tensor, engine.Tensor, engine.Tensor, engine.Tensor, engine.Tensor, engine.Tensor) {
+		P, G := in*bits/32, in/gs
+		raw := rndPackedU32(E*rows*P, seed)
+		sc, bi := rnd(E*rows*G, seed+1), rnd(E*rows*G, seed+2)
+		return g.FromRaw(engine.U32, raw, E, rows, P), g.FromFloats(sc, E, rows, G), g.FromFloats(bi, E, rows, G),
+			c.FromRaw(engine.U32, raw, E, rows, P), c.FromFloats(sc, E, rows, G), c.FromFloats(bi, E, rows, G)
+	}
+	gGW, gGS, gGB, cGW, cGS, cGB := mk(inter, hidden, 51) // gate: hidden -> inter
+	gUW, gUS, gUB, cUW, cUS, cUB := mk(inter, hidden, 61) // up
+	gDW, gDS, gDB, cDW, cDS, cDB := mk(hidden, inter, 71) // down: inter -> hidden
+	ids := []int32{3, 0, 15, 7, 9, 1, 12, 5}
+	scores := []float32{0.3, 0.2, 0.15, 0.1, 0.1, 0.05, 0.05, 0.05}
+	x := rnd(hidden, 81)
+	run := func(b engine.Backend, w, s, bb, uw, us, ub, dw, ds, db engine.Tensor) []float32 {
+		xe := b.FromFloats(x, 1, 1, 1, 1, hidden)
+		ri := b.FromInt32(ids, 1, 1, K)
+		gt := b.GatherQuantMatmul(xe, w, s, bb, ri, true, gs, bits)
+		ut := b.GatherQuantMatmul(xe, uw, us, ub, ri, true, gs, bits)
+		hh := b.Mul(b.SiLU(gt), ut)
+		d := b.GatherQuantMatmul(hh, dw, ds, db, ri, true, gs, bits)
+		d2 := b.Reshape(d, 1, 1, K, hidden)
+		sc := b.FromFloats(scores, 1, 1, K, 1)
+		return b.Floats(b.ScalarMul(b.Mean(b.Mul(d2, sc), 2), float32(K)))
+	}
+	got := run(g, gGW, gGS, gGB, gUW, gUS, gUB, gDW, gDS, gDB)
+	want := run(c, cGW, cGS, cGB, cUW, cUS, cUB, cDW, cDS, cDB)
+	bad := 0
+	for _, v := range got {
+		if v != v || v > 1e30 || v < -1e30 {
+			bad++
+		}
+	}
+	if bad > 0 {
+		t.Fatalf("%d of %d NaN/Inf in the MoE block output on %s", bad, len(got), g.Version())
+	}
+	relOK(t, "MoE block (gate, up, SiLU, product, down, weighted mean)", 3e-2, got, want)
+}
