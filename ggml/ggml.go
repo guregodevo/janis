@@ -392,6 +392,24 @@ func (b *Backend) flushLocked() {
 			}
 			if bad > 0 {
 				fmt.Fprintf(os.Stderr, "ggml check: %d of %d values NaN/Inf in a result of %s %v\n", bad, n, p.where, p.shape)
+				for _, d := range p.deps {
+					if d != nil && d.dt == engine.F32 && d.t != nil && d.t.data != nil {
+						dv := make([]float32, numel(d.shape))
+						if len(dv) > 0 {
+							C.ggml_backend_tensor_get(d.t, unsafe.Pointer(&dv[0]), 0, C.size_t(len(dv)*4))
+						}
+						maxAbs, dbad := 0.0, 0
+						for _, v := range dv {
+							f := float64(v)
+							if math.IsNaN(f) || math.IsInf(f, 0) {
+								dbad++
+							} else if math.Abs(f) > maxAbs {
+								maxAbs = math.Abs(f)
+							}
+						}
+						fmt.Fprintf(os.Stderr, "ggml check:   input %v: %d NaN/Inf, max |v| %.4g\n", d.shape, dbad, maxAbs)
+					}
+				}
 				os.Exit(3)
 			}
 		}
@@ -1192,9 +1210,23 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 	nx := len(tx.shape)
 	shape := append(append([]int(nil), tx.shape[:nx-1]...), q.shape[0])
 	return b.op(engine.F32, shape, []*tensor{tx, q, as(w)}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-		return C.ggml_mul_mat(ctx, q.t, f32(ctx, tx)) // ne (out, M, …)
+		x := f32(ctx, tx)
+		if q.t._type == C.GGML_TYPE_Q4_1 {
+			x = C.ggml_scale(ctx, x, 1/q8Headroom) // ne (out, M, …)
+			return C.ggml_scale(ctx, C.ggml_mul_mat(ctx, q.t, x), q8Headroom)
+		}
+		return C.ggml_mul_mat(ctx, q.t, x)
 	})
 }
+
+// q8Headroom scales the activations down before a Q4_1 matmul and the
+// result back up. ggml's Q4_1 kernels quantize the activations to q8_1
+// blocks whose scale and block sum are f16; a block with a value past about
+// 2,000 overflows the sum to infinity and the output to NaN, and Qwen3's
+// attention outputs have such channels (the 30B MoE answered NaN logits on
+// the L4; argmax hid it, sampling did not). A power of two keeps the
+// scaling exact and the 8-bit quantization relative, so nothing else moves.
+const q8Headroom = 128
 
 // GatherQuantMatmul is the MoE expert matmul on ggml_mul_mat_id: w, scales
 // and biases are the stack [E, out, in] (repacked once to Q4_1, ne =
@@ -1214,9 +1246,16 @@ func (b *Backend) GatherQuantMatmul(x, w, scales, biases, rhsIndices engine.Tens
 	out := q.shape[1]
 	shape := append(append([]int(nil), rs...), 1, out)
 	return b.op(engine.F32, shape, []*tensor{tx, ti, q, as(w)}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-		xb := C.ggml_reshape_3d(ctx, f32(ctx, tx), C.int64_t(in), C.int64_t(A), C.int64_t(nTok))
+		x := f32(ctx, tx)
+		if q.t._type == C.GGML_TYPE_Q4_1 {
+			x = C.ggml_scale(ctx, x, 1/q8Headroom)
+		}
+		xb := C.ggml_reshape_3d(ctx, C.ggml_cont(ctx, x), C.int64_t(in), C.int64_t(A), C.int64_t(nTok))
 		ids := C.ggml_reshape_2d(ctx, ti.t, C.int64_t(K), C.int64_t(nTok))
 		r := C.ggml_mul_mat_id(ctx, q.t, xb, ids) // ne (out, K, nTok)
+		if q.t._type == C.GGML_TYPE_Q4_1 {
+			r = C.ggml_scale(ctx, r, q8Headroom)
+		}
 		m := ne(shape)
 		return C.ggml_cont(ctx, C.ggml_reshape_4d(ctx, r, m[0], m[1], m[2], m[3]))
 	})
