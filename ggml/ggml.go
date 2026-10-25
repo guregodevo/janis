@@ -76,6 +76,7 @@ type Backend struct {
 	// tracked is every tensor made since Open, weakly: Sweep frees the ones
 	// that are alive and not pinned; a collected one needs nothing.
 	tracked map[weak.Pointer[tensor]]struct{}
+	flushes int
 	// Small constants every layer re-asks for: the RoPE positions of a step
 	// and the causal mask of a shape. Uploaded once, pinned.
 	positions map[[2]int]*tensor
@@ -221,6 +222,11 @@ type batch struct {
 	cap  int // capacity along the token axis
 }
 
+// memMu guards the refcounts and arena state that finalizers touch from
+// their own goroutine while the engine records and flushes.
+var memMu sync.Mutex
+
+// release drops one reference; called with memMu held.
 func (g *batch) release() {
 	g.refs--
 	if g.refs > 0 {
@@ -244,6 +250,8 @@ func (t *tensor) Shape() []int { return append([]int(nil), t.shape...) }
 // free releases what the tensor holds; a recorded, never computed node has
 // nothing of its own yet and is left to its flush. Idempotent.
 func (t *tensor) free() {
+	memMu.Lock()
+	defer memMu.Unlock()
 	if t.freed || t.grp == nil && t.ctx == nil && t.buf == nil && t.q4 == nil {
 		return
 	}
@@ -264,8 +272,11 @@ func (t *tensor) free() {
 		t.ctx = nil
 	}
 	if t.q4 != nil {
-		t.q4.free()
+		q := t.q4
 		t.q4 = nil
+		memMu.Unlock()
+		q.free()
+		memMu.Lock()
 	}
 	t.deps = nil
 }
@@ -331,7 +342,16 @@ func (b *Backend) newFrom(dt engine.DType, shape []int, raw unsafe.Pointer, size
 
 // track registers a tensor for Sweep (weakly) and for the collector.
 func (b *Backend) track(t *tensor) {
-	runtime.SetFinalizer(t, func(x *tensor) { x.free() })
+	if freeLog && t.where == "" {
+		_, file, line, _ := runtime.Caller(2)
+		t.where = fmt.Sprintf("%s:%d", file[strings.LastIndex(file, "/")+1:], line)
+	}
+	runtime.SetFinalizer(t, func(x *tensor) {
+		if freeLog && !x.freed {
+			fmt.Fprintf(os.Stderr, "ggml finalizer: %v %s cache=%v grp=%v\n", x.shape, x.where, x.cacheLen, x.grp != nil)
+		}
+		x.free()
+	})
 	b.mu.Lock()
 	b.tracked[weak.Make(t)] = struct{}{}
 	b.mu.Unlock()
@@ -500,6 +520,20 @@ func (b *Backend) flushLocked() {
 	if in != nil {
 		in.busy = grp
 	}
+	// Results nobody holds any more are freed by their finalizers, and
+	// their batches with them; the collector runs on heap pressure, which
+	// a few thousand small Go objects never give it, so it is asked every
+	// few flushes: without this a step's every intermediate stayed on the
+	// device until the engine's sweep (1.4 GB on the 30B MoE at a 6k-token
+	// prompt, in allocations that fragmented the L4's heap).
+	b.flushes++
+	if gcEvery > 0 && b.flushes%gcEvery == 0 {
+		if gcSync {
+			runtime.GC()
+		} else {
+			go runtime.GC()
+		}
+	}
 	for _, p := range pending {
 		p.t.op = C.GGML_OP_NONE
 		for i := range p.t.src {
@@ -529,12 +563,15 @@ func (b *Backend) placeInArena(ctx *C.struct_ggml_context) *arena {
 		need += (sz + align - 1) / align * align
 	}
 	var a *arena
+	memMu.Lock()
 	for _, cand := range b.arenas {
 		if cand.busy == nil && need <= cand.size {
 			a = cand
+			a.busy = &batch{} // claimed until the flush sets its batch
 			break
 		}
 	}
+	memMu.Unlock()
 	if a == nil {
 		return nil
 	}
@@ -563,6 +600,9 @@ func (b *Backend) placeInArena(ctx *C.struct_ggml_context) *arena {
 			for _, p := range placed { // undo, and let the batch take a buffer of its own
 				p.data, p.buffer = nil, nil
 			}
+			memMu.Lock()
+			a.busy = nil
+			memMu.Unlock()
 			return nil
 		}
 		placed = append(placed, t)
@@ -695,7 +735,10 @@ func (b *Backend) own(x *tensor) {
 		return // no room for the copy: it stays in its batch
 	}
 	C.ggml_backend_tensor_copy(x.t, t)
+	runtime.KeepAlive(x)
+	memMu.Lock()
 	x.grp.release()
+	memMu.Unlock()
 	x.grp, x.t, x.ctx, x.buf = nil, t, ctx, buf
 }
 
@@ -744,7 +787,11 @@ func (b *Backend) Floats(t engine.Tensor) []float32 {
 		c := b.op(engine.F32, x.shape, []*tensor{x}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor { return f32(ctx, x) })
 		b.flush()
 		C.ggml_backend_tensor_get(c.t, unsafe.Pointer(&out[0]), 0, C.size_t(n*4))
+		runtime.KeepAlive(c)
 	}
+	// The Go tensor is dead once its C pointer is read; without this its
+	// finalizer may free the buffer while the copy-out still reads it.
+	runtime.KeepAlive(x)
 	return out
 }
 
@@ -758,6 +805,7 @@ func (b *Backend) Ints(t engine.Tensor) []int32 {
 	}
 	if x.dt == engine.I32 || x.dt == engine.U32 {
 		C.ggml_backend_tensor_get(x.t, unsafe.Pointer(&out[0]), 0, C.size_t(n*4))
+		runtime.KeepAlive(x)
 		return out
 	}
 	for i, v := range b.Floats(t) {
@@ -776,6 +824,7 @@ func (b *Backend) Bytes(t engine.Tensor) []byte {
 	if n > 0 {
 		C.ggml_backend_tensor_get(x.t, unsafe.Pointer(&out[0]), 0, C.size_t(n))
 	}
+	runtime.KeepAlive(x)
 	return out
 }
 
@@ -1015,7 +1064,9 @@ func (b *Backend) appendCache(ta, tb *tensor, axis int) engine.Tensor {
 	}
 	b.writeCache(grp, tb, n)
 	out := &tensor{shape: shape, dt: engine.F16, grp: grp, cacheLen: need}
+	memMu.Lock()
 	grp.refs++
+	memMu.Unlock()
 	out.t = b.cacheView(grp, shape)
 	b.mu.Unlock()
 	b.track(out)
@@ -1025,6 +1076,20 @@ func (b *Backend) appendCache(ta, tb *tensor, axis int) engine.Tensor {
 
 // cacheGrow is the spare room a cache buffer is made with, in tokens.
 const cacheGrow = 256
+
+// gcEvery is how many flushes pass between collections (see flushLocked);
+// JANIS_GGML_GC overrides (0 turns it off), JANIS_GGML_GCSYNC=1 collects
+// on the flushing goroutine itself. Both for measuring.
+var (
+	gcEvery = func() int {
+		if v, err := strconv.Atoi(os.Getenv("JANIS_GGML_GC")); err == nil && v >= 0 {
+			return v
+		}
+		return 4
+	}()
+	gcSync  = os.Getenv("JANIS_GGML_GCSYNC") == "1"
+	freeLog = os.Getenv("JANIS_GGML_FREELOG") == "1"
+)
 
 // cacheView is a view of the first shape[axis] tokens of a cache buffer.
 func (b *Backend) cacheView(grp *batch, shape []int) *C.struct_ggml_tensor {
