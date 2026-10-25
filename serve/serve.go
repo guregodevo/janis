@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,7 @@ import (
 type Generator interface {
 	ModelType() string
 	ChatStream(msgs []llm.Message, opts llm.Options, onDelta func(string)) string
+	Decide(state string, qs []llm.Question) ([]llm.Decision, error)
 	NumTokens(text string) int
 	Close()
 }
@@ -77,6 +79,7 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
+	mux.HandleFunc("POST /v1/systemone", s.handleDecide)
 	return mux
 }
 
@@ -516,6 +519,171 @@ func parseCalls(reply string) (string, []toolCall) {
 	text := callBlock.ReplaceAllString(reply, "")
 	text = thinkBlock.ReplaceAllString(text, "")
 	return strings.TrimSpace(text), calls
+}
+
+// ---- decisions: the System One wire, on the engine's Decide ----
+//
+// POST /v1/systemone takes the request a Jev / TypeSafe client sends — one
+// state and typed questions about it (noul: P(yes); choice: one of
+// labelled options; score: a level on an ordered rubric) — and answers each
+// from one prefill of the loaded model, the probability read off the
+// next-token distribution over the option letters. Memdoor's decision
+// model runs here, on this machine, with no key.
+
+type wireQuestion struct {
+	Type         string          `json:"type"`
+	Instructions string          `json:"instructions"`
+	Criteria     json.RawMessage `json:"criteria,omitempty"`
+}
+
+type wireRequest struct {
+	Model     string                  `json:"model"`
+	State     string                  `json:"state"`
+	Questions map[string]wireQuestion `json:"questions"`
+}
+
+type wireAnswer struct {
+	Type          string             `json:"type"`
+	Noul          *float64           `json:"noul,omitempty"`
+	Choice        string             `json:"choice,omitempty"`
+	Score         *float64           `json:"score,omitempty"`
+	Probabilities map[string]float64 `json:"probabilities,omitempty"`
+	Confidence    float64            `json:"confidence"`
+}
+
+func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
+	var req wireRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "a JSON body: "+err.Error())
+		return
+	}
+	if len(req.Questions) == 0 {
+		writeError(w, http.StatusBadRequest, "questions is empty")
+		return
+	}
+	ids := make([]string, 0, len(req.Questions))
+	for id := range req.Questions {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	qs := make([]llm.Question, 0, len(ids))
+	for _, id := range ids {
+		q, err := toQuestion(req.Questions[id])
+		if err != nil {
+			writeError(w, http.StatusUnprocessableEntity, id+": "+err.Error())
+			return
+		}
+		qs = append(qs, q)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// A decision client names its own model (jev-latest): the loaded model
+	// answers unless the name is one installed here.
+	model := req.Model
+	if !installed(model) {
+		model = ""
+	}
+	if err := s.ensure(model); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	ds, err := s.current.Decide(req.State, qs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	answers := make(map[string]wireAnswer, len(ids))
+	for i, id := range ids {
+		answers[id] = toAnswer(req.Questions[id].Type, qs[i], ds[i])
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"model": s.name, "answers": answers})
+}
+
+func installed(name string) bool {
+	if name == "" {
+		return false
+	}
+	list, _ := installedModels()
+	for _, m := range list {
+		if m.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// toQuestion maps a wire question onto the engine's: a noul becomes a
+// yes/no with the criteria spelled out, a score a rubric whose levels are
+// numbered from zero (the client's "zero-based position"), a choice its
+// labels in a fixed order with each description in the text.
+func toQuestion(wq wireQuestion) (llm.Question, error) {
+	text := strings.TrimSpace(wq.Instructions)
+	switch wq.Type {
+	case "noul", "boolean", "yesno":
+		var crit map[string]string
+		if len(wq.Criteria) > 0 && json.Unmarshal(wq.Criteria, &crit) == nil {
+			if t := strings.TrimSpace(crit["true"]); t != "" {
+				text += "\nYes means: " + t
+			}
+			if f := strings.TrimSpace(crit["false"]); f != "" {
+				text += "\nNo means: " + f
+			}
+		}
+		return llm.NewYesNo(text)
+	case "score":
+		var levels []string
+		if err := json.Unmarshal(wq.Criteria, &levels); err != nil {
+			return llm.Question{}, fmt.Errorf("a score question needs its levels, low to high")
+		}
+		values := make([]float64, len(levels))
+		for i := range values {
+			values[i] = float64(i)
+		}
+		return llm.NewScore(text, levels, values)
+	case "choice", "":
+		var crit map[string]string
+		if err := json.Unmarshal(wq.Criteria, &crit); err != nil || len(crit) == 0 {
+			var labels []string
+			if json.Unmarshal(wq.Criteria, &labels) != nil || len(labels) == 0 {
+				return llm.Question{}, fmt.Errorf("a choice question needs its options")
+			}
+			return llm.NewChoice(text, labels)
+		}
+		labels := make([]string, 0, len(crit))
+		for l := range crit {
+			labels = append(labels, l)
+		}
+		sort.Strings(labels)
+		for _, l := range labels {
+			if d := strings.TrimSpace(crit[l]); d != "" && d != l {
+				text += "\n" + l + ": " + d
+			}
+		}
+		return llm.NewChoice(text, labels)
+	}
+	return llm.Question{}, fmt.Errorf("unknown question type %q (noul, choice, score)", wq.Type)
+}
+
+func toAnswer(wireType string, q llm.Question, d llm.Decision) wireAnswer {
+	a := wireAnswer{Type: wireType, Confidence: d.Confidence, Probabilities: map[string]float64{}}
+	switch q.Kind {
+	case llm.KindYesNo:
+		p := d.Probs[0]
+		a.Noul = &p
+		a.Probabilities = nil
+	case llm.KindScore:
+		e := d.Expected
+		a.Score = &e
+		for i, p := range d.Probs {
+			a.Probabilities[fmt.Sprint(i)] = p
+		}
+	default:
+		a.Choice = d.Answer()
+		for i, p := range d.Probs {
+			a.Probabilities[d.Options[i]] = p
+		}
+	}
+	return a
 }
 
 // ---- plumbing ----

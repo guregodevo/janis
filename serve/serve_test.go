@@ -15,9 +15,11 @@ import (
 
 // fakeEngine answers with a script and records the rendered prompt.
 type fakeEngine struct {
-	reply string
-	got   []llm.Message
-	opts  llm.Options
+	reply     string
+	got       []llm.Message
+	opts      llm.Options
+	state     string
+	questions []llm.Question
 }
 
 func (f *fakeEngine) ModelType() string { return "qwen3" }
@@ -32,7 +34,29 @@ func (f *fakeEngine) ChatStream(msgs []llm.Message, opts llm.Options, onDelta fu
 	return f.reply
 }
 func (f *fakeEngine) NumTokens(text string) int { return len(strings.Fields(text)) }
-func (f *fakeEngine) Close()                    {}
+
+// Decide answers every question with a fixed distribution: the first option
+// at 0.8, the rest sharing 0.2; the state and questions are kept.
+func (f *fakeEngine) Decide(state string, qs []llm.Question) ([]llm.Decision, error) {
+	f.state, f.questions = state, qs
+	out := make([]llm.Decision, len(qs))
+	for i, q := range qs {
+		probs := make([]float64, len(q.Options))
+		probs[0] = 0.8
+		for j := 1; j < len(probs); j++ {
+			probs[j] = 0.2 / float64(len(probs)-1)
+		}
+		exp := 0.0
+		for j, p := range probs {
+			if q.Kind == llm.KindScore {
+				exp += p * q.Values[j]
+			}
+		}
+		out[i] = llm.Decision{Options: q.Options, Probs: probs, Index: 0, Confidence: 0.8, Expected: exp}
+	}
+	return out, nil
+}
+func (f *fakeEngine) Close() {}
 
 // installFake puts one model in a scratch HuggingFace cache so the server
 // has something to list and load.
@@ -218,4 +242,58 @@ func readStream(t *testing.T, resp *http.Response) (text, finish string, sawUsag
 		}
 	}
 	return
+}
+
+// The System One wire on the engine's Decide: a noul, a choice and a score
+// about one state, answered with probabilities; the client's own model
+// name is accepted and the loaded model answers.
+func TestDecisionsAnswerTheSystemOneWire(t *testing.T) {
+	installFake(t, "Qwen3-8B-4bit", 40960)
+	eng := &fakeEngine{}
+	srv := newTestServer(t, eng)
+	body := `{"model":"jev-latest","state":"func add(a, b int) int { return a + b }","questions":{
+		"relevant":{"type":"noul","instructions":"Is this hit relevant to the task?","criteria":{"true":"it is about the add function","false":"it is about something else"}},
+		"kind":{"type":"choice","instructions":"What kind of code is this?","criteria":{"test":"a test","impl":"an implementation","doc":"documentation"}},
+		"quality":{"type":"score","instructions":"How clear is it?","criteria":["unclear","fine","clear"]}}}`
+	resp, v := post(t, srv.URL+"/v1/systemone", body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d: %v", resp.StatusCode, v)
+	}
+	if v["model"] != "Qwen3-8B-4bit" || eng.state != "func add(a, b int) int { return a + b }" || len(eng.questions) != 3 {
+		t.Fatalf("answered by the loaded model on the state: %v %+v", v, eng.questions)
+	}
+	answers := v["answers"].(map[string]any)
+	rel := answers["relevant"].(map[string]any)
+	if rel["type"] != "noul" || rel["noul"].(float64) != 0.8 || rel["confidence"].(float64) != 0.8 {
+		t.Fatalf("noul: %v", rel)
+	}
+	kind := answers["kind"].(map[string]any)
+	if kind["choice"] != "doc" || kind["probabilities"].(map[string]any)["doc"].(float64) != 0.8 || len(kind["probabilities"].(map[string]any)) != 3 {
+		t.Fatalf("choice (labels in a fixed order, the first favoured by the fake): %v", kind)
+	}
+	q := answers["quality"].(map[string]any)
+	if sc := q["score"].(float64); sc < 0.299 || sc > 0.301 || q["probabilities"].(map[string]any)["0"].(float64) != 0.8 {
+		t.Fatalf("score: a zero-based expected level and a probability per level: %v", q)
+	}
+	// The questions the engine saw carry the criteria in their text.
+	for _, eq := range eng.questions {
+		switch eq.Kind {
+		case llm.KindYesNo:
+			if !strings.Contains(eq.Text, "Yes means: it is about the add function") {
+				t.Fatalf("noul criteria: %q", eq.Text)
+			}
+		case llm.KindChoice:
+			if !strings.Contains(eq.Text, "impl: an implementation") || strings.Join(eq.Options, ",") != "doc,impl,test" {
+				t.Fatalf("choice: %q %v", eq.Text, eq.Options)
+			}
+		case llm.KindScore:
+			if strings.Join(eq.Options, ",") != "unclear,fine,clear" || eq.Values[2] != 2 {
+				t.Fatalf("score levels: %v %v", eq.Options, eq.Values)
+			}
+		}
+	}
+	resp, v = post(t, srv.URL+"/v1/systemone", `{"state":"x","questions":{"q":{"type":"choice","instructions":"?","criteria":{"only":"one"}}}}`)
+	if resp.StatusCode != 422 || !strings.Contains(v["error"].(map[string]any)["message"].(string), "options") {
+		t.Fatalf("a one-option choice is refused in words: %d %v", resp.StatusCode, v)
+	}
 }
