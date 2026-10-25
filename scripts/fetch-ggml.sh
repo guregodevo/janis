@@ -18,8 +18,11 @@ if [ "${1:-}" = "--cuda" ]; then
 	command -v nvcc >/dev/null || { echo "nvcc (the CUDA toolkit) is needed" >&2; exit 1; }
 	DEST="$ROOT/ggml/third_party/ubuntu-$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')"
 	mkdir -p "$DEST/lib" "$DEST/include"
-	tmp=$(mktemp -d)
-	curl -fsSL "https://github.com/ggml-org/llama.cpp/archive/refs/tags/$TAG.tar.gz" | tar -xz -C "$tmp"
+	# The source and the build live under the repo (gitignored), not /tmp: a
+	# machine stopped mid-build resumes where it was instead of starting over.
+	tmp="$ROOT/ggml/third_party/build-cuda-$TAG"
+	mkdir -p "$tmp"
+	[ -d "$tmp"/llama.cpp-* ] || curl -fsSL "https://github.com/ggml-org/llama.cpp/archive/refs/tags/$TAG.tar.gz" | tar -xz -C "$tmp"
 	src=$(echo "$tmp"/llama.cpp-*)
 	# ggml's own CMake does not configure standalone inside the llama.cpp
 	# tree (no ggml.pc.in there); the root configures with everything but
@@ -34,7 +37,6 @@ if [ "${1:-}" = "--cuda" ]; then
 	cmake --build "$tmp/build" --config Release -j"$(nproc)" --target ggml ggml-base ggml-cpu ggml-cuda 2>&1 | tail -3
 	find "$tmp/build" -name 'libggml*.so*' -exec cp -a {} "$DEST/lib/" \;
 	cp "$src"/ggml/include/*.h "$DEST/include/"
-	rm -rf "$tmp"
 	echo "$TAG" > "$DEST/.tag"
 	echo "✓ ggml $TAG with CUDA → $DEST ($(ls "$DEST/lib" | wc -l | tr -d ' ') libraries)"
 	exit 0
