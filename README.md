@@ -81,6 +81,43 @@ start the turn's effort, the tool routing, the judged reads and the stop
 verdict are decided here, with no key. The numbers above are illustrative;
 a 0.6B model answers the wire but judges poorly, an 8B is the sensible floor.
 
+## Backends and flavors
+
+The model code is written against one tensor interface (`engine.Backend`,
+about fifty ops); a backend is an implementation of it. Three exist:
+
+| Flavor | Backend | Where | How |
+|---|---|---|---|
+| janis | MLX | Apple Silicon | the default build (`make build`) |
+| janis-cuda | ggml, llama.cpp's tensor library: CUDA, Metal or CPU kernels | Linux with an NVIDIA GPU; also Metal and CPU on a Mac | `-tags ggml`, `JANIS_BACKEND=ggml`, `JANIS_GGML_DEVICE=gpu` |
+| janis-cpu | pure Go | anywhere | `CGO_ENABLED=0`, or `JANIS_BACKEND=cpu` |
+
+The ggml backend (package `ggml`, branch `ggml`, 2026-10-25) links the
+prebuilt libraries from llama.cpp's releases (`scripts/fetch-ggml.sh`; on a
+Linux GPU box `--cuda` builds them with cmake for the GPU present, about 20
+minutes once). Ops are recorded and flushed as one graph per step, tensors
+stay on the device, MLX's 4-bit weights are repacked once into ggml's Q4_1
+(the same affine formula), and the engine's pin/sweep protocol frees each
+step's temporaries. Every op matches the pure-Go backend to float
+precision; the quantized matmul within llama.cpp's own 8-bit-activation
+precision.
+
+Measured, Qwen3 4-bit, 160 to 512 tokens generated:
+
+| Machine | Model | MLX | ggml Metal | ggml CUDA | ggml CPU | pure Go |
+|---|---|---|---|---|---|---|
+| Mac M4 | 0.6B | 169 tok/s | 69 | | 66 (4 threads) | 17 |
+| Mac M4 | 8B | 18.8 | 13.0 | | 5.6 | |
+| Google g2-standard-4, 1× L4 | 0.6B | | | 52 to 56 (about 100 steady) | 9.4 | |
+| Google g2-standard-4, 1× L4 | 8B | | | 10 to 12 (about 38 steady) | 1.1 | |
+
+The two CUDA figures per row are the whole run, which includes the one-time
+Q4_1 repack of every weight on the host (about 19 s for the 8B on four
+vCPUs), and the steady rate the per-step compute timings give once that is
+done. llama.cpp runs the same 8B at 45 to 50 tok/s on an L4. Not in the ggml
+backend yet: the MoE expert matmul, the Qwen3.5 hybrid's scan and depthwise
+convolution, and a cached repack.
+
 ## Build
 
 Apple Silicon with MLX:
