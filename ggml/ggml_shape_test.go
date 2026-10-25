@@ -127,3 +127,32 @@ func TestMoEBlockMatchesCPU(t *testing.T) {
 	}
 	relOK(t, "MoE block (gate, up, SiLU, product, down, weighted mean)", 3e-2, got, want)
 }
+
+// An input with a channel past 2,000 (Qwen3's attention outputs have them)
+// overflows ggml's q8_1 block sum on a Q4_1 weight; the weight that meets
+// such an input is kept as Q8_0 and must still match the oracle.
+func TestAnOutlierInputKeepsTheWeightExact(t *testing.T) {
+	g := New()
+	defer g.Close()
+	c := cpu.New()
+	const out, in, gs, bits = 32, 512, 64, 4
+	P, G := in*bits/32, in/gs
+	raw := rndPackedU32(out*P, 91)
+	sc, bi := rnd(out*G, 92), rnd(out*G, 93)
+	x := rnd(in, 94)
+	x[37] = 5000 // one outlier channel
+	gW, cW := g.FromRaw(engine.U32, raw, out, P), c.FromRaw(engine.U32, raw, out, P)
+	gS, gB := g.FromFloats(sc, out, G), g.FromFloats(bi, out, G)
+	cS, cB := c.FromFloats(sc, out, G), c.FromFloats(bi, out, G)
+	got := g.Floats(g.QuantMatmul(g.FromFloats(x, 1, 1, in), gW, gS, gB, true, gs, bits))
+	for _, v := range got {
+		if v != v {
+			t.Fatal("NaN in the output: the q8_1 overflow")
+		}
+	}
+	relOK(t, "QuantMatmul with an outlier input (Q8_0 weight)", 1e-2, got,
+		c.Floats(c.QuantMatmul(c.FromFloats(x, 1, 1, in), cW, cS, cB, true, gs, bits)))
+	if gW.(*tensor).q4.t._type != 8 { // GGML_TYPE_Q8_0
+		t.Fatalf("the weight that met the outlier is Q8_0, got type %d", int(gW.(*tensor).q4.t._type))
+	}
+}

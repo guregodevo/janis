@@ -1105,6 +1105,114 @@ func rangeCheck(what string, shape []int, vals []float32) {
 	fmt.Fprintf(os.Stderr, "ggml check: %s of %v: %d of %d outside f16, max |v| %.4g\n", what, shape, bad, len(vals), maxAbs)
 }
 
+// packed is the device form of an affine weight, chosen once at its first
+// use: Q4_1 (the same 4-bit affine blocks, ggml's quantized kernels) unless
+// the input that meets it carries values past q8Threshold, in which case
+// Q8_0. ggml's Q4_1 kernels quantize the activations to q8_1 blocks whose
+// scale and block sum are f16, and a block holding a value past about
+// 2,000 overflows the sum: NaN in the output. Qwen3's attention outputs
+// have such channels (the 30B MoE answered NaN logits on the L4, hidden by
+// argmax, exposed by sampling), so the projections that take them go to
+// Q8_0, whose kernel has no block sum, at twice the bytes for those weights
+// alone. Scaling the activations instead was tried and is wrong: dividing
+// by 128 pushes small blocks' scales under f16's normal range.
+func (b *Backend) packed(x, tw, ts, tb *tensor, groupSize, bits int) *tensor {
+	if tw.q4 != nil {
+		return tw.q4
+	}
+	if bits == 4 && groupSize%32 == 0 {
+		maxAbs := float32(0)
+		for _, v := range b.Floats(x) {
+			if v < 0 {
+				v = -v
+			}
+			if v > maxAbs {
+				maxAbs = v
+			}
+		}
+		if maxAbs > q8Threshold {
+			if check || trace {
+				fmt.Fprintf(os.Stderr, "ggml: weight %v kept as Q8_0 (its input reaches %.4g)\n", tw.shape, maxAbs)
+			}
+			return b.q8_0(tw, ts, tb, groupSize, bits)
+		}
+	}
+	return b.q4_1(tw, ts, tb, groupSize, bits)
+}
+
+// q8Threshold is the input magnitude past which a weight is kept as Q8_0:
+// half of where the q8_1 block sum overflows, with room for later tokens.
+const q8Threshold = 1024
+
+// q8_0 repacks an affine 4-bit weight into ggml's Q8_0 (blocks of 32: f16
+// scale d, 32 int8): each value q*scale+bias rounded to d = max|v|/127,
+// a sixteenth of a 4-bit step at most. Built once, pinned; the words go.
+func (b *Backend) q8_0(tw, ts, tb *tensor, groupSize, bits int) *tensor {
+	words := b.Ints(tw)
+	sc, bi := b.Floats(ts), b.Floats(tb)
+	valsPerWord := 32 / bits
+	mask := uint32((1 << bits) - 1)
+	P := tw.shape[len(tw.shape)-1]
+	in := P * valsPerWord
+	G := ts.shape[len(ts.shape)-1]
+	rows := numel(tw.shape) / P
+	const blk = 34 // sizeof(block_q8_0): 2+32
+	raw := make([]byte, rows*(in/32)*blk)
+	var wg sync.WaitGroup
+	workers := runtime.NumCPU()
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			vals := make([]float32, 32)
+			for r := w; r < rows; r += workers {
+				for blkIdx := 0; blkIdx < in/32; blkIdx++ {
+					amax := float32(0)
+					for j := 0; j < 32; j++ {
+						e := blkIdx*32 + j
+						q := (uint32(words[r*P+e/valsPerWord]) >> uint((e%valsPerWord)*bits)) & mask
+						g := e / groupSize
+						v := float32(q)*sc[r*G+g] + bi[r*G+g]
+						vals[j] = v
+						if v < 0 {
+							v = -v
+						}
+						if v > amax {
+							amax = v
+						}
+					}
+					d := amax / 127
+					o := (r*(in/32) + blkIdx) * blk
+					binary.LittleEndian.PutUint16(raw[o:], f32tof16(d))
+					for j, v := range vals {
+						qv := 0
+						if d > 0 {
+							qv = int(math.Round(float64(v / d)))
+						}
+						raw[o+2+j] = byte(int8(qv))
+					}
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	shape := append([]int(nil), tw.shape...)
+	shape[len(shape)-1] = in
+	ctx := C.janis_ctx(ctxMem)
+	n := ne(shape)
+	t := C.janis_new(ctx, C.GGML_TYPE_Q8_0, n[0], n[1], n[2], n[3])
+	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+	C.ggml_backend_tensor_set(t, unsafe.Pointer(&raw[0]), 0, C.size_t(len(raw)))
+	q := &tensor{t: t, ctx: ctx, buf: buf, shape: shape, dt: engine.F16, pin: true}
+	tw.q4 = q
+	if !tw.gathered && tw.buf != nil {
+		C.ggml_backend_buffer_free(tw.buf)
+		C.ggml_free(tw.ctx)
+		tw.buf, tw.ctx, tw.t, tw.dropped = nil, nil, nil, true
+	}
+	return q
+}
+
 // q4_1 repacks a 4-bit, group-64-or-32 affine weight [out, in] into ggml's
 // Q4_1 (blocks of 32: f16 scale d, f16 min m, 16 bytes of nibbles, element
 // j in the low nibble of byte j for j<16 and the high nibble of byte j-16
@@ -1219,32 +1327,13 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 		return b.MatMul(x, b.Dequantize(w, scales, biases, groupSize, bits))
 	}
 	tx := as(x)
-	q := b.q4_1(as(w), as(scales), as(biases), groupSize, bits)
+	q := b.packed(tx, as(w), as(scales), as(biases), groupSize, bits)
 	nx := len(tx.shape)
 	shape := append(append([]int(nil), tx.shape[:nx-1]...), q.shape[0])
 	return b.op(engine.F32, shape, []*tensor{tx, q, as(w)}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-		x := f32(ctx, tx)
-		if q.t._type == C.GGML_TYPE_Q4_1 {
-			x = C.ggml_scale(ctx, x, 1/q8Headroom)
-			return C.ggml_scale(ctx, C.ggml_mul_mat(ctx, q.t, x), q8Headroom)
-		}
-		return C.ggml_mul_mat(ctx, q.t, x)
+		return C.ggml_mul_mat(ctx, q.t, f32(ctx, tx)) // ne (out, M, …)
 	})
 }
-
-// q8Headroom scales the activations down before a Q4_1 matmul and the
-// result back up. ggml's Q4_1 kernels quantize the activations to q8_1
-// blocks whose scale and block sum are f16; a block with a value past about
-// 2,000 overflows the sum to infinity and the output to NaN, and Qwen3's
-// attention outputs have such channels (the 30B MoE answered NaN logits on
-// the L4; argmax hid it, sampling did not). A power of two keeps the
-// scaling exact and the 8-bit quantization relative, so nothing else moves.
-var q8Headroom = func() C.float {
-	if os.Getenv("JANIS_GGML_HEADROOM") == "0" { // for measuring the overflow
-		return 1
-	}
-	return 128
-}()
 
 // GatherQuantMatmul is the MoE expert matmul on ggml_mul_mat_id: w, scales
 // and biases are the stack [E, out, in] (repacked once to Q4_1, ne =
@@ -1256,7 +1345,7 @@ func (b *Backend) GatherQuantMatmul(x, w, scales, biases, rhsIndices engine.Tens
 		panic("ggml: GatherQuantMatmul without transpose is not used by the models")
 	}
 	tx, ti := as(x), as(rhsIndices)
-	q := b.q4_1(as(w), as(scales), as(biases), groupSize, bits)
+	q := b.packed(tx, as(w), as(scales), as(biases), groupSize, bits)
 	xs, rs := tx.shape, ti.shape
 	in, A := xs[len(xs)-1], xs[len(xs)-3]
 	K := rs[len(rs)-1]
@@ -1264,16 +1353,9 @@ func (b *Backend) GatherQuantMatmul(x, w, scales, biases, rhsIndices engine.Tens
 	out := q.shape[1]
 	shape := append(append([]int(nil), rs...), 1, out)
 	return b.op(engine.F32, shape, []*tensor{tx, ti, q, as(w)}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-		x := f32(ctx, tx)
-		if q.t._type == C.GGML_TYPE_Q4_1 {
-			x = C.ggml_scale(ctx, x, 1/q8Headroom)
-		}
-		xb := C.ggml_reshape_3d(ctx, C.ggml_cont(ctx, x), C.int64_t(in), C.int64_t(A), C.int64_t(nTok))
+		xb := C.ggml_reshape_3d(ctx, f32(ctx, tx), C.int64_t(in), C.int64_t(A), C.int64_t(nTok))
 		ids := C.ggml_reshape_2d(ctx, ti.t, C.int64_t(K), C.int64_t(nTok))
 		r := C.ggml_mul_mat_id(ctx, q.t, xb, ids) // ne (out, K, nTok)
-		if q.t._type == C.GGML_TYPE_Q4_1 {
-			r = C.ggml_scale(ctx, r, q8Headroom)
-		}
 		m := ne(shape)
 		return C.ggml_cont(ctx, C.ggml_reshape_4d(ctx, r, m[0], m[1], m[2], m[3]))
 	})
