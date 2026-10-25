@@ -75,7 +75,25 @@ type Backend struct {
 	// and the causal mask of a shape. Uploaded once, pinned.
 	positions map[[2]int]*tensor
 	masks     map[[2]int]*tensor
+	// arenas are a few fixed buffers that batches are placed into with a
+	// linear allocator and reused once their results are gone: a flush is
+	// not a fresh device allocation of yet another size, which is what
+	// fragmented the L4's heap until a 100 MB request failed with 1.7 GB
+	// nominally free. A batch that does not fit, or finds every arena busy,
+	// gets a buffer of its own as before.
+	arenas []*arena
 }
+
+type arena struct {
+	buf  C.ggml_backend_buffer_t
+	size C.size_t
+	busy *batch // the batch living in it, nil when free
+}
+
+const (
+	arenaCount = 4
+	arenaBytes = 256 << 20
+)
 
 // A flush records at most this many results before computing: a decode
 // step of a 28-layer model is one or two graphs instead of hundreds
@@ -115,6 +133,11 @@ func New() *Backend {
 	b.tracked = map[weak.Pointer[tensor]]struct{}{}
 	b.positions = map[[2]int]*tensor{}
 	b.masks = map[[2]int]*tensor{}
+	for i := 0; i < arenaCount; i++ {
+		if buf := C.ggml_backend_buft_alloc_buffer(b.buft, arenaBytes); buf != nil {
+			b.arenas = append(b.arenas, &arena{buf: buf, size: arenaBytes})
+		}
+	}
 	return b
 }
 
@@ -143,6 +166,10 @@ func (b *Backend) Close() {
 		}
 	}
 	b.tracked = map[weak.Pointer[tensor]]struct{}{}
+	for _, a := range b.arenas {
+		C.ggml_backend_buffer_free(a.buf)
+	}
+	b.arenas = nil
 	if b.be != nil {
 		C.ggml_backend_free(b.be)
 		b.be = nil
@@ -179,7 +206,8 @@ type quantCall struct{ groupSize, bits int }
 // released when the last of them goes.
 type batch struct {
 	ctx  *C.struct_ggml_context
-	buf  C.ggml_backend_buffer_t
+	buf  C.ggml_backend_buffer_t // its own buffer, when no arena took it
+	in   *arena                  // the arena it lives in, else nil
 	refs int
 }
 
@@ -187,6 +215,10 @@ func (g *batch) release() {
 	g.refs--
 	if g.refs > 0 {
 		return
+	}
+	if g.in != nil {
+		g.in.busy = nil
+		g.in = nil
 	}
 	if g.buf != nil {
 		C.ggml_backend_buffer_free(g.buf)
@@ -369,7 +401,11 @@ func (b *Backend) flushLocked() {
 	ctx, pending := b.rec, b.pending
 	b.rec, b.pending = nil, nil
 	t0 := time.Now()
-	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+	var buf C.ggml_backend_buffer_t
+	in := b.placeInArena(ctx)
+	if in == nil {
+		buf = C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+	}
 	t1 := time.Now()
 	g := C.ggml_new_graph_custom(ctx, maxNodes, false)
 	for _, p := range pending {
@@ -444,7 +480,10 @@ func (b *Backend) flushLocked() {
 		fmt.Fprintf(os.Stderr, "ggml flush: %d results, %d nodes, %s alloc, %s build, %s compute\n",
 			len(pending), int(C.ggml_graph_n_nodes(g)), t1.Sub(t0).Round(10*time.Microsecond), t2.Sub(t1).Round(10*time.Microsecond), t3.Sub(t2).Round(10*time.Microsecond))
 	}
-	grp := &batch{ctx: ctx, buf: buf, refs: len(pending)}
+	grp := &batch{ctx: ctx, buf: buf, in: in, refs: len(pending)}
+	if in != nil {
+		in.busy = grp
+	}
 	for _, p := range pending {
 		p.t.op = C.GGML_OP_NONE
 		for i := range p.t.src {
@@ -458,6 +497,43 @@ func (b *Backend) flushLocked() {
 	if st != C.GGML_STATUS_SUCCESS {
 		panic(fmt.Sprintf("ggml: compute failed (%d)", int(st)))
 	}
+}
+
+// placeInArena lays the context's tensors out in a free arena with a linear
+// allocator (views initialized after their sources), or returns nil when
+// none is free or the batch does not fit.
+func (b *Backend) placeInArena(ctx *C.struct_ggml_context) *arena {
+	var need C.size_t
+	align := C.ggml_backend_buft_get_alignment(b.buft)
+	for t := C.ggml_get_first_tensor(ctx); t != nil; t = C.ggml_get_next_tensor(ctx, t) {
+		if t.data != nil || t.view_src != nil {
+			continue
+		}
+		sz := C.ggml_backend_buft_get_alloc_size(b.buft, t)
+		need += (sz + align - 1) / align * align
+	}
+	var a *arena
+	for _, cand := range b.arenas {
+		if cand.busy == nil && need <= cand.size {
+			a = cand
+			break
+		}
+	}
+	if a == nil {
+		return nil
+	}
+	tal := C.ggml_tallocr_new(a.buf)
+	for t := C.ggml_get_first_tensor(ctx); t != nil; t = C.ggml_get_next_tensor(ctx, t) {
+		if t.data != nil {
+			continue
+		}
+		if t.view_src != nil {
+			C.ggml_backend_view_init(t)
+			continue
+		}
+		C.ggml_tallocr_alloc(&tal, t)
+	}
+	return a
 }
 
 // flush computes whatever is recorded (a readback, Eval, Sweep need it).
