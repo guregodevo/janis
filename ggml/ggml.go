@@ -526,6 +526,12 @@ func (b *Backend) placeInArena(ctx *C.struct_ggml_context) *arena {
 	var placed []*C.struct_ggml_tensor
 	for t := C.ggml_get_first_tensor(ctx); t != nil; t = C.ggml_get_next_tensor(ctx, t) {
 		if t.data != nil {
+			// A view of a tensor that already had data was given its address
+			// at creation but no buffer; ggml's own allocator still runs
+			// view_init on it, and CUDA reads a source's buffer.
+			if t.view_src != nil && t.buffer == nil {
+				C.ggml_backend_view_init(t)
+			}
 			continue
 		}
 		var st C.enum_ggml_status
