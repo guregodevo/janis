@@ -161,6 +161,7 @@ type tensor struct {
 	deps  []*tensor               // the inputs a recorded node reads, held until it is computed
 	shape []int
 	dt    engine.DType
+	where string  // the op's call site, kept when tracing or checking
 	q4    *tensor // the Q4_1 repack of a packed weight, built once
 	pin   bool    // survives Sweep
 	freed bool
@@ -335,6 +336,10 @@ func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx
 	}
 	node := fn(b.rec)
 	out := &tensor{t: node, shape: append([]int(nil), shape...), dt: dt}
+	if check {
+		_, file, line, _ := runtime.Caller(1)
+		out.where = fmt.Sprintf("%s:%d", file[strings.LastIndex(file, "/")+1:], line)
+	}
 	for _, in := range inputs {
 		if in != nil {
 			out.deps = append(out.deps, in)
@@ -369,6 +374,28 @@ func (b *Backend) flushLocked() {
 	}
 	t2 := time.Now()
 	st := C.ggml_backend_graph_compute(b.be, g)
+	if check {
+		for _, p := range pending {
+			if p.dt != engine.F32 {
+				continue
+			}
+			n := numel(p.shape)
+			vals := make([]float32, n)
+			if n > 0 {
+				C.ggml_backend_tensor_get(p.t, unsafe.Pointer(&vals[0]), 0, C.size_t(n*4))
+			}
+			bad := 0
+			for _, v := range vals {
+				if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+					bad++
+				}
+			}
+			if bad > 0 {
+				fmt.Fprintf(os.Stderr, "ggml check: %d of %d values NaN/Inf in a result of %s %v\n", bad, n, p.where, p.shape)
+				os.Exit(3)
+			}
+		}
+	}
 	if timing {
 		t3 := time.Now()
 		fmt.Fprintf(os.Stderr, "ggml flush: %d results, %d nodes, %s alloc, %s build, %s compute\n",
@@ -402,6 +429,9 @@ func (b *Backend) flush() {
 var (
 	trace  = os.Getenv("JANIS_GGML_TRACE") == "1"
 	timing = os.Getenv("JANIS_GGML_TIMING") == "1"
+	// check (JANIS_GGML_CHECK=1) reads every result back after each flush
+	// and stops at the first NaN or Inf, naming the op that made it.
+	check = os.Getenv("JANIS_GGML_CHECK") == "1"
 )
 
 // f32 is x as an F32 node in ctx (a cast when it is not).
