@@ -42,18 +42,20 @@ func ApplyTemplate(modelType string, msgs []Message) string {
 	}
 }
 
-// EndOfTextMarker is the family's end-of-text token, the one the base model
-// was trained to stop on: a chat model may still draw it (Qwen3-Coder did,
-// under sampling, in place of a one-word answer), and it decodes to
-// nothing, so it must count as a stop and not as a word.
-func EndOfTextMarker(modelType string) string {
+// ControlMarkers are the family's tokens that may never be generated as
+// text, so they count as stops: the end-of-text token the base model was
+// trained to stop on, and the marker that opens a turn. A chat model draws
+// them under sampling (Qwen3-Coder opened a new turn, <|im_start|>, in
+// place of a one-word answer); both decode to nothing, and as stops the
+// first-token guard resamples instead of answering with an empty word.
+func ControlMarkers(modelType string) []string {
 	switch modelType {
 	case "gemma2":
-		return "<eos>"
+		return []string{"<eos>", "<start_of_turn>"}
 	case "llama":
-		return "<|end_of_text|>"
+		return []string{"<|end_of_text|>", "<|start_header_id|>"}
 	default:
-		return "<|endoftext|>"
+		return []string{"<|endoftext|>", "<|im_start|>"}
 	}
 }
 

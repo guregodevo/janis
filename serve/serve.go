@@ -283,6 +283,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Seed != nil {
 		opts.Seed = *req.Seed
+	} else {
+		opts.Seed = uint64(time.Now().UnixNano()) // each request its own draw, unless the client fixes it
 	}
 	ctx := r.Context()
 	opts.Cancel = func() bool { return ctx.Err() != nil }
