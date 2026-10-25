@@ -110,13 +110,21 @@ Measured, Qwen3 4-bit, 160 to 512 tokens generated:
 | Mac M4 | 8B | 18.8 | 13.0 | | 5.6 | |
 | Google g2-standard-4, 1× L4 | 0.6B | | | 52 to 56 (about 100 steady) | 9.4 | |
 | Google g2-standard-4, 1× L4 | 8B | | | 10 to 12 (about 38 steady) | 1.1 | |
+| Google g2-standard-4, 1× L4 | Qwen3-Coder-30B-A3B (MoE, 128 experts, 8 active) | | | 11 steady, after a 2-minute load | | |
 
 The two CUDA figures per row are the whole run, which includes the one-time
 Q4_1 repack of every weight on the host (about 19 s for the 8B on four
 vCPUs), and the steady rate the per-step compute timings give once that is
-done. llama.cpp runs the same 8B at 45 to 50 tok/s on an L4. Not in the ggml
-backend yet: the MoE expert matmul, the Qwen3.5 hybrid's scan and depthwise
-convolution, and a cached repack.
+done. llama.cpp runs the same 8B at 45 to 50 tok/s on an L4.
+
+MoE runs resident (`JANIS_MOE_RESIDENT=1`): every expert of a layer is
+stacked once on the device and the gather picks them by index
+(`ggml_mul_mat_id`), the shape of MoE on a GPU with room for the whole
+model; the 30B-A3B takes 18 GB of the L4. Its 11 tok/s is overhead, not
+kernels: the router's top-k runs on the host, one sync per layer per token
+(the GPU sits at 13%), and the 16 GB repack on load is what the two minutes
+are. Both are the next changes, with a cached repack. Not in the ggml
+backend yet: the Qwen3.5 hybrid's scan and depthwise convolution.
 
 ## Build
 
