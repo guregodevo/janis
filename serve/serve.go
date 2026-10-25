@@ -45,6 +45,10 @@ type Generator interface {
 // llm.Open; tests inject a fake.
 type Loader func(modelDir string) (Generator, error)
 
+// traceTokens (JANIS_TRACE_TOKENS=1) logs every generated token id and its
+// text: what a reply that decodes to nothing was made of.
+var traceTokens = os.Getenv("JANIS_TRACE_TOKENS") == "1"
+
 // Server serves one engine at a time behind the OpenAI endpoints.
 type Server struct {
 	load    Loader
@@ -285,6 +289,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if len(req.Tools) > 0 {
 		opts.ToolCallGrammar = true
 		opts.ForceToolCall = string(req.ToolChoice) == `"required"`
+	}
+	if traceTokens {
+		opts.OnToken = func(id int32, text string) { s.logf("token %d %q", id, text) }
 	}
 	inTokens := 0
 	for _, m := range msgs {
