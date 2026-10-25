@@ -15,6 +15,26 @@ elsewhere, and what it takes to run a model on the machine in front of you.
 
 Weights come from `huggingface.co/mlx-community` into `~/.cache/huggingface/`.
 
+## Serve
+
+`janis serve` runs the installed models the way llama.cpp or Ollama does,
+for any OpenAI-compatible client, on `http://127.0.0.1:8090/v1`:
+
+```bash
+go build -o janis ./cmd/janis
+./janis list                         # the installed mlx-community models
+./janis serve --model Qwen3-8B-4bit  # GET /v1/models, POST /v1/chat/completions
+```
+
+Streamed or not, with tools: the schemas are rendered into the system prompt
+the Hermes way, the engine's grammar keeps every `<tool_call>` well-formed,
+and the call comes back as OpenAI `tool_calls`. One model is loaded at a
+time; a request naming another installed model swaps it. `/v1/models`
+carries each model's `context_length` from its config. `--host 0.0.0.0`
+opens it to the network. Memdoor connects it with
+`memdoor connect local --base http://localhost:8090/v1`, no key, on this
+machine or on a box reached over ssh.
+
 ## Build
 
 Apple Silicon with MLX:
