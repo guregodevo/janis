@@ -96,10 +96,19 @@ type arena struct {
 	busy *batch // the batch living in it, nil when free
 }
 
-const (
-	arenaCount = 2
-	arenaBytes = 128 << 20
-)
+// arenaSizes are the arenas made at start: batches are small (on the 30B
+// MoE a median under a megabyte, the largest 18 MB) and live a few flushes
+// each, so many small slots catch nearly all of them, two large ones the
+// prefill's. Placement takes the smallest free arena that fits.
+var arenaSizes = append(append([]C.size_t{}, repeatSize(12, 32<<20)...), 128<<20, 128<<20)
+
+func repeatSize(n int, sz C.size_t) []C.size_t {
+	out := make([]C.size_t, n)
+	for i := range out {
+		out[i] = sz
+	}
+	return out
+}
 
 // A flush records at most this many results before computing: a decode
 // step of a 28-layer model is one or two graphs instead of hundreds
@@ -139,9 +148,9 @@ func New() *Backend {
 	b.tracked = map[weak.Pointer[tensor]]struct{}{}
 	b.positions = map[[2]int]*tensor{}
 	b.masks = map[[2]int]*tensor{}
-	for i := 0; i < arenaCount; i++ {
-		if buf := C.ggml_backend_buft_alloc_buffer(b.buft, arenaBytes); buf != nil {
-			b.arenas = append(b.arenas, &arena{buf: buf, size: arenaBytes})
+	for _, sz := range arenaSizes {
+		if buf := C.ggml_backend_buft_alloc_buffer(b.buft, sz); buf != nil {
+			b.arenas = append(b.arenas, &arena{buf: buf, size: sz})
 		}
 	}
 	return b
@@ -574,12 +583,13 @@ func (b *Backend) placeInArena(ctx *C.struct_ggml_context) *arena {
 	}
 	var a *arena
 	memMu.Lock()
-	for _, cand := range b.arenas {
-		if cand.busy == nil && need <= cand.size {
+	for _, cand := range b.arenas { // the smallest free one that fits
+		if cand.busy == nil && need <= cand.size && (a == nil || cand.size < a.size) {
 			a = cand
-			a.busy = &batch{} // claimed until the flush sets its batch
-			break
 		}
+	}
+	if a != nil {
+		a.busy = &batch{} // claimed until the flush sets its batch
 	}
 	memMu.Unlock()
 	if a == nil {
