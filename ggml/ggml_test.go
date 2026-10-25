@@ -144,6 +144,13 @@ func TestGGMLMatchesCPU(t *testing.T) {
 	gS, gB := g.FromFloats(sc, out, G), g.FromFloats(bi, out, G)
 	cS, cB := c.FromFloats(sc, out, G), c.FromFloats(bi, out, G)
 	diffOK(t, "Dequantize", tol, g.Floats(g.Dequantize(gW, gS, gB, gs, bits)), c.Floats(c.Dequantize(cW, cS, cB, gs, bits)))
+	// The embedding is gathered before it is ever multiplied (the model's
+	// order); a weight that is only multiplied keeps its Q4_1 copy alone.
+	ids := []int32{0, 3, 5, 2}
+	gIdx, cIdx := g.FromInt32(ids, len(ids)), c.FromInt32(ids, len(ids))
+	diffOK(t, "QuantEmbed(gather+dequant)", tol,
+		g.Floats(g.Dequantize(g.TakeAxis(gW, gIdx, 0), g.TakeAxis(gS, gIdx, 0), g.TakeAxis(gB, gIdx, 0), gs, bits)),
+		c.Floats(c.Dequantize(c.TakeAxis(cW, cIdx, 0), c.TakeAxis(cS, cIdx, 0), c.TakeAxis(cB, cIdx, 0), gs, bits)))
 	// ggml's Q4_1 kernel rounds the activations to 8 bits per block of 32
 	// (q8_1) before the dot, and keeps scale and min in f16: llama.cpp's
 	// precision, about half a percent of the output's magnitude, not the
@@ -157,11 +164,6 @@ func TestGGMLMatchesCPU(t *testing.T) {
 		g.Floats(g.QuantMatmul(g.FromFloats(xq1, 1, in), gW, gS, gB, true, gs, bits)),
 		c.Floats(c.QuantMatmul(c.FromFloats(xq1, 1, in), cW, cS, cB, true, gs, bits)))
 
-	ids := []int32{0, 3, 5, 2}
-	gIdx, cIdx := g.FromInt32(ids, len(ids)), c.FromInt32(ids, len(ids))
-	diffOK(t, "QuantEmbed(gather+dequant)", tol,
-		g.Floats(g.Dequantize(g.TakeAxis(gW, gIdx, 0), g.TakeAxis(gS, gIdx, 0), g.TakeAxis(gB, gIdx, 0), gs, bits)),
-		c.Floats(c.Dequantize(c.TakeAxis(cW, cIdx, 0), c.TakeAxis(cS, cIdx, 0), c.TakeAxis(cB, cIdx, 0), gs, bits)))
 	am := rnd(3*9, 22)
 	gi, ci := g.Ints(g.Argmax(g.FromFloats(am, 3, 9), -1)), c.Ints(c.Argmax(c.FromFloats(am, 3, 9), -1))
 	for i := range ci {

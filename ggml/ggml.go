@@ -7,11 +7,17 @@
 // that device's library, because every op is a ggml graph node and ggml
 // owns the kernels.
 //
-// This is the spike (2026-10-25): eager, one graph per op, each result in its
-// own backend buffer; correct first, batched graphs later. Affine 4-bit
-// weights (MLX's layout) are repacked once into ggml's Q4_1, whose block is
-// the same formula (scale*q + min), so quantized matmuls run on ggml's
-// quantized kernels rather than through a dequantized copy.
+// Ops record nodes into a shared context and nothing runs until something
+// needs a value: Eval, a readback, or a full context flushes the recorded
+// nodes as ONE graph into ONE buffer that the batch shares (refcounted, so a
+// tensor keeps its batch alive and no more), and every computed node is
+// then detached from its sources so later graphs see a leaf with data. The
+// engine's Pin/Unpin/Sweep protocol (engine.Sweeper, what MLX uses) frees
+// a step's temporaries deterministically; weak references let the garbage
+// collector cover code paths that never sweep. Affine 4-bit weights (MLX's
+// layout) are repacked once into ggml's Q4_1, whose block is the same
+// formula (scale*q + min), so quantized matmuls run on ggml's quantized
+// kernels rather than through a dequantized copy.
 package ggml
 
 /*
@@ -45,7 +51,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
+	"weak"
 
 	"github.com/guregodevo/janis/engine"
 )
@@ -57,7 +65,30 @@ type Backend struct {
 	buft C.ggml_backend_buffer_type_t
 	name string
 	mu   sync.Mutex
+
+	rec     *C.struct_ggml_context // the recording context: nodes not yet computed
+	pending []*tensor              // their result tensors, in order
+	// tracked is every tensor made since Open, weakly: Sweep frees the ones
+	// that are alive and not pinned; a collected one needs nothing.
+	tracked map[weak.Pointer[tensor]]struct{}
+	// Small constants every layer re-asks for: the RoPE positions of a step
+	// and the causal mask of a shape. Uploaded once, pinned.
+	positions map[[2]int]*tensor
+	masks     map[[2]int]*tensor
 }
+
+// A flush records at most this many results before computing: a decode
+// step of a 28-layer model is one or two graphs instead of hundreds
+// (JANIS_GGML_FLUSH overrides, for measuring).
+var flushEvery = func() int {
+	if n, err := strconv.Atoi(os.Getenv("JANIS_GGML_FLUSH")); err == nil && n > 0 {
+		return n
+	}
+	return 512
+}()
+
+// maxNodes bounds one recording context (results and intermediates).
+const maxNodes = 8192
 
 // New opens the CPU backend, or a GPU one when JANIS_GGML_DEVICE=gpu and a
 // device library (libggml-metal, libggml-cuda) sits next to the CPU one.
@@ -81,6 +112,9 @@ func New() *Backend {
 	}
 	b.buft = C.ggml_backend_get_default_buffer_type(b.be)
 	b.name = C.GoString(C.ggml_backend_name(b.be))
+	b.tracked = map[weak.Pointer[tensor]]struct{}{}
+	b.positions = map[[2]int]*tensor{}
+	b.masks = map[[2]int]*tensor{}
 	return b
 }
 
@@ -100,6 +134,15 @@ func libDir() string {
 func (b *Backend) Version() string { return "ggml-" + b.name }
 
 func (b *Backend) Close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.flushLocked()
+	for wp := range b.tracked {
+		if t := wp.Value(); t != nil {
+			t.free()
+		}
+	}
+	b.tracked = map[weak.Pointer[tensor]]struct{}{}
 	if b.be != nil {
 		C.ggml_backend_free(b.be)
 		b.be = nil
@@ -112,16 +155,60 @@ func (b *Backend) Close() {
 // shape; ggml's ne is the same list reversed (ne0 innermost).
 type tensor struct {
 	t     *C.struct_ggml_tensor
-	ctx   *C.struct_ggml_context
-	buf   C.ggml_backend_buffer_t
+	ctx   *C.struct_ggml_context  // a leaf's own context and buffer …
+	buf   C.ggml_backend_buffer_t //
+	grp   *batch                  // … or the batch a computed result lives in
+	deps  []*tensor               // the inputs a recorded node reads, held until it is computed
 	shape []int
 	dt    engine.DType
 	q4    *tensor // the Q4_1 repack of a packed weight, built once
+	pin   bool    // survives Sweep
+	freed bool
+	// gathered: rows of this packed weight were taken (the embedding), so
+	// its words stay after the repack; a weight only ever multiplied keeps
+	// the Q4_1 copy alone.
+	gathered bool
+	dropped  bool // the words are gone: only QuantMatmul may use it now
+}
+
+// batch is one flushed graph's context and buffer, shared by its results and
+// released when the last of them goes.
+type batch struct {
+	ctx  *C.struct_ggml_context
+	buf  C.ggml_backend_buffer_t
+	refs int
+}
+
+func (g *batch) release() {
+	g.refs--
+	if g.refs > 0 {
+		return
+	}
+	if g.buf != nil {
+		C.ggml_backend_buffer_free(g.buf)
+	}
+	if g.ctx != nil {
+		C.ggml_free(g.ctx)
+	}
+	g.buf, g.ctx = nil, nil
 }
 
 func (t *tensor) Shape() []int { return append([]int(nil), t.shape...) }
 
+// free releases what the tensor holds; a recorded, never computed node has
+// nothing of its own yet and is left to its flush. Idempotent.
 func (t *tensor) free() {
+	if t.freed || t.grp == nil && t.ctx == nil && t.buf == nil && t.q4 == nil {
+		return
+	}
+	t.freed = true
+	if t.grp != nil {
+		t.grp.release()
+		t.grp = nil
+	}
+	if t.dropped {
+		t.t = nil
+	}
 	if t.buf != nil {
 		C.ggml_backend_buffer_free(t.buf)
 		t.buf = nil
@@ -134,6 +221,7 @@ func (t *tensor) free() {
 		t.q4.free()
 		t.q4 = nil
 	}
+	t.deps = nil
 }
 
 func as(t engine.Tensor) *tensor { return t.(*tensor) }
@@ -182,8 +270,16 @@ func (b *Backend) newFrom(dt engine.DType, shape []int, raw unsafe.Pointer, size
 		C.ggml_backend_tensor_set(t, raw, 0, C.size_t(size))
 	}
 	out := &tensor{t: t, ctx: ctx, buf: buf, shape: append([]int(nil), shape...), dt: dt}
-	runtime.SetFinalizer(out, func(x *tensor) { x.free() })
+	b.track(out)
 	return out
+}
+
+// track registers a tensor for Sweep (weakly) and for the collector.
+func (b *Backend) track(t *tensor) {
+	runtime.SetFinalizer(t, func(x *tensor) { x.free() })
+	b.mu.Lock()
+	b.tracked[weak.Make(t)] = struct{}{}
+	b.mu.Unlock()
 }
 
 func (b *Backend) FromFloats(data []float32, shape ...int) engine.Tensor {
@@ -209,16 +305,12 @@ func (b *Backend) FromRaw(dt engine.DType, raw []byte, shape ...int) engine.Tens
 
 // ---- eager graph execution ----
 
-// op builds a graph around the node fn makes and computes it; the node's
-// data lives in the returned tensor's own buffer. The node must not be a
-// view (wrap views in cont).
-//
-// The inputs are kept alive until the compute is done: a temporary only the
-// closure refers to would otherwise be collected, and its finalizer free the
-// buffer the graph is about to read (the first full forward crashed so).
+// op records the node fn makes in the recording context; nothing runs until
+// a flush. The inputs are held by the result until then, so a temporary only
+// the closure referred to stays alive for the compute. The node must not be
+// a view (wrap views in cont).
 func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor) *tensor {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if trace {
 		_, file, line, _ := runtime.Caller(1)
 		var ins []string
@@ -229,36 +321,79 @@ func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx
 		}
 		fmt.Fprintf(os.Stderr, "ggml op %s:%d %s -> %v\n", file[strings.LastIndex(file, "/")+1:], line, strings.Join(ins, " "), shape)
 	}
-	ctx := C.janis_ctx(ctxMem + C.size_t(C.ggml_graph_overhead()))
-	node := fn(ctx)
-	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
-	g := C.ggml_new_graph_custom(ctx, 256, false)
-	C.ggml_build_forward_expand(g, node)
-	st := C.ggml_backend_graph_compute(b.be, g)
+	if b.rec == nil {
+		b.rec = C.janis_ctx(C.size_t(C.ggml_tensor_overhead())*maxNodes + C.ggml_graph_overhead_custom(maxNodes, false))
+	}
+	node := fn(b.rec)
+	out := &tensor{t: node, shape: append([]int(nil), shape...), dt: dt}
 	for _, in := range inputs {
-		runtime.KeepAlive(in)
+		if in != nil {
+			out.deps = append(out.deps, in)
+		}
+	}
+	b.pending = append(b.pending, out)
+	full := len(b.pending) >= flushEvery
+	if full {
+		b.flushLocked()
+	}
+	b.mu.Unlock()
+	b.track(out)
+	return out
+}
+
+// flushLocked computes every recorded node as one graph into one buffer the
+// batch shares, then detaches the results: a computed node still pointing at
+// its sources would make a later graph walk (and recompute) the whole
+// history across every earlier context. Called with b.mu held.
+func (b *Backend) flushLocked() {
+	if len(b.pending) == 0 {
+		return
+	}
+	ctx, pending := b.rec, b.pending
+	b.rec, b.pending = nil, nil
+	t0 := time.Now()
+	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+	t1 := time.Now()
+	g := C.ggml_new_graph_custom(ctx, maxNodes, false)
+	for _, p := range pending {
+		C.ggml_build_forward_expand(g, p.t)
+	}
+	t2 := time.Now()
+	st := C.ggml_backend_graph_compute(b.be, g)
+	if timing {
+		t3 := time.Now()
+		fmt.Fprintf(os.Stderr, "ggml flush: %d results, %d nodes, %s alloc, %s build, %s compute\n",
+			len(pending), int(C.ggml_graph_n_nodes(g)), t1.Sub(t0).Round(10*time.Microsecond), t2.Sub(t1).Round(10*time.Microsecond), t3.Sub(t2).Round(10*time.Microsecond))
+	}
+	grp := &batch{ctx: ctx, buf: buf, refs: len(pending)}
+	for _, p := range pending {
+		p.t.op = C.GGML_OP_NONE
+		for i := range p.t.src {
+			p.t.src[i] = nil
+		}
+		p.t.view_src = nil
+		p.t.flags = 0
+		p.grp = grp
+		p.deps = nil
 	}
 	if st != C.GGML_STATUS_SUCCESS {
 		panic(fmt.Sprintf("ggml: compute failed (%d)", int(st)))
 	}
-	// Detach: a computed node still points at its sources, and a later
-	// graph built on it would walk (and recompute) the whole upstream
-	// history across every earlier context. With its data in place it is a
-	// leaf from here on.
-	node.op = C.GGML_OP_NONE
-	for i := range node.src {
-		node.src[i] = nil
-	}
-	node.view_src = nil
-	node.flags = 0
-	out := &tensor{t: node, ctx: ctx, buf: buf, shape: append([]int(nil), shape...), dt: dt}
-	runtime.SetFinalizer(out, func(x *tensor) { x.free() })
-	return out
 }
 
-// trace (JANIS_GGML_TRACE=1) prints every op before it runs: the last line
-// names the one a native crash happened in.
-var trace = os.Getenv("JANIS_GGML_TRACE") == "1"
+// flush computes whatever is recorded (a readback, Eval, Sweep need it).
+func (b *Backend) flush() {
+	b.mu.Lock()
+	b.flushLocked()
+	b.mu.Unlock()
+}
+
+// trace (JANIS_GGML_TRACE=1) prints every op as it is recorded; timing
+// (JANIS_GGML_TIMING=1) prints what each flush cost.
+var (
+	trace  = os.Getenv("JANIS_GGML_TRACE") == "1"
+	timing = os.Getenv("JANIS_GGML_TIMING") == "1"
+)
 
 // f32 is x as an F32 node in ctx (a cast when it is not).
 func f32(ctx *C.struct_ggml_context, x *tensor) *C.struct_ggml_tensor {
@@ -268,9 +403,66 @@ func f32(ctx *C.struct_ggml_context, x *tensor) *C.struct_ggml_tensor {
 	return C.ggml_cast(ctx, x.t, C.GGML_TYPE_F32)
 }
 
-func (b *Backend) Eval(ts ...engine.Tensor) {}
+// Eval computes everything recorded so far; the engine calls it once per
+// decode step with the step's survivors.
+func (b *Backend) Eval(ts ...engine.Tensor) { b.flush() }
+
+// AsyncEval is Eval here (ggml's compute is synchronous on the CPU; a GPU
+// backend queues it).
+func (b *Backend) AsyncEval(ts ...engine.Tensor) { b.flush() }
+
+// ---- the engine's lifetime protocol (engine.Sweeper) ----
+
+// PinAll pins everything made so far: the weights, after the load.
+func (b *Backend) PinAll() {
+	b.flush()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for wp := range b.tracked {
+		if t := wp.Value(); t != nil {
+			t.pin = true
+		} else {
+			delete(b.tracked, wp)
+		}
+	}
+}
+
+func (b *Backend) Pin(ts ...engine.Tensor) {
+	for _, t := range ts {
+		if t != nil {
+			as(t).pin = true
+		}
+	}
+}
+
+func (b *Backend) Unpin(ts ...engine.Tensor) {
+	for _, t := range ts {
+		if t != nil {
+			as(t).pin = false
+		}
+	}
+}
+
+// Sweep frees every tracked tensor that is not pinned: a step's temporaries.
+func (b *Backend) Sweep() {
+	b.flush()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for wp := range b.tracked {
+		t := wp.Value()
+		if t == nil || t.freed {
+			delete(b.tracked, wp)
+			continue
+		}
+		if !t.pin {
+			t.free()
+			delete(b.tracked, wp)
+		}
+	}
+}
 
 func (b *Backend) Floats(t engine.Tensor) []float32 {
+	b.flush()
 	x := as(t)
 	n := numel(x.shape)
 	out := make([]float32, n)
@@ -286,12 +478,14 @@ func (b *Backend) Floats(t engine.Tensor) []float32 {
 		}
 	default:
 		c := b.op(engine.F32, x.shape, []*tensor{x}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor { return f32(ctx, x) })
+		b.flush()
 		C.ggml_backend_tensor_get(c.t, unsafe.Pointer(&out[0]), 0, C.size_t(n*4))
 	}
 	return out
 }
 
 func (b *Backend) Ints(t engine.Tensor) []int32 {
+	b.flush()
 	x := as(t)
 	n := numel(x.shape)
 	out := make([]int32, n)
@@ -311,6 +505,7 @@ func (b *Backend) Ints(t engine.Tensor) []int32 {
 // Bytes and DTypeOf let the loader read a tensor back raw (engine.RawReader).
 func (b *Backend) DTypeOf(t engine.Tensor) engine.DType { return as(t).dt }
 func (b *Backend) Bytes(t engine.Tensor) []byte {
+	b.flush()
 	x := as(t)
 	n := int(C.ggml_nbytes(x.t))
 	out := make([]byte, n)
@@ -322,6 +517,7 @@ func (b *Backend) Bytes(t engine.Tensor) []byte {
 
 // Free releases tensors early (engine.Freer); the finalizer covers the rest.
 func (b *Backend) Free(ts ...engine.Tensor) {
+	b.flush() // a recorded node may still read what is being freed
 	for _, t := range ts {
 		if t != nil {
 			as(t).free()
@@ -540,6 +736,10 @@ func (b *Backend) Slice(x engine.Tensor, axis, start, end int) engine.Tensor {
 // embedding lookup (ggml_get_rows). Other axes go through a transpose.
 func (b *Backend) TakeAxis(a, indices engine.Tensor, axis int) engine.Tensor {
 	ta, ti := as(a), as(indices)
+	if ta.dropped {
+		panic("ggml: a weight's packed words were dropped after its Q4_1 repack; it was never gathered before")
+	}
+	ta.gathered = true
 	nd := len(ta.shape)
 	if axis < 0 {
 		axis += nd
@@ -686,11 +886,7 @@ func (b *Backend) RoPEFreqs(x engine.Tensor, dims int, traditional bool, scale f
 func (b *Backend) rope(tx *tensor, dims int, traditional bool, base, scale float32, offset int, freqs *tensor) engine.Tensor {
 	nd := len(tx.shape)
 	L := tx.shape[nd-2]
-	pos := make([]int32, L)
-	for i := range pos {
-		pos[i] = int32(offset + i)
-	}
-	tpos := as(b.FromInt32(pos, L))
+	tpos := b.positionsFor(offset, L)
 	mode := C.int(C.GGML_ROPE_TYPE_NEOX)
 	if traditional {
 		mode = C.GGML_ROPE_TYPE_NORMAL
@@ -718,15 +914,7 @@ func (b *Backend) SDPA(q, k, v engine.Tensor, scale float32, causal bool) engine
 	Dv := tv.shape[3]
 	var tmask *tensor
 	if causal {
-		m := make([]float32, Lk*Lq)
-		for i := 0; i < Lq; i++ {
-			for j := 0; j < Lk; j++ {
-				if j > i+(Lk-Lq) {
-					m[i*Lk+j] = float32(math.Inf(-1))
-				}
-			}
-		}
-		tmask = as(b.FromFloats(m, Lq, Lk))
+		tmask = b.maskFor(Lq, Lk)
 	}
 	shape := []int{B, H, Lq, Dv}
 	return b.op(engine.F32, shape, []*tensor{tq, tk, tv, tmask}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
@@ -740,6 +928,66 @@ func (b *Backend) SDPA(q, k, v engine.Tensor, scale float32, causal bool) engine
 		vT := C.ggml_cont(ctx, C.ggml_transpose(ctx, vv)) // ne (Lk, Dv, Hk, B)
 		return C.ggml_mul_mat(ctx, vT, p)                 // ne (Dv, Lq, H, B)
 	})
+}
+
+// positionsFor is the pinned I32 vector offset..offset+L, made once per
+// (offset, L): every layer of a step asks for the same one.
+func (b *Backend) positionsFor(offset, L int) *tensor {
+	b.mu.Lock()
+	t, ok := b.positions[[2]int{offset, L}]
+	b.mu.Unlock()
+	if ok {
+		return t
+	}
+	pos := make([]int32, L)
+	for i := range pos {
+		pos[i] = int32(offset + i)
+	}
+	t = as(b.FromInt32(pos, L))
+	t.pin = true
+	b.mu.Lock()
+	if len(b.positions) > 64 { // a decode step moves on: let the old ones go
+		b.flushLocked()
+		for _, old := range b.positions {
+			old.free()
+		}
+		b.positions = map[[2]int]*tensor{}
+	}
+	b.positions[[2]int{offset, L}] = t
+	b.mu.Unlock()
+	return t
+}
+
+// maskFor is the pinned causal mask [Lq, Lk] (0 kept, -inf above the
+// diagonal offset by Lk-Lq), made once per shape.
+func (b *Backend) maskFor(Lq, Lk int) *tensor {
+	b.mu.Lock()
+	t, ok := b.masks[[2]int{Lq, Lk}]
+	b.mu.Unlock()
+	if ok {
+		return t
+	}
+	m := make([]float32, Lk*Lq)
+	for i := 0; i < Lq; i++ {
+		for j := 0; j < Lk; j++ {
+			if j > i+(Lk-Lq) {
+				m[i*Lk+j] = float32(math.Inf(-1))
+			}
+		}
+	}
+	t = as(b.FromFloats(m, Lq, Lk))
+	t.pin = true
+	b.mu.Lock()
+	if len(b.masks) > 64 {
+		b.flushLocked()
+		for _, old := range b.masks {
+			old.free()
+		}
+		b.masks = map[[2]int]*tensor{}
+	}
+	b.masks[[2]int{Lq, Lk}] = t
+	b.mu.Unlock()
+	return t
 }
 
 // ---- affine 4-bit weights ----
@@ -789,23 +1037,38 @@ func (b *Backend) q4_1(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 	rows := numel(tw.shape) / P
 	const blk = 20 // sizeof(block_q4_1): 2+2+16
 	raw := make([]byte, rows*(in/32)*blk)
-	for r := 0; r < rows; r++ {
-		for blkIdx := 0; blkIdx < in/32; blkIdx++ {
-			g := (blkIdx * 32) / groupSize
-			o := (r*(in/32) + blkIdx) * blk
-			binary.LittleEndian.PutUint16(raw[o:], f32tof16(sc[r*G+g]))
-			binary.LittleEndian.PutUint16(raw[o+2:], f32tof16(bi[r*G+g]))
-			for j := 0; j < 32; j++ {
-				e := blkIdx*32 + j
-				q := byte((uint32(words[r*P+e/8]) >> uint((e%8)*4)) & 0xF)
-				if j < 16 {
-					raw[o+4+j] |= q
-				} else {
-					raw[o+4+j-16] |= q << 4
+	// Rows are independent: one goroutine per slice of them (the repack of
+	// a whole model is done once, at the first use of each weight).
+	var wg sync.WaitGroup
+	workers := runtime.NumCPU()
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for r := w; r < rows; r += workers {
+				for blkIdx := 0; blkIdx < in/32; blkIdx++ {
+					g := (blkIdx * 32) / groupSize
+					o := (r*(in/32) + blkIdx) * blk
+					binary.LittleEndian.PutUint16(raw[o:], f32tof16(sc[r*G+g]))
+					binary.LittleEndian.PutUint16(raw[o+2:], f32tof16(bi[r*G+g]))
+					// Eight nibbles per word, element j of the block at bits 4*(j%8).
+					for wi := 0; wi < 4; wi++ {
+						word := uint32(words[r*P+blkIdx*4+wi])
+						for k := 0; k < 8; k++ {
+							j := wi*8 + k
+							q := byte((word >> uint(k*4)) & 0xF)
+							if j < 16 {
+								raw[o+4+j] |= q
+							} else {
+								raw[o+4+j-16] |= q << 4
+							}
+						}
+					}
 				}
 			}
-		}
+		}(w)
 	}
+	wg.Wait()
 	shape := append([]int(nil), tw.shape...)
 	shape[len(shape)-1] = in
 	ctx := C.janis_ctx(ctxMem)
@@ -813,8 +1076,14 @@ func (b *Backend) q4_1(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 	t := C.janis_new(ctx, C.GGML_TYPE_Q4_1, n[0], n[1], n[2], n[3])
 	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
 	C.ggml_backend_tensor_set(t, unsafe.Pointer(&raw[0]), 0, C.size_t(len(raw)))
-	q := &tensor{t: t, ctx: ctx, buf: buf, shape: shape, dt: engine.F16}
+	q := &tensor{t: t, ctx: ctx, buf: buf, shape: shape, dt: engine.F16, pin: true}
 	tw.q4 = q
+	if !tw.gathered && tw.buf != nil {
+		// The words are not needed again: one copy of the weight, not two.
+		C.ggml_backend_buffer_free(tw.buf)
+		C.ggml_free(tw.ctx)
+		tw.buf, tw.ctx, tw.t, tw.dropped = nil, nil, nil, true
+	}
 	return q
 }
 
