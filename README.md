@@ -39,6 +39,47 @@ opens it to the network. Memdoor connects it with
 `memdoor connect local --base http://localhost:8090/v1`, no key, on this
 machine or on a box reached over ssh.
 
+### Decisions (a local Jev)
+
+The same server answers typed questions the way a System One / Jev decision
+model does, on the loaded model: `POST /v1/systemone` takes one piece of
+state and questions about it, and answers each from a single prefill, the
+probability read off the model's next-token distribution over the option
+letters. No decoding, no prose to parse, a few tens of milliseconds a
+question.
+
+```bash
+curl -s localhost:8090/v1/systemone -H 'Content-Type: application/json' -d '{
+  "state": "func add(a, b int) int { return a + b }",
+  "questions": {
+    "relevant": {"type": "noul",   "instructions": "Is this about the add function?",
+                 "criteria": {"true": "it is", "false": "it is about something else"}},
+    "kind":     {"type": "choice", "instructions": "What kind of code is this?",
+                 "criteria": {"test": "a test", "impl": "an implementation", "doc": "documentation"}},
+    "clarity":  {"type": "score",  "instructions": "How clear is it?",
+                 "criteria": ["unclear", "fine", "clear"]}}}'
+```
+
+```json
+{"model":"Qwen3-8B-4bit","answers":{
+  "relevant":{"type":"noul","noul":0.93,"confidence":0.93},
+  "kind":{"type":"choice","choice":"impl","probabilities":{"doc":0.02,"impl":0.95,"test":0.03},"confidence":0.95},
+  "clarity":{"type":"score","score":1.8,"probabilities":{"0":0.05,"1":0.1,"2":0.85},"confidence":0.85}}}
+```
+
+Three question types: `noul` answers P(yes) (its `criteria` may spell out what
+true and false mean); `choice` picks one of the labelled `criteria` and gives
+the distribution; `score` places the state on an ordered rubric, `score`
+being the expected zero-based level. A `model` in the request is honoured
+when it names an installed model, otherwise the loaded one answers. The same
+call from Go is `engine.Decide(state, questions)` (`decide.go`).
+
+Memdoor uses this as its decision model: `memdoor connect local` on a janis
+keeps `local-decisions` next to the chat provider, and from the next gateway
+start the turn's effort, the tool routing, the judged reads and the stop
+verdict are decided here, with no key. The numbers above are illustrative;
+a 0.6B model answers the wire but judges poorly, an 8B is the sensible floor.
+
 ## Build
 
 Apple Silicon with MLX:
