@@ -1130,7 +1130,7 @@ func (b *Backend) packed(x, tw, ts, tb *tensor, groupSize, bits int) *tensor {
 				maxAbs = v
 			}
 		}
-		if maxAbs > q8Threshold {
+		if maxAbs > q8Threshold || forceQ8 {
 			if check || trace {
 				fmt.Fprintf(os.Stderr, "ggml: weight %v kept as Q8_0 (its input reaches %.4g)\n", tw.shape, maxAbs)
 			}
@@ -1142,7 +1142,10 @@ func (b *Backend) packed(x, tw, ts, tb *tensor, groupSize, bits int) *tensor {
 
 // q8Threshold is the input magnitude past which a weight is kept as Q8_0:
 // half of where the q8_1 block sum overflows, with room for later tokens.
+// JANIS_GGML_Q8=1 keeps every dense weight as Q8_0 (for measuring).
 const q8Threshold = 1024
+
+var forceQ8 = os.Getenv("JANIS_GGML_Q8") == "1"
 
 // q8_0 repacks an affine 4-bit weight into ggml's Q8_0 (blocks of 32: f16
 // scale d, 32 int8): each value q*scale+bias rounded to d = max|v|/127,
@@ -1268,6 +1271,37 @@ func (b *Backend) q4_1(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 		}(w)
 	}
 	wg.Wait()
+	if check {
+		// Dequantize the blocks back and compare with the source: a bad row
+		// in the matmul is either here or in the kernel.
+		worst, worstRow, nan := 0.0, -1, 0
+		for r := 0; r < rows; r++ {
+			for blkIdx := 0; blkIdx < in/32; blkIdx++ {
+				o := (r*(in/32) + blkIdx) * blk
+				d := float64(f16tof32(binary.LittleEndian.Uint16(raw[o:])))
+				m := float64(f16tof32(binary.LittleEndian.Uint16(raw[o+2:])))
+				g := (blkIdx * 32) / groupSize
+				for j := 0; j < 32; j++ {
+					var q byte
+					if j < 16 {
+						q = raw[o+4+j] & 0xF
+					} else {
+						q = raw[o+4+j-16] >> 4
+					}
+					got := d*float64(q) + m
+					e := blkIdx*32 + j
+					src := float64((uint32(words[r*P+e/8])>>uint((e%8)*4))&0xF)*float64(sc[r*G+g]) + float64(bi[r*G+g])
+					if math.IsNaN(got) || math.IsInf(got, 0) {
+						nan++
+					}
+					if diff := math.Abs(got - src); diff > worst {
+						worst, worstRow = diff, r
+					}
+				}
+			}
+		}
+		fmt.Fprintf(os.Stderr, "ggml check: Q4_1 repack of %v: %d NaN/Inf, worst |repack-source| %.3g at row %d\n", tw.shape, nan, worst, worstRow)
+	}
 	shape := append([]int(nil), tw.shape...)
 	shape[len(shape)-1] = in
 	ctx := C.janis_ctx(ctxMem)
@@ -1368,6 +1402,30 @@ func (b *Backend) Conv1dDepthwise(x, w engine.Tensor) engine.Tensor {
 }
 func (b *Backend) GatedDeltaScan(q, k, v, g, beta, state engine.Tensor) (engine.Tensor, engine.Tensor) {
 	panic("ggml: GatedDeltaScan is not implemented in the spike")
+}
+
+func f16tof32(h uint16) float32 {
+	sign := uint32(h>>15) << 31
+	exp := int((h >> 10) & 0x1F)
+	mant := uint32(h & 0x3FF)
+	switch {
+	case exp == 0:
+		if mant == 0 {
+			return math.Float32frombits(sign)
+		}
+		return math.Float32frombits(sign) + float32(math.Ldexp(float64(mant), -24))*func() float32 {
+			if sign != 0 {
+				return -1
+			}
+			return 1
+		}()
+	case exp == 31:
+		if mant == 0 {
+			return math.Float32frombits(sign | 0x7F800000)
+		}
+		return float32(math.NaN())
+	}
+	return math.Float32frombits(sign | uint32(exp+112)<<23 | mant<<13)
 }
 
 func f32tof16(f float32) uint16 {
