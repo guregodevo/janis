@@ -4,6 +4,7 @@ package ggml
 
 import (
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/guregodevo/janis/cpu"
@@ -178,5 +179,29 @@ func TestPinnedResultsLeaveTheirBatch(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("value %d changed after the batch was swept: %v vs %v", i, got[i], want[i])
 		}
+	}
+}
+
+// The KV cache is f16: attention over f16 keys and values, concatenated as
+// the cache grows, matches the oracle's f32 within f16's precision.
+func TestAttentionOverAnF16Cache(t *testing.T) {
+	g := New()
+	defer g.Close()
+	c := cpu.New()
+	q, k1, v1, k2, v2 := rnd(1*4*1*8, 111), rnd(1*2*5*8, 112), rnd(1*2*5*8, 113), rnd(1*2*1*8, 114), rnd(1*2*1*8, 115)
+	scale := float32(1.0 / math.Sqrt(8))
+	gk := g.Concat(g.Cast(g.FromFloats(k1, 1, 2, 5, 8), engine.F16), g.Cast(g.FromFloats(k2, 1, 2, 1, 8), engine.F16), 2)
+	gv := g.Concat(g.Cast(g.FromFloats(v1, 1, 2, 5, 8), engine.F16), g.Cast(g.FromFloats(v2, 1, 2, 1, 8), engine.F16), 2)
+	if gk.(*tensor).dt != engine.F16 || fmt.Sprint(gk.Shape()) != "[1 2 6 8]" {
+		t.Fatalf("the concatenated cache stays f16 and grows: %v %v", gk.(*tensor).dt, gk.Shape())
+	}
+	ck := c.Concat(c.FromFloats(k1, 1, 2, 5, 8), c.FromFloats(k2, 1, 2, 1, 8), 2)
+	cv := c.Concat(c.FromFloats(v1, 1, 2, 5, 8), c.FromFloats(v2, 1, 2, 1, 8), 2)
+	diffOK(t, "SDPA over an f16 cache (decode, GQA)", 5e-3,
+		g.Floats(g.SDPA(g.FromFloats(q, 1, 4, 1, 8), gk, gv, scale, true)),
+		c.Floats(c.SDPA(c.FromFloats(q, 1, 4, 1, 8), ck, cv, scale, true)))
+	// Truncate slices the cache; it stays f16.
+	if s := g.Slice(gk, 2, 0, 3); s.(*tensor).dt != engine.F16 || fmt.Sprint(s.Shape()) != "[1 2 3 8]" {
+		t.Fatalf("a sliced cache stays f16: %v %v", s.(*tensor).dt, s.Shape())
 	}
 }

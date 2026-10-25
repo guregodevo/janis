@@ -91,8 +91,8 @@ type arena struct {
 }
 
 const (
-	arenaCount = 4
-	arenaBytes = 256 << 20
+	arenaCount = 2
+	arenaBytes = 128 << 20
 )
 
 // A flush records at most this many results before computing: a decode
@@ -952,6 +952,11 @@ func (b *Backend) Concat(a, bb engine.Tensor, axis int) engine.Tensor {
 	}
 	shape := append([]int(nil), ta.shape...)
 	shape[axis] += tb.shape[axis]
+	if ta.dt == engine.F16 && tb.dt == engine.F16 { // the KV cache: kept at half the bytes
+		return b.op(engine.F16, shape, []*tensor{ta, tb}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+			return C.ggml_concat(ctx, ta.t, tb.t, C.int(nd-1-axis))
+		})
+	}
 	return b.op(engine.F32, shape, []*tensor{ta, tb}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		return C.ggml_concat(ctx, f32(ctx, ta), f32(ctx, tb), C.int(nd-1-axis))
 	})
@@ -1166,7 +1171,16 @@ func (b *Backend) SDPA(q, k, v engine.Tensor, scale float32, causal bool) engine
 	}
 	shape := []int{B, H, Lq, Dv}
 	return b.op(engine.F32, shape, []*tensor{tq, tk, tv, tmask}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-		qq, kk, vv := f32(ctx, tq), f32(ctx, tk), f32(ctx, tv)
+		// Keys and values may be f16 (the cache): mul_mat takes an f16
+		// first operand against f32 as it is, no cast over the whole cache.
+		qq := f32(ctx, tq)
+		kk, vv := tk.t, tv.t
+		if tk.dt != engine.F32 && tk.dt != engine.F16 {
+			kk = f32(ctx, tk)
+		}
+		if tv.dt != engine.F32 && tv.dt != engine.F16 {
+			vv = f32(ctx, tv)
+		}
 		kq := C.ggml_mul_mat(ctx, kk, qq) // ne (Lk, Lq, H, B)
 		var mask *C.struct_ggml_tensor
 		if tmask != nil {

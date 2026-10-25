@@ -62,7 +62,15 @@ func (c *KVCache) Tensors() []engine.Tensor {
 }
 
 // Update appends the new step's k/v and returns the full cached k/v.
+// Update appends this step's keys and values. A backend whose activations
+// are f32 (ggml) hands them over as f32; the cache keeps them as f16, half
+// the bytes over a long prompt (a 6k-token coder prompt on the 30B MoE is
+// 1.2 GB of f32 cache, more than an L4 has left). MLX hands over the
+// model's own dtype already and is left alone.
 func (c *KVCache) Update(b engine.Backend, kNew, vNew engine.Tensor) (engine.Tensor, engine.Tensor) {
+	if rr, ok := b.(engine.RawReader); ok && rr.DTypeOf(kNew) == engine.F32 {
+		kNew, vNew = b.Cast(kNew, engine.F16), b.Cast(vNew, engine.F16)
+	}
 	if c.K == nil {
 		c.K, c.V = kNew, vNew
 	} else {
