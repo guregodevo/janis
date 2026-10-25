@@ -155,8 +155,10 @@ func Open(modelDir string) (*Engine, error) {
 	if e.tok, err = tokenizer.New(modelDir); err != nil {
 		return nil, err
 	}
-	for _, id := range e.tok.Encode(chat.StopMarker(cfg.ModelType)) {
-		e.stops[id] = true
+	for _, marker := range []string{chat.StopMarker(cfg.ModelType), chat.EndOfTextMarker(cfg.ModelType)} {
+		for _, id := range e.tok.Encode(marker) {
+			e.stops[id] = true
+		}
 	}
 	for _, id := range cfg.EosTokens {
 		e.stops[id] = true

@@ -42,6 +42,21 @@ func ApplyTemplate(modelType string, msgs []Message) string {
 	}
 }
 
+// EndOfTextMarker is the family's end-of-text token, the one the base model
+// was trained to stop on: a chat model may still draw it (Qwen3-Coder did,
+// under sampling, in place of a one-word answer), and it decodes to
+// nothing, so it must count as a stop and not as a word.
+func EndOfTextMarker(modelType string) string {
+	switch modelType {
+	case "gemma2":
+		return "<eos>"
+	case "llama":
+		return "<|end_of_text|>"
+	default:
+		return "<|endoftext|>"
+	}
+}
+
 // StopMarker is the string that ends an assistant turn for the model family;
 // the server tokenizes it to derive the stop token id.
 func StopMarker(modelType string) string {
