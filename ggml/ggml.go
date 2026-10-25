@@ -952,9 +952,12 @@ func (b *Backend) Concat(a, bb engine.Tensor, axis int) engine.Tensor {
 	}
 	shape := append([]int(nil), ta.shape...)
 	shape[axis] += tb.shape[axis]
-	if ta.dt == engine.F16 && tb.dt == engine.F16 { // the KV cache: kept at half the bytes
+	if ta.dt == engine.F16 && tb.dt == engine.F16 {
+		// The KV cache, kept at half the bytes. CUDA's concat takes f32
+		// only (Metal and the CPU take f16), so the join is done in f32 and
+		// cast back: the same one pass over the cache a concat is.
 		return b.op(engine.F16, shape, []*tensor{ta, tb}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-			return C.ggml_concat(ctx, ta.t, tb.t, C.int(nd-1-axis))
+			return C.ggml_cast(ctx, C.ggml_concat(ctx, f32(ctx, ta), f32(ctx, tb), C.int(nd-1-axis)), C.GGML_TYPE_F16)
 		})
 	}
 	return b.op(engine.F32, shape, []*tensor{ta, tb}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
