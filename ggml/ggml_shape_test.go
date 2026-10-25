@@ -61,3 +61,22 @@ func TestGatherQuantMatmulMatchesCPU(t *testing.T) {
 		t.Fatalf("shape [lead…, K, 1, out]: %v", got)
 	}
 }
+
+// An 8-bit affine weight (the MoE routers) has no ggml block type: it goes
+// to the device as f16 and must still match the oracle.
+func TestEightBitWeightsMatchCPU(t *testing.T) {
+	g := New()
+	defer g.Close()
+	c := cpu.New()
+	const out, in, gs, bits = 16, 128, 64, 8
+	P, G := in*bits/32, in/gs
+	raw := rndPackedU32(out*P, 41)
+	sc, bi := rnd(out*G, 42), rnd(out*G, 43)
+	x := rnd(3*in, 44)
+	gW, cW := g.FromRaw(engine.U32, raw, out, P), c.FromRaw(engine.U32, raw, out, P)
+	gS, gB := g.FromFloats(sc, out, G), g.FromFloats(bi, out, G)
+	cS, cB := c.FromFloats(sc, out, G), c.FromFloats(bi, out, G)
+	relOK(t, "QuantMatmul 8-bit (f16 on the device)", 5e-3,
+		g.Floats(g.QuantMatmul(g.FromFloats(x, 1, 3, in), gW, gS, gB, true, gs, bits)),
+		c.Floats(c.QuantMatmul(c.FromFloats(x, 1, 3, in), cW, cS, cB, true, gs, bits)))
+}

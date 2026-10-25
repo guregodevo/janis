@@ -1036,7 +1036,7 @@ func (b *Backend) q4_1(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 		return tw.q4
 	}
 	if bits != 4 || groupSize%32 != 0 {
-		panic(fmt.Sprintf("ggml: %d-bit group %d weights are not repackable to Q4_1", bits, groupSize))
+		return b.deviceF16(tw, ts, tb, groupSize, bits)
 	}
 	words := b.Ints(tw)
 	sc, bi := b.Floats(ts), b.Floats(tb)
@@ -1089,6 +1089,41 @@ func (b *Backend) q4_1(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 	tw.q4 = q
 	if !tw.gathered && tw.buf != nil {
 		// The words are not needed again: one copy of the weight, not two.
+		C.ggml_backend_buffer_free(tw.buf)
+		C.ggml_free(tw.ctx)
+		tw.buf, tw.ctx, tw.t, tw.dropped = nil, nil, nil, true
+	}
+	return q
+}
+
+// deviceF16 is the device copy of an affine weight ggml has no block type
+// for (8-bit with a bias: the MoE routers of the mlx-community checkpoints,
+// 128 by 2048 each): dequantized on the host and kept as f16, which ggml's
+// f16 matmul and mul_mat_id take. Built once, pinned, kept in q4 like the
+// Q4_1 repack; the packed words go the same way after.
+func (b *Backend) deviceF16(tw, ts, tb *tensor, groupSize, bits int) *tensor {
+	words := b.Ints(tw)
+	sc, bi := b.Floats(ts), b.Floats(tb)
+	valsPerWord := 32 / bits
+	mask := uint32((1 << bits) - 1)
+	P := tw.shape[len(tw.shape)-1]
+	in := P * valsPerWord
+	G := ts.shape[len(ts.shape)-1]
+	rows := numel(tw.shape) / P
+	raw := make([]byte, rows*in*2)
+	for r := 0; r < rows; r++ {
+		for j := 0; j < in; j++ {
+			q := (uint32(words[r*P+j/valsPerWord]) >> uint((j%valsPerWord)*bits)) & mask
+			g := j / groupSize
+			binary.LittleEndian.PutUint16(raw[(r*in+j)*2:], f32tof16(float32(q)*sc[r*G+g]+bi[r*G+g]))
+		}
+	}
+	shape := append([]int(nil), tw.shape...)
+	shape[len(shape)-1] = in
+	q := b.newFrom(engine.F16, shape, unsafe.Pointer(&raw[0]), len(raw))
+	q.pin = true
+	tw.q4 = q
+	if !tw.gathered && tw.buf != nil {
 		C.ggml_backend_buffer_free(tw.buf)
 		C.ggml_free(tw.ctx)
 		tw.buf, tw.ctx, tw.t, tw.dropped = nil, nil, nil, true
