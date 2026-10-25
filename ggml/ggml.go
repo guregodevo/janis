@@ -1057,6 +1057,23 @@ func (b *Backend) Dequantize(w, scales, biases engine.Tensor, groupSize, bits in
 	return b.FromFloats(out, shape...)
 }
 
+// rangeCheck (under JANIS_GGML_CHECK) reports affine parameters f16 cannot
+// hold: a NaN, an infinity, or a magnitude past 65504 becomes Inf in a
+// Q4_1 block and NaN in the matmul.
+func rangeCheck(what string, shape []int, vals []float32) {
+	bad, maxAbs := 0, 0.0
+	for _, v := range vals {
+		f := float64(v)
+		if math.IsNaN(f) || math.IsInf(f, 0) || math.Abs(f) > 65504 {
+			bad++
+		}
+		if a := math.Abs(f); a > maxAbs && !math.IsInf(f, 0) && !math.IsNaN(f) {
+			maxAbs = a
+		}
+	}
+	fmt.Fprintf(os.Stderr, "ggml check: %s of %v: %d of %d outside f16, max |v| %.4g\n", what, shape, bad, len(vals), maxAbs)
+}
+
 // q4_1 repacks a 4-bit, group-64-or-32 affine weight [out, in] into ggml's
 // Q4_1 (blocks of 32: f16 scale d, f16 min m, 16 bytes of nibbles, element
 // j in the low nibble of byte j for j<16 and the high nibble of byte j-16
@@ -1070,6 +1087,10 @@ func (b *Backend) q4_1(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 	}
 	words := b.Ints(tw)
 	sc, bi := b.Floats(ts), b.Floats(tb)
+	if check {
+		rangeCheck("scales", tw.shape, sc)
+		rangeCheck("biases", tw.shape, bi)
+	}
 	P := tw.shape[len(tw.shape)-1]
 	in := P * 8
 	G := ts.shape[len(ts.shape)-1]
