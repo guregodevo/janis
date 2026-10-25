@@ -548,12 +548,45 @@ func (b *Backend) PinAll() {
 	}
 }
 
+// Pin marks survivors (the KV caches, the logits) and moves each out of
+// its batch into a buffer of its own: a batch holds every intermediate of
+// its graph, and a survivor that stayed in it would keep hundreds of
+// megabytes alive for a step or longer (the 30B MoE ran the L4 out of
+// memory loading its last experts while the caches held the prefill's
+// batches). The copy is device to device and the caches are small.
 func (b *Backend) Pin(ts ...engine.Tensor) {
 	for _, t := range ts {
-		if t != nil {
-			as(t).pin = true
+		if t == nil {
+			continue
 		}
+		x := as(t)
+		x.pin = true
+		b.own(x)
 	}
+}
+
+// own gives a batched result its own buffer. Anything recorded against the
+// old node is computed first, so no pending graph refers to it after.
+func (b *Backend) own(x *tensor) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if x.grp == nil && x.t != nil && x.t.data == nil {
+		b.flushLocked() // pending: computed now, into a batch
+	}
+	if x.grp == nil || x.t == nil {
+		return
+	}
+	ctx := C.janis_ctx(ctxMem)
+	n := ne(x.shape)
+	t := C.janis_new(ctx, x.t._type, n[0], n[1], n[2], n[3])
+	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+	if buf == nil {
+		C.ggml_free(ctx)
+		return // no room for the copy: it stays in its batch
+	}
+	C.ggml_backend_tensor_copy(x.t, t)
+	x.grp.release()
+	x.grp, x.t, x.ctx, x.buf = nil, t, ctx, buf
 }
 
 func (b *Backend) Unpin(ts ...engine.Tensor) {

@@ -156,3 +156,27 @@ func TestAnOutlierInputKeepsTheWeightExact(t *testing.T) {
 		t.Fatalf("the weight that met the outlier is Q8_0, got type %d", int(gW.(*tensor).q4.t._type))
 	}
 }
+
+// A pinned result leaves its batch (its own buffer, the same values) and
+// is still right in a later graph after the batch's other results are
+// swept.
+func TestPinnedResultsLeaveTheirBatch(t *testing.T) {
+	g := New()
+	defer g.Close()
+	a := g.FromFloats(rnd(64, 101), 8, 8)
+	sq := g.Mul(a, a) // a result in a batch, with others
+	tmp := g.SiLU(a)  // the same batch
+	g.Eval(sq, tmp)
+	want := g.Floats(sq)
+	g.Pin(sq)
+	if x := sq.(*tensor); x.grp != nil || x.buf == nil {
+		t.Fatalf("pinned: own buffer, no batch: grp=%v buf=%v", x.grp, x.buf)
+	}
+	g.Sweep() // frees tmp and the batch
+	got := g.Floats(g.Add(sq, g.FromFloats(make([]float32, 64), 8, 8)))
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("value %d changed after the batch was swept: %v vs %v", i, got[i], want[i])
+		}
+	}
+}
