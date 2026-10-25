@@ -68,6 +68,11 @@ type Backend struct {
 
 	rec     *C.struct_ggml_context // the recording context: nodes not yet computed
 	pending []*tensor              // their result tensors, in order
+	// extra are nodes the next flush must run before the results: the
+	// writes of new keys and values into a cache's spare room, which no
+	// result depends on through the graph. extraDeps keeps what they read.
+	extra     []*C.struct_ggml_tensor
+	extraDeps []*tensor
 	// tracked is every tensor made since Open, weakly: Sweep frees the ones
 	// that are alive and not pinned; a collected one needs nothing.
 	tracked map[weak.Pointer[tensor]]struct{}
@@ -198,6 +203,7 @@ type tensor struct {
 	// the Q4_1 copy alone.
 	gathered bool
 	dropped  bool // the words are gone: only QuantMatmul may use it now
+	cacheLen int  // a cache view: tokens in use along the token axis
 }
 
 type quantCall struct{ groupSize, bits int }
@@ -209,6 +215,10 @@ type batch struct {
 	buf  C.ggml_backend_buffer_t // its own buffer, when no arena took it
 	in   *arena                  // the arena it lives in, else nil
 	refs int
+	// A cache buffer: base is the f16 tensor holding the whole capacity,
+	// every cache tensor a view of a prefix of it; Pin leaves it in place.
+	base *C.struct_ggml_tensor
+	cap  int // capacity along the token axis
 }
 
 func (g *batch) release() {
@@ -395,7 +405,7 @@ func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx
 // its sources would make a later graph walk (and recompute) the whole
 // history across every earlier context. Called with b.mu held.
 func (b *Backend) flushLocked() {
-	if len(b.pending) == 0 {
+	if (len(b.pending) == 0 && len(b.extra) == 0) || b.rec == nil {
 		return
 	}
 	ctx, pending := b.rec, b.pending
@@ -408,6 +418,11 @@ func (b *Backend) flushLocked() {
 	}
 	t1 := time.Now()
 	g := C.ggml_new_graph_custom(ctx, maxNodes, false)
+	extra, extraDeps := b.extra, b.extraDeps
+	b.extra, b.extraDeps = nil, nil
+	for _, e := range extra {
+		C.ggml_build_forward_expand(g, e) // first in the graph: the cache writes
+	}
 	for _, p := range pending {
 		// Every result may be read later, by a later graph or by the host:
 		// an output. A backend's op fusion (ggml-cuda folds a SiLU into the
@@ -419,6 +434,7 @@ func (b *Backend) flushLocked() {
 	}
 	t2 := time.Now()
 	st := C.ggml_backend_graph_compute(b.be, g)
+	runtime.KeepAlive(extraDeps)
 	if check {
 		for _, p := range pending {
 			if p.dt != engine.F32 {
@@ -667,8 +683,8 @@ func (b *Backend) own(x *tensor) {
 	if x.grp == nil && x.t != nil && x.t.data == nil {
 		b.flushLocked() // pending: computed now, into a batch
 	}
-	if x.grp == nil || x.t == nil {
-		return
+	if x.grp == nil || x.t == nil || x.grp.base != nil {
+		return // a leaf, or a cache view: both already own their memory
 	}
 	ctx := C.janis_ctx(ctxMem)
 	n := ne(x.shape)
@@ -952,17 +968,87 @@ func (b *Backend) Concat(a, bb engine.Tensor, axis int) engine.Tensor {
 	}
 	shape := append([]int(nil), ta.shape...)
 	shape[axis] += tb.shape[axis]
-	if ta.dt == engine.F16 && tb.dt == engine.F16 {
-		// The KV cache, kept at half the bytes. CUDA's concat takes f32
-		// only (Metal and the CPU take f16), so the join is done in f32 and
-		// cast back: the same one pass over the cache a concat is.
-		return b.op(engine.F16, shape, []*tensor{ta, tb}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-			return C.ggml_cast(ctx, C.ggml_concat(ctx, f32(ctx, ta), f32(ctx, tb), C.int(nd-1-axis)), C.GGML_TYPE_F16)
-		})
+	if ta.dt == engine.F16 && tb.dt == engine.F16 && axis == nd-2 {
+		return b.appendCache(ta, tb, axis)
 	}
 	return b.op(engine.F32, shape, []*tensor{ta, tb}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		return C.ggml_concat(ctx, f32(ctx, ta), f32(ctx, tb), C.int(nd-1-axis))
 	})
+}
+
+// appendCache is Concat for the f16 KV cache along its token axis, in
+// place: the cache lives in a buffer with spare room (cacheGrow tokens
+// beyond what is used), the new keys or values are copied into that room
+// by a node the next flush runs first, and the result is a view of the
+// longer prefix sharing the buffer. No pass over the whole cache a step,
+// no old and new copies alive at once; a cache that has no room, or that
+// came from somewhere else (a slice, the first step), moves into a new
+// buffer first. The old view stays valid: it covers the prefix only.
+func (b *Backend) appendCache(ta, tb *tensor, axis int) engine.Tensor {
+	n, m := ta.shape[axis], tb.shape[axis]
+	need := n + m
+	shape := append([]int(nil), ta.shape...)
+	shape[axis] = need
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.rec == nil {
+		b.rec = C.janis_ctx(C.size_t(C.ggml_tensor_overhead())*maxNodes + C.ggml_graph_overhead_custom(maxNodes, false))
+	}
+	grp := ta.grp
+	if grp == nil || grp.base == nil || ta.cacheLen != n || grp.cap < need {
+		// A new buffer with room: the old cache is copied in by the flush.
+		capShape := append([]int(nil), shape...)
+		capShape[axis] = need + cacheGrow
+		// The buffer's context also holds every prefix view made over its
+		// life (one a step, up to cacheGrow of them): it must outlive the
+		// recording contexts those steps flush.
+		ctx := C.janis_ctx(ctxMem + C.size_t(C.ggml_tensor_overhead())*(cacheGrow+64))
+		cne := ne(capShape)
+		base := C.janis_new(ctx, C.GGML_TYPE_F16, cne[0], cne[1], cne[2], cne[3])
+		buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+		if buf == nil {
+			C.ggml_free(ctx)
+			panic("ggml: no room on the device for the cache")
+		}
+		grp = &batch{ctx: ctx, buf: buf, base: base, cap: capShape[axis]}
+		b.writeCache(grp, ta, 0)
+	}
+	b.writeCache(grp, tb, n)
+	out := &tensor{shape: shape, dt: engine.F16, grp: grp, cacheLen: need}
+	grp.refs++
+	out.t = b.cacheView(grp, shape)
+	b.mu.Unlock()
+	b.track(out)
+	b.mu.Lock()
+	return out
+}
+
+// cacheGrow is the spare room a cache buffer is made with, in tokens.
+const cacheGrow = 256
+
+// cacheView is a view of the first shape[axis] tokens of a cache buffer.
+func (b *Backend) cacheView(grp *batch, shape []int) *C.struct_ggml_tensor {
+	m := ne(shape)
+	base := grp.base
+	v := C.ggml_view_4d(grp.ctx, base, m[0], m[1], m[2], m[3], base.nb[1], base.nb[2], base.nb[3], 0)
+	C.ggml_backend_view_init(v)
+	return v
+}
+
+// writeCache records the copy of x into the cache buffer at token offset
+// off along the token axis (nd-2, ggml's ne1), to run first in the next
+// flush.
+func (b *Backend) writeCache(grp *batch, x *tensor, off int) {
+	m := ne(x.shape)
+	base := grp.base
+	dst := C.ggml_view_4d(b.rec, base, m[0], m[1], m[2], m[3], base.nb[1], base.nb[2], base.nb[3], C.size_t(off)*C.size_t(base.nb[1]))
+	C.ggml_backend_view_init(dst)
+	srcT := x.t
+	if x.dt != engine.F16 {
+		srcT = C.ggml_cast(b.rec, srcT, C.GGML_TYPE_F16)
+	}
+	b.extra = append(b.extra, C.ggml_cpy(b.rec, srcT, dst))
+	b.extraDeps = append(b.extraDeps, x)
 }
 
 func (b *Backend) Slice(x engine.Tensor, axis, start, end int) engine.Tensor {

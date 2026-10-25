@@ -205,3 +205,39 @@ func TestAttentionOverAnF16Cache(t *testing.T) {
 		t.Fatalf("a sliced cache stays f16: %v %v", s.(*tensor).dt, s.Shape())
 	}
 }
+
+// The cache grows a token at a time past its spare room, is truncated and
+// grown again, and reads back exactly what the oracle's concatenations hold.
+func TestTheCacheGrowsInPlace(t *testing.T) {
+	g := New()
+	defer g.Close()
+	c := cpu.New()
+	var gk, ck engine.Tensor
+	for i := 0; i < cacheGrow+40; i++ {
+		step := rnd(1*2*1*8, int64(1000+i))
+		gs, cs := g.Cast(g.FromFloats(step, 1, 2, 1, 8), engine.F16), c.FromFloats(step, 1, 2, 1, 8)
+		if gk == nil {
+			gk, ck = gs, cs
+			continue
+		}
+		gk, ck = g.Concat(gk, gs, 2), c.Concat(ck, cs, 2)
+		if i%97 == 0 {
+			g.Pin(gk)
+			g.Eval(gk)
+			g.Sweep()
+			g.Unpin(gk)
+		}
+	}
+	if fmt.Sprint(gk.Shape()) != fmt.Sprint(ck.Shape()) {
+		t.Fatalf("shapes: %v vs %v", gk.Shape(), ck.Shape())
+	}
+	diffOK(t, "cache after growth past its room", 2e-3, g.Floats(gk), c.Floats(ck))
+	// Truncate, then append: a copy, a new buffer, the same values.
+	gk, ck = g.Slice(gk, 2, 0, 100), c.Slice(ck, 2, 0, 100)
+	more := rnd(1*2*3*8, 5000)
+	gk, ck = g.Concat(gk, g.Cast(g.FromFloats(more, 1, 2, 3, 8), engine.F16), 2), c.Concat(ck, c.FromFloats(more, 1, 2, 3, 8), 2)
+	diffOK(t, "cache after truncate and append", 2e-3, g.Floats(gk), c.Floats(ck))
+	if gk.(*tensor).grp == nil || gk.(*tensor).grp.base == nil || gk.(*tensor).cacheLen != 103 {
+		t.Fatalf("a cache view with its buffer: %+v", gk.(*tensor))
+	}
+}
