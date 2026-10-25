@@ -1226,7 +1226,7 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 // attention outputs have such channels (the 30B MoE answered NaN logits on
 // the L4; argmax hid it, sampling did not). A power of two keeps the
 // scaling exact and the 8-bit quantization relative, so nothing else moves.
-const q8Headroom = 128
+const q8Headroom = 128.0
 
 // GatherQuantMatmul is the MoE expert matmul on ggml_mul_mat_id: w, scales
 // and biases are the stack [E, out, in] (repacked once to Q4_1, ne =
