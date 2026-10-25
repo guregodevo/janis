@@ -162,6 +162,7 @@ type tensor struct {
 	shape []int
 	dt    engine.DType
 	where string  // the op's call site, kept when tracing or checking
+	quant *quantCall // set on a QuantMatmul result: what a dump needs to replay it
 	q4    *tensor // the Q4_1 repack of a packed weight, built once
 	pin   bool    // survives Sweep
 	freed bool
@@ -171,6 +172,8 @@ type tensor struct {
 	gathered bool
 	dropped  bool // the words are gone: only QuantMatmul may use it now
 }
+
+type quantCall struct{ groupSize, bits int }
 
 // batch is one flushed graph's context and buffer, shared by its results and
 // released when the last of them goes.
@@ -423,6 +426,9 @@ func (b *Backend) flushLocked() {
 						fmt.Fprintf(os.Stderr, "ggml check:   input %v: %d NaN/Inf, max |v| %.4g, values at the bad indices %v\n", d.shape, dbad, maxAbs, atv)
 					}
 				}
+				if p.quant != nil {
+					b.dumpQuantCall(p)
+				}
 				os.Exit(3)
 			}
 		}
@@ -453,6 +459,45 @@ func (b *Backend) flush() {
 	b.mu.Lock()
 	b.flushLocked()
 	b.mu.Unlock()
+}
+
+// dumpQuantCall writes a NaN-producing QuantMatmul's input and weight
+// (x, words, scales, biases, shapes) under /tmp/janis-nan, for
+// TestDumpedQuantMatmul to replay on each backend.
+func (b *Backend) dumpQuantCall(p *tensor) {
+	if len(p.deps) < 5 {
+		return
+	}
+	x, w, sc, bi := p.deps[0], p.deps[2], p.deps[3], p.deps[4]
+	if w.t == nil {
+		fmt.Fprintln(os.Stderr, "ggml check: the weight's words were dropped; no dump")
+		return
+	}
+	dir := "/tmp/janis-nan"
+	_ = os.MkdirAll(dir, 0o755)
+	write := func(name string, v any) {
+		f, err := os.Create(dir + "/" + name)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		_ = binary.Write(f, binary.LittleEndian, v)
+	}
+	write("x.f32", b.Floats(x))
+	write("w.u32", b.Ints(w))
+	write("scales.f32", b.Floats(sc))
+	write("biases.f32", b.Floats(bi))
+	meta := fmt.Sprintf(`{"x":%v,"w":%v,"scales":%v,"group_size":%d,"bits":%d}`, jsonInts(x.shape), jsonInts(w.shape), jsonInts(sc.shape), p.quant.groupSize, p.quant.bits)
+	_ = os.WriteFile(dir+"/meta.json", []byte(meta), 0o644)
+	fmt.Fprintf(os.Stderr, "ggml check: dumped the call to %s (%s)\n", dir, meta)
+}
+
+func jsonInts(v []int) string {
+	parts := make([]string, len(v))
+	for i, d := range v {
+		parts[i] = fmt.Sprint(d)
+	}
+	return "[" + strings.Join(parts, ",") + "]"
 }
 
 // trace (JANIS_GGML_TRACE=1) prints every op as it is recorded; timing
@@ -1311,7 +1356,7 @@ func (b *Backend) q4_1(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 	C.ggml_backend_tensor_set(t, unsafe.Pointer(&raw[0]), 0, C.size_t(len(raw)))
 	q := &tensor{t: t, ctx: ctx, buf: buf, shape: shape, dt: engine.F16, pin: true}
 	tw.q4 = q
-	if !tw.gathered && tw.buf != nil {
+	if !tw.gathered && tw.buf != nil && !check {
 		// The words are not needed again: one copy of the weight, not two.
 		C.ggml_backend_buffer_free(tw.buf)
 		C.ggml_free(tw.ctx)
@@ -1364,9 +1409,11 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 	q := b.packed(tx, as(w), as(scales), as(biases), groupSize, bits)
 	nx := len(tx.shape)
 	shape := append(append([]int(nil), tx.shape[:nx-1]...), q.shape[0])
-	return b.op(engine.F32, shape, []*tensor{tx, q, as(w)}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+	out := b.op(engine.F32, shape, []*tensor{tx, q, as(w), as(scales), as(biases)}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		return C.ggml_mul_mat(ctx, q.t, f32(ctx, tx)) // ne (out, M, …)
 	})
+	out.quant = &quantCall{groupSize: groupSize, bits: bits}
+	return out
 }
 
 // GatherQuantMatmul is the MoE expert matmul on ggml_mul_mat_id: w, scales
