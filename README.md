@@ -1,9 +1,13 @@
 # janis
 
 Local inference for open-weight models — an Ollama for MLX. One Go module,
-no daemon, no Python: an MLX backend on Apple Silicon, a pure-Go CPU backend
-elsewhere, and what it takes to run a model on the machine in front of you.
+no Python: an MLX backend on Apple Silicon, a pure-Go CPU backend elsewhere,
+and what it takes to run a model on the machine in front of you. Use it as a
+library, or run `janis serve` and talk to it like llama.cpp or Ollama from any
+OpenAI-compatible client.
 
+- **serve, cmd/janis** — the OpenAI endpoints over the engine (`janis serve`,
+  `janis list`): models, chat completions streamed or not, tool calls.
 - **engine** — load a model, chat, stream, swap the loaded model live.
 - **qwen, qwen35, gemma** — model families (Qwen3, Qwen3.5 hybrid, Gemma).
 - **whisper, bge, reranker** — speech-to-text, embeddings, reranking.
