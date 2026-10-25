@@ -116,22 +116,9 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": cards})
 }
 
-// installedModels is the cache's chat models whose weights are there: a
-// snapshot a download left without a safetensors file is not served, so a
-// client never picks a model that cannot load.
-func installedModels() ([]hostfit.InstalledModel, error) {
-	all, err := hostfit.ListInstalled()
-	if err != nil {
-		return nil, err
-	}
-	out := all[:0]
-	for _, m := range all {
-		if w, _ := filepath.Glob(filepath.Join(m.Path, "*.safetensors")); len(w) > 0 {
-			out = append(out, m)
-		}
-	}
-	return out, nil
-}
+// installedModels is the cache's chat models whose weights are there
+// (hostfit leaves out a snapshot a download stopped short of).
+func installedModels() ([]hostfit.InstalledModel, error) { return hostfit.ListInstalled() }
 
 // contextLength is the model's own window, from its config.json; 0 when the
 // file does not say.

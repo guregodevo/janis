@@ -154,13 +154,20 @@ func ListInstalled() ([]InstalledModel, error) {
 	seen := map[string]bool{}
 	for _, dir := range matches {
 		name := nameFromPath(dir)
-		if name == "" || seen[name] || IsEmbeddingModel(name) {
+		if name == "" || seen[name] || IsEmbeddingModel(name) || !hasWeights(dir) {
 			continue
 		}
 		seen[name] = true
 		out = append(out, InstalledModel{Name: name, SizeBytes: dirSize(dir), Path: dir})
 	}
 	return out, nil
+}
+
+// hasWeights reports whether a snapshot holds a safetensors file: a download
+// that stopped at the config leaves a directory that lists but cannot load.
+func hasWeights(dir string) bool {
+	w, _ := filepath.Glob(filepath.Join(dir, "*.safetensors"))
+	return len(w) > 0
 }
 
 // IsEmbeddingModel reports whether a cached model is an embedder rather than a

@@ -1,6 +1,7 @@
 // Command janis runs the local models on this machine the way llama.cpp or
 // Ollama does, for any OpenAI-compatible client:
 //
+//	janis pull [NAME]                download a model (none: the one that fits this machine)
 //	janis list                       the installed models
 //	janis serve [--port N] [--model NAME] [--host ADDR]
 //
@@ -17,6 +18,7 @@ import (
 	"net/http"
 	"os"
 
+	llm "github.com/guregodevo/janis"
 	"github.com/guregodevo/janis/hostfit"
 	"github.com/guregodevo/janis/serve"
 )
@@ -29,6 +31,8 @@ func main() {
 	switch os.Args[1] {
 	case "list":
 		list()
+	case "pull":
+		pull(os.Args[2:])
 	case "serve":
 		run(os.Args[2:])
 	default:
@@ -38,7 +42,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: janis list | janis serve [--port 8090] [--host 127.0.0.1] [--model NAME]")
+	fmt.Fprintln(os.Stderr, "usage: janis pull [NAME] | janis list | janis serve [--port 8090] [--host 127.0.0.1] [--model NAME]")
 }
 
 func list() {
@@ -51,8 +55,9 @@ func list() {
 		fmt.Println("no model installed: janis serves the mlx-community models in ~/.cache/huggingface/hub")
 		return
 	}
+	host, _ := hostfit.Detect(llm.HasLocalEngine())
 	for _, m := range models {
-		fmt.Printf("%-40s %s\n", m.Name, hostfit.HumanSize(m.SizeBytes))
+		fmt.Printf("%s %-40s %s\n", host.Rate(m.Name).Flag(), m.Name, hostfit.HumanSize(m.SizeBytes))
 	}
 }
 

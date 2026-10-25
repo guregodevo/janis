@@ -26,8 +26,9 @@ for any OpenAI-compatible client, on `http://127.0.0.1:8090/v1`:
 
 ```bash
 go build -o janis ./cmd/janis
-./janis list                         # the installed mlx-community models
-./janis serve --model Qwen3-8B-4bit  # GET /v1/models, POST /v1/chat/completions
+./janis pull                         # the mlx-community model that fits this machine (or: pull Qwen3-8B-4bit)
+./janis list                         # the installed models, with whether each fits
+./janis serve                        # GET /v1/models, POST /v1/chat/completions
 ```
 
 Streamed or not, with tools: the schemas are rendered into the system prompt
