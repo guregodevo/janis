@@ -297,3 +297,26 @@ func TestDecisionsAnswerTheSystemOneWire(t *testing.T) {
 		t.Fatalf("a one-option choice is refused in words: %d %v", resp.StatusCode, v)
 	}
 }
+
+// The loaded model is listed first, so a client taking the first entry (a
+// probe, a default) gets the one answering now instead of forcing a swap.
+func TestTheLoadedModelIsListedFirst(t *testing.T) {
+	installFake(t, "Qwen3-8B-4bit", 40960)
+	home, _ := os.UserHomeDir()
+	for _, n := range []string{"A-first-1B", "Z-last-1B"} {
+		d := filepath.Join(home, ".cache/huggingface/hub/models--mlx-community--"+n+"/snapshots/abc")
+		_ = os.MkdirAll(d, 0o755)
+		_ = os.WriteFile(filepath.Join(d, "config.json"), []byte(`{}`), 0o644)
+		_ = os.WriteFile(filepath.Join(d, "model.safetensors"), []byte("x"), 0o644)
+	}
+	srv := newTestServer(t, &fakeEngine{reply: "ok"})
+	post(t, srv.URL+"/v1/chat/completions", `{"model":"Z-last-1B","messages":[{"role":"user","content":"hi"}]}`)
+	resp, _ := http.Get(srv.URL + "/v1/models")
+	var v struct {
+		Data []modelCard `json:"data"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&v)
+	if len(v.Data) != 3 || v.Data[0].ID != "Z-last-1B" {
+		t.Fatalf("loaded first: %+v", v.Data)
+	}
+}

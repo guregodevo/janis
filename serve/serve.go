@@ -113,6 +113,17 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	for _, m := range installed {
 		cards = append(cards, modelCard{ID: m.Name, Object: "model", Created: time.Now().Unix(), OwnedBy: "janis", ContextLength: contextLength(m.Path)})
 	}
+	// The loaded model first: a client that takes the first listed (a probe,
+	// a default) gets the one that answers now, not a swap to another.
+	s.mu.Lock()
+	loaded := s.name
+	s.mu.Unlock()
+	for i, c := range cards {
+		if c.ID == loaded && i > 0 {
+			cards = append([]modelCard{c}, append(cards[:i:i], cards[i+1:]...)...)
+			break
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": cards})
 }
 
