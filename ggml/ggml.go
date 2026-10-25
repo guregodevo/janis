@@ -332,6 +332,7 @@ func (b *Backend) newFrom(dt engine.DType, shape []int, raw unsafe.Pointer, size
 	n := ne(shape)
 	t := C.janis_new(ctx, ggmlType(dt), n[0], n[1], n[2], n[3])
 	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+	logAlloc("leaf", C.ggml_nbytes(t), shape)
 	if size > 0 {
 		C.ggml_backend_tensor_set(t, raw, 0, C.size_t(size))
 	}
@@ -435,6 +436,15 @@ func (b *Backend) flushLocked() {
 	in := b.placeInArena(ctx)
 	if in == nil {
 		buf = C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+		if memLog {
+			var total C.size_t
+			for t := C.ggml_get_first_tensor(ctx); t != nil; t = C.ggml_get_next_tensor(ctx, t) {
+				if t.view_src == nil {
+					total += C.ggml_nbytes(t)
+				}
+			}
+			logAlloc(fmt.Sprintf("batch of %d results (no arena free)", len(pending)), total, nil)
+		}
 	}
 	t1 := time.Now()
 	g := C.ggml_new_graph_custom(ctx, maxNodes, false)
@@ -1060,6 +1070,7 @@ func (b *Backend) appendCache(ta, tb *tensor, axis int) engine.Tensor {
 			panic("ggml: no room on the device for the cache")
 		}
 		grp = &batch{ctx: ctx, buf: buf, base: base, cap: capShape[axis]}
+		logAlloc("cache", C.ggml_nbytes(base), capShape)
 		b.writeCache(grp, ta, 0)
 	}
 	b.writeCache(grp, tb, n)
@@ -1089,7 +1100,16 @@ var (
 	}()
 	gcSync  = os.Getenv("JANIS_GGML_GCSYNC") == "1"
 	freeLog = os.Getenv("JANIS_GGML_FREELOG") == "1"
+	// memLog (JANIS_GGML_MEMLOG=1) prints every device allocation the
+	// backend makes, with its size and what it is for.
+	memLog = os.Getenv("JANIS_GGML_MEMLOG") == "1"
 )
+
+func logAlloc(what string, bytes C.size_t, shape []int) {
+	if memLog {
+		fmt.Fprintf(os.Stderr, "ggml alloc: %s %.1f MiB %v\n", what, float64(bytes)/(1<<20), shape)
+	}
+}
 
 // cacheView is a view of the first shape[axis] tokens of a cache buffer.
 func (b *Backend) cacheView(grp *batch, shape []int) *C.struct_ggml_tensor {
@@ -1551,6 +1571,7 @@ func (b *Backend) q8_0(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 	n := ne(shape)
 	t := C.janis_new(ctx, C.GGML_TYPE_Q8_0, n[0], n[1], n[2], n[3])
 	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+	logAlloc("Q8_0 weight", C.ggml_nbytes(t), shape)
 	C.ggml_backend_tensor_set(t, unsafe.Pointer(&raw[0]), 0, C.size_t(len(raw)))
 	q := &tensor{t: t, ctx: ctx, buf: buf, shape: shape, dt: engine.F16, pin: true}
 	tw.q4 = q
@@ -1654,6 +1675,7 @@ func (b *Backend) q4_1(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 	n := ne(shape)
 	t := C.janis_new(ctx, C.GGML_TYPE_Q4_1, n[0], n[1], n[2], n[3])
 	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+	logAlloc("Q4_1 weight", C.ggml_nbytes(t), shape)
 	C.ggml_backend_tensor_set(t, unsafe.Pointer(&raw[0]), 0, C.size_t(len(raw)))
 	q := &tensor{t: t, ctx: ctx, buf: buf, shape: shape, dt: engine.F16, pin: true}
 	tw.q4 = q
