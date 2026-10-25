@@ -373,6 +373,12 @@ func (b *Backend) flushLocked() {
 	t1 := time.Now()
 	g := C.ggml_new_graph_custom(ctx, maxNodes, false)
 	for _, p := range pending {
+		// Every result may be read later, by a later graph or by the host:
+		// an output. A backend's op fusion (ggml-cuda folds a SiLU into the
+		// multiply after it, a matmul into the add after it) skips writing
+		// a fused node's own buffer unless it is flagged so; without the
+		// flag the 30B MoE read never-written memory as its activations.
+		C.ggml_set_output(p.t)
 		C.ggml_build_forward_expand(g, p.t)
 	}
 	t2 := time.Now()
