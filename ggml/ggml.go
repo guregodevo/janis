@@ -523,15 +523,27 @@ func (b *Backend) placeInArena(ctx *C.struct_ggml_context) *arena {
 		return nil
 	}
 	tal := C.ggml_tallocr_new(a.buf)
+	var placed []*C.struct_ggml_tensor
 	for t := C.ggml_get_first_tensor(ctx); t != nil; t = C.ggml_get_next_tensor(ctx, t) {
 		if t.data != nil {
 			continue
 		}
+		var st C.enum_ggml_status
 		if t.view_src != nil {
-			C.ggml_backend_view_init(t)
-			continue
+			st = C.ggml_backend_view_init(t)
+		} else {
+			st = C.ggml_tallocr_alloc(&tal, t)
 		}
-		C.ggml_tallocr_alloc(&tal, t)
+		if st != C.GGML_STATUS_SUCCESS {
+			if check || trace {
+				fmt.Fprintf(os.Stderr, "ggml: arena placement failed (%d) for a tensor of %d bytes (view %v) after %d placed, need %d of %d\n", int(st), int(C.ggml_nbytes(t)), t.view_src != nil, len(placed), int(need), int(a.size))
+			}
+			for _, p := range placed { // undo, and let the batch take a buffer of its own
+				p.data, p.buffer = nil, nil
+			}
+			return nil
+		}
+		placed = append(placed, t)
 	}
 	return a
 }
