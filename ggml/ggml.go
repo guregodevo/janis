@@ -1212,7 +1212,7 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 	return b.op(engine.F32, shape, []*tensor{tx, q, as(w)}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		x := f32(ctx, tx)
 		if q.t._type == C.GGML_TYPE_Q4_1 {
-			x = C.ggml_scale(ctx, x, 1/q8Headroom) // ne (out, M, …)
+			x = C.ggml_scale(ctx, x, 1/q8Headroom)
 			return C.ggml_scale(ctx, C.ggml_mul_mat(ctx, q.t, x), q8Headroom)
 		}
 		return C.ggml_mul_mat(ctx, q.t, x)
@@ -1226,7 +1226,12 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 // attention outputs have such channels (the 30B MoE answered NaN logits on
 // the L4; argmax hid it, sampling did not). A power of two keeps the
 // scaling exact and the 8-bit quantization relative, so nothing else moves.
-const q8Headroom = 128.0
+var q8Headroom = func() C.float {
+	if os.Getenv("JANIS_GGML_HEADROOM") == "0" { // for measuring the overflow
+		return 1
+	}
+	return 128
+}()
 
 // GatherQuantMatmul is the MoE expert matmul on ggml_mul_mat_id: w, scales
 // and biases are the stack [E, out, in] (repacked once to Q4_1, ne =
