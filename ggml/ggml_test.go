@@ -127,12 +127,13 @@ func TestGGMLMatchesCPU(t *testing.T) {
 		c.Floats(c.RoPEFreqs(c.FromFloats(rp, 1, 2, 4, 8), 8, false, 1.0, 3, c.FromFloats(fr, half))))
 
 	// The Qwen3.5 hybrid's two ops: the causal depthwise conv over the packed
-	// projection (K=4, as the model's), and the gated delta-rule recurrence
-	// with key heads serving adjacent value heads (Hk=2, Hv=4, Dk=Dv=16).
-	cx, cw := rnd(1*7*6, 20), rnd(6*4*1, 21)
+	// projection (K=4 as the model's; 128 channels, the CUDA kernel's block),
+	// and the gated delta-rule recurrence with key heads serving adjacent
+	// value heads (Hk=2, Hv=4, Dk=Dv=16).
+	cx, cw := rnd(1*7*128, 20), rnd(128*4*1, 21)
 	diffOK(t, "Conv1dDepthwise", tol,
-		g.Floats(g.Conv1dDepthwise(g.FromFloats(cx, 1, 7, 6), g.FromFloats(cw, 6, 4, 1))),
-		c.Floats(c.Conv1dDepthwise(c.FromFloats(cx, 1, 7, 6), c.FromFloats(cw, 6, 4, 1))))
+		g.Floats(g.Conv1dDepthwise(g.FromFloats(cx, 1, 7, 128), g.FromFloats(cw, 128, 4, 1))),
+		c.Floats(c.Conv1dDepthwise(c.FromFloats(cx, 1, 7, 128), c.FromFloats(cw, 128, 4, 1))))
 	dq, dk, dv := rnd(1*5*2*16, 22), rnd(1*5*2*16, 23), rnd(1*5*4*16, 24)
 	dg, db, ds := rnd(1*5*4, 25), rnd(1*5*4, 26), rnd(1*4*16*16, 27)
 	for i := range dg {

@@ -1779,6 +1779,8 @@ func (b *Backend) GatherQuantMatmul(x, w, scales, biases, rhsIndices engine.Tens
 // and the Qwen3.5 hybrid share: x [B, L, C] with one filter per channel,
 // w [C, K, 1], stride 1, no padding -> [B, L-K+1, C] in f32. ggml wants the
 // input with time innermost ([L, C, B] in its order) and the filters as [K, C].
+// The CUDA kernel takes the channels 128 a block and asserts C is a multiple
+// of 128 (the hybrid's packed projection is 10240 wide on the 27B).
 func (b *Backend) Conv1dDepthwise(x, w engine.Tensor) engine.Tensor {
 	tx, tw := as(x), as(w)
 	B, L, Cn := tx.shape[0], tx.shape[1], tx.shape[2]
