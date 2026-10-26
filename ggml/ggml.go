@@ -1775,13 +1775,64 @@ func (b *Backend) GatherQuantMatmul(x, w, scales, biases, rhsIndices engine.Tens
 	})
 }
 
-// Conv1dDepthwise and GatedDeltaScan belong to the Qwen3.5 hybrid; not in
-// the spike (Qwen3 dense first).
+// Conv1dDepthwise is ggml_ssm_conv, the causal depthwise convolution Mamba
+// and the Qwen3.5 hybrid share: x [B, L, C] with one filter per channel,
+// w [C, K, 1], stride 1, no padding -> [B, L-K+1, C] in f32. ggml wants the
+// input with time innermost ([L, C, B] in its order) and the filters as [K, C].
 func (b *Backend) Conv1dDepthwise(x, w engine.Tensor) engine.Tensor {
-	panic("ggml: Conv1dDepthwise is not implemented in the spike")
+	tx, tw := as(x), as(w)
+	B, L, Cn := tx.shape[0], tx.shape[1], tx.shape[2]
+	K := tw.shape[1]
+	shape := []int{B, L - K + 1, Cn}
+	return b.op(engine.F32, shape, []*tensor{tx, tw}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		xs := C.ggml_reshape_3d(ctx, C.ggml_cont(ctx, f32(ctx, tx)), C.int64_t(Cn), C.int64_t(L), C.int64_t(B))
+		sx := C.ggml_cont(ctx, C.ggml_transpose(ctx, xs))
+		c := C.ggml_reshape_2d(ctx, C.ggml_cont(ctx, f32(ctx, tw)), C.int64_t(K), C.int64_t(Cn))
+		return C.ggml_ssm_conv(ctx, sx, c)
+	})
 }
+
+// GatedDeltaScan is ggml_gated_delta_net, one fused node for the whole
+// recurrence (a CUDA kernel for head sizes 16, 32, 64 and 128; the CPU op for
+// any). The contract is engine.Backend's; three things differ from ggml's
+// and are translated here:
+//   - ggml exponentiates the gate itself, so it is given log g;
+//   - ggml scales the output by 1/sqrt(Dv), so q is given times sqrt(Dv)
+//     (q never enters the state, the state is untouched);
+//   - ggml maps value head h to key head h mod Hk, the contract to h / (Hv/Hk):
+//     q and k are repeated to Hv heads in the contract's order first.
+//
+// The node's result packs y [B, T, Hv, Dv] and the new state [B, Hv, Dv, Dk]
+// one after the other, in the layouts the contract names; they are cut out as
+// two views.
 func (b *Backend) GatedDeltaScan(q, k, v, g, beta, state engine.Tensor) (engine.Tensor, engine.Tensor) {
-	panic("ggml: GatedDeltaScan is not implemented in the spike")
+	tq, tk, tv, tg, tb, ts := as(q), as(k), as(v), as(g), as(beta), as(state)
+	B, T, Hk, Dk := tq.shape[0], tq.shape[1], tq.shape[2], tq.shape[3]
+	Hv, Dv := tv.shape[2], tv.shape[3]
+	if Dk != Dv {
+		panic(fmt.Sprintf("ggml: GatedDeltaScan needs Dk == Dv, got %d and %d", Dk, Dv))
+	}
+	rep := Hv / Hk
+	rows := T*B + Dv*B
+	res := b.op(engine.F32, []int{rows, Hv * Dv}, []*tensor{tq, tk, tv, tg, tb, ts}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		heads := func(t *tensor) *C.struct_ggml_tensor {
+			x := C.ggml_reshape_4d(ctx, C.ggml_cont(ctx, f32(ctx, t)), C.int64_t(Dk), 1, C.int64_t(Hk), C.int64_t(T*B))
+			if rep > 1 {
+				x = C.ggml_repeat_4d(ctx, x, C.int64_t(Dk), C.int64_t(rep), C.int64_t(Hk), C.int64_t(T*B))
+			}
+			return C.ggml_reshape_4d(ctx, x, C.int64_t(Dk), C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
+		}
+		qh := C.ggml_scale(ctx, heads(tq), C.float(math.Sqrt(float64(Dv))))
+		kh := heads(tk)
+		vh := C.ggml_reshape_4d(ctx, C.ggml_cont(ctx, f32(ctx, tv)), C.int64_t(Dv), C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
+		gh := C.ggml_reshape_4d(ctx, C.ggml_log(ctx, C.ggml_cont(ctx, f32(ctx, tg))), 1, C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
+		bh := C.ggml_reshape_4d(ctx, C.ggml_cont(ctx, f32(ctx, tb)), 1, C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
+		sh := C.ggml_reshape_4d(ctx, C.ggml_cont(ctx, f32(ctx, ts)), C.int64_t(Dk), C.int64_t(Dv), C.int64_t(Hv), C.int64_t(B))
+		return C.ggml_gated_delta_net(ctx, qh, kh, vh, gh, bh, sh)
+	})
+	y := b.Reshape(b.Slice(res, 0, 0, T*B), B, T, Hv, Dv)
+	st := b.Reshape(b.Slice(res, 0, T*B, rows), B, Hv, Dv, Dk)
+	return y, st
 }
 
 func f16tof32(h uint16) float32 {

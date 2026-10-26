@@ -126,6 +126,26 @@ func TestGGMLMatchesCPU(t *testing.T) {
 		g.Floats(g.RoPEFreqs(g.FromFloats(rp, 1, 2, 4, 8), 8, false, 1.0, 3, g.FromFloats(fr, half))),
 		c.Floats(c.RoPEFreqs(c.FromFloats(rp, 1, 2, 4, 8), 8, false, 1.0, 3, c.FromFloats(fr, half))))
 
+	// The Qwen3.5 hybrid's two ops: the causal depthwise conv over the packed
+	// projection (K=4, as the model's), and the gated delta-rule recurrence
+	// with key heads serving adjacent value heads (Hk=2, Hv=4, Dk=Dv=16).
+	cx, cw := rnd(1*7*6, 20), rnd(6*4*1, 21)
+	diffOK(t, "Conv1dDepthwise", tol,
+		g.Floats(g.Conv1dDepthwise(g.FromFloats(cx, 1, 7, 6), g.FromFloats(cw, 6, 4, 1))),
+		c.Floats(c.Conv1dDepthwise(c.FromFloats(cx, 1, 7, 6), c.FromFloats(cw, 6, 4, 1))))
+	dq, dk, dv := rnd(1*5*2*16, 22), rnd(1*5*2*16, 23), rnd(1*5*4*16, 24)
+	dg, db, ds := rnd(1*5*4, 25), rnd(1*5*4, 26), rnd(1*4*16*16, 27)
+	for i := range dg {
+		dg[i] = 0.5 + 0.5*float32(math.Abs(float64(dg[i]))) // a gate in (0, 1]
+		db[i] = 0.5 + 0.5*float32(math.Abs(float64(db[i])))
+	}
+	dy, dst := g.GatedDeltaScan(g.FromFloats(dq, 1, 5, 2, 16), g.FromFloats(dk, 1, 5, 2, 16), g.FromFloats(dv, 1, 5, 4, 16),
+		g.FromFloats(dg, 1, 5, 4), g.FromFloats(db, 1, 5, 4), g.FromFloats(ds, 1, 4, 16, 16))
+	cy, cs := c.GatedDeltaScan(c.FromFloats(dq, 1, 5, 2, 16), c.FromFloats(dk, 1, 5, 2, 16), c.FromFloats(dv, 1, 5, 4, 16),
+		c.FromFloats(dg, 1, 5, 4), c.FromFloats(db, 1, 5, 4), c.FromFloats(ds, 1, 4, 16, 16))
+	diffOK(t, "GatedDeltaScan(y)", tol, g.Floats(dy), c.Floats(cy))
+	diffOK(t, "GatedDeltaScan(state)", tol, g.Floats(dst), c.Floats(cs))
+
 	q, k, v := rnd(1*4*5*8, 13), rnd(1*2*5*8, 14), rnd(1*2*5*8, 15)
 	scale := float32(1.0 / math.Sqrt(8))
 	diffOK(t, "SDPA(causal,GQA)", tol,
