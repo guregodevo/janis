@@ -341,6 +341,10 @@ func (b *Backend) newFrom(dt engine.DType, shape []int, raw unsafe.Pointer, size
 	n := ne(shape)
 	t := C.janis_new(ctx, ggmlType(dt), n[0], n[1], n[2], n[3])
 	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+	if buf == nil {
+		C.ggml_free(ctx)
+		panic(fmt.Sprintf("ggml: no room on the device for a leaf of %v", shape))
+	}
 	logAlloc("leaf", C.ggml_nbytes(t), shape)
 	if size > 0 {
 		C.ggml_backend_tensor_set(t, raw, 0, C.size_t(size))
@@ -445,6 +449,14 @@ func (b *Backend) flushLocked() {
 	in := b.placeInArena(ctx)
 	if in == nil {
 		buf = C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+		if buf == nil {
+			// Out of device memory. Computing the graph over unallocated
+			// tensors was a SIGSEGV that took the server down (the 27B on an
+			// L4 at a 10K-token prompt, 2026-10-26); a panic is caught per
+			// request by net/http and the server answers the next one.
+			C.ggml_free(ctx)
+			panic(fmt.Sprintf("ggml: no room on the device for a batch of %d results", len(pending)))
+		}
 		if memLog {
 			var total C.size_t
 			for t := C.ggml_get_first_tensor(ctx); t != nil; t = C.ggml_get_next_tensor(ctx, t) {
