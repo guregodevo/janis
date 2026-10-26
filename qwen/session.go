@@ -86,6 +86,7 @@ func cachedLen(caches []LayerCache) int {
 func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) ([]float32, bool) {
 	sw, _ := b.(engine.Sweeper)
 	old := cacheTensors(s.Caches) // previous turn's caches, to be freed
+	prevLen := cachedLen(s.Caches)
 
 	// Reuse the shared prefix; keep at least one token to prefill (we need its
 	// logits to predict the first reply token).
@@ -112,6 +113,19 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 		for _, c := range s.Caches {
 			c.Truncate(b, P)
 		}
+	}
+
+	// A previous prompt whose caches are not reused, or only a prefix of
+	// them, is gone before the new prefill rather than after it: on a 22 GB
+	// card the 27B held a 9.8K-token prompt's caches through the whole
+	// prefill of the next, unrelated one and ran out of room (2026-10-26).
+	// When the new prompt extends the old one the caches are the same
+	// tensors and stay.
+	if sw != nil && P < prevLen {
+		pinCaches(sw, s.Caches)
+		sw.Unpin(old...)
+		sw.Sweep()
+		old = nil
 	}
 
 	suffix := newIDs[P:]
