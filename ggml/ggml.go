@@ -208,6 +208,12 @@ type tensor struct {
 	buf   C.ggml_backend_buffer_t //
 	grp   *batch                  // … or the batch a computed result lives in
 	deps  []*tensor               // the inputs a recorded node reads, held until it is computed
+	// via holds what a pending input reads, through that input's own holder
+	// rather than the input itself (which may be a temporary the model
+	// drops): a residual chain shares its ancestry by reference, not by copy
+	// (a copied list doubled every layer and ate 64 GB of host memory on
+	// the 27B, 2026-10-26).
+	via *depHolder
 	shape []int
 	dt    engine.DType
 	where string     // the op's call site, kept when tracing or checking
@@ -288,6 +294,15 @@ var reuseAbove = func() C.size_t {
 	return 64 << 20
 }()
 
+// depHolder is what a pending result keeps alive for the nodes that read
+// it: its direct inputs and, by reference, the holders of its own pending
+// inputs. Reachable from the result and from every pending node that reads
+// it, until the flush that computes them.
+type depHolder struct {
+	deps []*tensor
+	via  []*depHolder
+}
+
 // pendingInput reports whether a tensor is a recorded result not yet
 // computed: it has no memory of its own that a dependency would keep alive,
 // its node lives in the recording context.
@@ -328,7 +343,7 @@ func (t *tensor) free() {
 		q.free()
 		memMu.Lock()
 	}
-	t.deps = nil
+	t.deps, t.via = nil, nil
 }
 
 func as(t engine.Tensor) *tensor { return t.(*tensor) }
@@ -474,8 +489,17 @@ func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx
 		if check || !pendingInput(in) {
 			out.deps = append(out.deps, in)
 		} else {
-			out.deps = append(out.deps, in.deps...)
+			if out.via == nil {
+				out.via = &depHolder{}
+			}
+			if in.via == nil {
+				in.via = &depHolder{deps: in.deps}
+			}
+			out.via.via = append(out.via.via, in.via)
 		}
+	}
+	if out.via != nil {
+		out.via.deps = out.deps
 	}
 	ref := pendingRef{node: node, wp: weak.Make(out), bytes: C.ggml_nbytes(node)}
 	if check {
@@ -644,7 +668,15 @@ func (b *Backend) flushLocked() {
 	}
 	for _, t := range live {
 		t.grp = grp
-		t.deps = nil
+		t.deps, t.via = nil, nil
+	}
+	if len(live) == 0 {
+		// Nothing holds a result: the batch (its context, the allocator's
+		// buffer) has no tensor to be released by and goes now.
+		grp.refs = 1
+		memMu.Lock()
+		grp.release()
+		memMu.Unlock()
 	}
 	if st != C.GGML_STATUS_SUCCESS {
 		panic(fmt.Sprintf("ggml: compute failed (%d)", int(st)))

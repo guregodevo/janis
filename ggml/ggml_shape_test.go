@@ -7,6 +7,7 @@ import (
 	"math"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/guregodevo/janis/cpu"
 	"github.com/guregodevo/janis/engine"
@@ -294,4 +295,27 @@ func TestADroppedChainKeepsItsLeaf(t *testing.T) {
 	runtime.GC()
 	diffOK(t, "dropped chain", 2e-3, g.Floats(y), c.Floats(chain(c)))
 	t.Logf("batch: %d results, %d held", g.lastBatch.results, g.lastBatch.held)
+}
+
+// TestAResidualChainHoldsItsAncestryOnce: h = h + silu(h) sixty times, every
+// link dropped but the last; the two inputs of each Add share their ancestry,
+// and a holder that copied lists doubled per layer (64 GB of host memory on
+// the 27B's prefill, 2026-10-26). By reference it is linear and instant.
+func TestAResidualChainHoldsItsAncestryOnce(t *testing.T) {
+	g := New()
+	defer g.Close()
+	saved := reuseAbove
+	reuseAbove = 0
+	defer func() { reuseAbove = saved }()
+	start := time.Now()
+	h := g.SiLU(g.FromFloats(rnd(32*32, 42), 32, 32))
+	for i := 0; i < 60; i++ {
+		h = g.Add(h, g.SiLU(h))
+	}
+	runtime.GC()
+	out := g.Floats(h)
+	if len(out) != 32*32 || time.Since(start) > 5*time.Second {
+		t.Fatalf("%d values in %s", len(out), time.Since(start))
+	}
+	t.Logf("60 residual links in %s; batch: %d results, %d held", time.Since(start).Round(time.Millisecond), g.lastBatch.results, g.lastBatch.held)
 }
