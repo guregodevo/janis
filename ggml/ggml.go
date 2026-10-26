@@ -67,7 +67,7 @@ type Backend struct {
 	mu   sync.Mutex
 
 	rec     *C.struct_ggml_context // the recording context: nodes not yet computed
-	pending []*tensor              // their result tensors, in order
+	pending []pendingRef           // their results, in order, held weakly
 	// extra are nodes the next flush must run before the results: the
 	// writes of new keys and values into a cache's spare room, which no
 	// result depends on through the graph. extraDeps keeps what they read.
@@ -77,6 +77,13 @@ type Backend struct {
 	// that are alive and not pinned; a collected one needs nothing.
 	tracked map[weak.Pointer[tensor]]struct{}
 	flushes int
+	// lastBatch is what the last flush's batch took on the device, and how
+	// many of its results were held: what a test of the reuse reads.
+	lastBatch struct {
+		bytes   C.size_t
+		results int
+		held    int
+	}
 	// Small constants every layer re-asks for: the RoPE positions of a step
 	// and the causal mask of a shape. Uploaded once, pinned.
 	positions map[[2]int]*tensor
@@ -221,10 +228,11 @@ type quantCall struct{ groupSize, bits int }
 // batch is one flushed graph's context and buffer, shared by its results and
 // released when the last of them goes.
 type batch struct {
-	ctx  *C.struct_ggml_context
-	buf  C.ggml_backend_buffer_t // its own buffer, when no arena took it
-	in   *arena                  // the arena it lives in, else nil
-	refs int
+	ctx    *C.struct_ggml_context
+	buf    C.ggml_backend_buffer_t // its own buffer, when no arena took it
+	in     *arena                  // the arena it lives in, else nil
+	galloc C.ggml_gallocr_t        // the graph allocator that laid the batch out, owning its buffer
+	refs   int
 	// A cache buffer: base is the f16 tensor holding the whole capacity,
 	// every cache tensor a view of a prefix of it; Pin leaves it in place.
 	base *C.struct_ggml_tensor
@@ -248,10 +256,43 @@ func (g *batch) release() {
 	if g.buf != nil {
 		C.ggml_backend_buffer_free(g.buf)
 	}
+	if g.galloc != nil {
+		C.ggml_gallocr_free(g.galloc)
+	}
 	if g.ctx != nil {
 		C.ggml_free(g.ctx)
 	}
-	g.buf, g.ctx = nil, nil
+	g.buf, g.galloc, g.ctx = nil, nil, nil
+}
+
+// pendingRef is a recorded, not yet computed result: its node in the
+// recording context, and the result itself weakly, so the flush can tell a
+// temporary the model has dropped from a result it still holds. In check
+// mode every result is held, to be read back after the compute.
+type pendingRef struct {
+	node   *C.struct_ggml_tensor
+	wp     weak.Pointer[tensor]
+	strong *tensor
+	bytes  C.size_t
+}
+
+// reuseAbove is the batch size, in bytes, from which a flush asks the
+// collector which results are still held before laying the batch out: a
+// collection costs a millisecond, which a decode step's small batch does
+// not pay and a prefill chunk's hundreds of megabytes do
+// (JANIS_GGML_REUSE_ABOVE, in MiB, overrides).
+var reuseAbove = func() C.size_t {
+	if n, err := strconv.Atoi(os.Getenv("JANIS_GGML_REUSE_ABOVE")); err == nil && n >= 0 {
+		return C.size_t(n) << 20
+	}
+	return 64 << 20
+}()
+
+// pendingInput reports whether a tensor is a recorded result not yet
+// computed: it has no memory of its own that a dependency would keep alive,
+// its node lives in the recording context.
+func pendingInput(t *tensor) bool {
+	return t.grp == nil && t.ctx == nil && t.buf == nil && t.t != nil && t.t.data == nil
 }
 
 func (t *tensor) Shape() []int { return append([]int(nil), t.shape...) }
@@ -420,11 +461,19 @@ func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx
 		out.where = fmt.Sprintf("%s:%d", file[strings.LastIndex(file, "/")+1:], line)
 	}
 	for _, in := range inputs {
-		if in != nil {
+		// A dependency keeps an input's memory until this node is computed.
+		// An input that is itself pending has none yet, its node lives in
+		// the same context: holding it would keep a dropped temporary alive
+		// and make the flush give it memory of its own.
+		if in != nil && (check || !pendingInput(in)) {
 			out.deps = append(out.deps, in)
 		}
 	}
-	b.pending = append(b.pending, out)
+	ref := pendingRef{node: node, wp: weak.Make(out), bytes: C.ggml_nbytes(node)}
+	if check {
+		ref.strong = out
+	}
+	b.pending = append(b.pending, ref)
 	full := len(b.pending) >= flushEvery
 	if full {
 		b.flushLocked()
@@ -445,49 +494,64 @@ func (b *Backend) flushLocked() {
 	ctx, pending := b.rec, b.pending
 	b.rec, b.pending = nil, nil
 	t0 := time.Now()
-	var buf C.ggml_backend_buffer_t
-	in := b.placeInArena(ctx)
-	if in == nil {
-		buf = C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
-		if buf == nil {
-			// Out of device memory. Computing the graph over unallocated
-			// tensors was a SIGSEGV that took the server down (the 27B on an
-			// L4 at a 10K-token prompt, 2026-10-26); a panic is caught per
-			// request by net/http and the server answers the next one.
-			C.ggml_free(ctx)
-			panic(fmt.Sprintf("ggml: no room on the device for a batch of %d results", len(pending)))
+	// Which results does the model still hold? Those are the batch's
+	// outputs and get memory of their own; a result nothing holds is a
+	// temporary, consumed inside this graph or by nothing, and ggml's graph
+	// allocator lets the temporaries share memory in the order they die.
+	// Every result used to get its own: a 32-token prefill chunk of the 27B
+	// hybrid held 2.2 GB of them until the chunk's sweep, on an L4 with
+	// 3 GB to spare beside the weights (2026-10-26).
+	var total C.size_t
+	for _, p := range pending {
+		total += p.bytes
+	}
+	if !check && total >= reuseAbove {
+		runtime.GC()
+	}
+	live := make([]*tensor, 0, len(pending))
+	for _, p := range pending {
+		t := p.strong
+		if t == nil {
+			t = p.wp.Value()
 		}
-		if memLog {
-			var total C.size_t
-			for t := C.ggml_get_first_tensor(ctx); t != nil; t = C.ggml_get_next_tensor(ctx, t) {
-				if t.view_src == nil {
-					total += C.ggml_nbytes(t)
-				}
-			}
-			logAlloc(fmt.Sprintf("batch of %d results (no arena free)", len(pending)), total, nil)
+		if t != nil {
+			live = append(live, t)
+			// A backend's op fusion (ggml-cuda folds a SiLU into the
+			// multiply after it, a matmul into the add after it) skips
+			// writing a fused node's own buffer unless it is flagged an
+			// output; without the flag the 30B MoE read never-written
+			// memory as its activations.
+			C.ggml_set_output(p.node)
 		}
 	}
-	t1 := time.Now()
 	g := C.ggml_new_graph_custom(ctx, maxNodes, false)
 	extra, extraDeps := b.extra, b.extraDeps
 	b.extra, b.extraDeps = nil, nil
 	for _, e := range extra {
 		C.ggml_build_forward_expand(g, e) // first in the graph: the cache writes
 	}
-	for _, p := range pending {
-		// Every result may be read later, by a later graph or by the host:
-		// an output. A backend's op fusion (ggml-cuda folds a SiLU into the
-		// multiply after it, a matmul into the add after it) skips writing
-		// a fused node's own buffer unless it is flagged so; without the
-		// flag the 30B MoE read never-written memory as its activations.
-		C.ggml_set_output(p.t)
-		C.ggml_build_forward_expand(g, p.t)
+	for _, t := range live {
+		C.ggml_build_forward_expand(g, t.t) // a dropped result nothing reads is not computed at all
+	}
+	t1 := time.Now()
+	galloc := C.ggml_gallocr_new(b.buft)
+	if !C.ggml_gallocr_alloc_graph(galloc, g) {
+		// Out of device memory. Computing the graph over unallocated
+		// tensors was a SIGSEGV that took the server down; a panic is
+		// caught per request by net/http and the server answers the next one.
+		C.ggml_gallocr_free(galloc)
+		C.ggml_free(ctx)
+		panic(fmt.Sprintf("ggml: no room on the device for a batch of %d results, %d of them held (%.1f MiB without reuse)", len(pending), len(live), float64(total)/(1<<20)))
+	}
+	b.lastBatch.bytes, b.lastBatch.results, b.lastBatch.held = C.ggml_gallocr_get_buffer_size(galloc, 0), len(pending), len(live)
+	if memLog {
+		logAlloc(fmt.Sprintf("batch of %d results, %d held, %.1f MiB without reuse", len(pending), len(live), float64(total)/(1<<20)), b.lastBatch.bytes, nil)
 	}
 	t2 := time.Now()
 	st := C.ggml_backend_graph_compute(b.be, g)
 	runtime.KeepAlive(extraDeps)
 	if check {
-		for _, p := range pending {
+		for _, p := range live {
 			if p.dt != engine.F32 {
 				continue
 			}
@@ -544,13 +608,10 @@ func (b *Backend) flushLocked() {
 	}
 	if timing {
 		t3 := time.Now()
-		fmt.Fprintf(os.Stderr, "ggml flush: %d results, %d nodes, %s alloc, %s build, %s compute\n",
-			len(pending), int(C.ggml_graph_n_nodes(g)), t1.Sub(t0).Round(10*time.Microsecond), t2.Sub(t1).Round(10*time.Microsecond), t3.Sub(t2).Round(10*time.Microsecond))
+		fmt.Fprintf(os.Stderr, "ggml flush: %d results, %d held, %d nodes, %s build, %s alloc, %s compute\n",
+			len(pending), len(live), int(C.ggml_graph_n_nodes(g)), t1.Sub(t0).Round(10*time.Microsecond), t2.Sub(t1).Round(10*time.Microsecond), t3.Sub(t2).Round(10*time.Microsecond))
 	}
-	grp := &batch{ctx: ctx, buf: buf, in: in, refs: len(pending)}
-	if in != nil {
-		in.busy = grp
-	}
+	grp := &batch{ctx: ctx, galloc: galloc, refs: len(live)}
 	// Results nobody holds any more are freed by their finalizers, and
 	// their batches with them; the collector runs on heap pressure, which
 	// a few thousand small Go objects never give it, so it is asked every
@@ -566,14 +627,16 @@ func (b *Backend) flushLocked() {
 		}
 	}
 	for _, p := range pending {
-		p.t.op = C.GGML_OP_NONE
-		for i := range p.t.src {
-			p.t.src[i] = nil
+		p.node.op = C.GGML_OP_NONE
+		for i := range p.node.src {
+			p.node.src[i] = nil
 		}
-		p.t.view_src = nil
-		p.t.flags = 0
-		p.grp = grp
-		p.deps = nil
+		p.node.view_src = nil
+		p.node.flags = 0
+	}
+	for _, t := range live {
+		t.grp = grp
+		t.deps = nil
 	}
 	if st != C.GGML_STATUS_SUCCESS {
 		panic(fmt.Sprintf("ggml: compute failed (%d)", int(st)))

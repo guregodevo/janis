@@ -241,3 +241,29 @@ func TestTheCacheGrowsInPlace(t *testing.T) {
 		t.Fatalf("a cache view with its buffer: %+v", gk.(*tensor))
 	}
 }
+
+// TestTemporariesShareTheBatch: a chain of ops whose intermediates the
+// model drops gets a batch the size of what is held, not of every result.
+// 200 results of 1 MiB each, only the last one held: the batch is a few
+// MiB, where it was 200 before the flush asked the collector (2026-10-26,
+// the 27B hybrid's prefill on an L4).
+func TestTemporariesShareTheBatch(t *testing.T) {
+	g := New()
+	defer g.Close()
+	x := g.FromFloats(rnd(512*512, 40), 512, 512) // 1 MiB
+	y := x
+	for i := 0; i < 200; i++ {
+		y = g.SiLU(y) // each result a temporary once the next is recorded
+	}
+	got := g.Floats(y)
+	if len(got) != 512*512 {
+		t.Fatalf("%d values", len(got))
+	}
+	t.Logf("batch: %d results, %d held, %.1f MiB on the device", g.lastBatch.results, g.lastBatch.held, float64(g.lastBatch.bytes)/(1<<20))
+	if g.lastBatch.held > 8 {
+		t.Errorf("%d results held of %d: the dropped temporaries were kept", g.lastBatch.held, g.lastBatch.results)
+	}
+	if g.lastBatch.bytes > 16<<20 {
+		t.Errorf("the batch took %.1f MiB for 1 MiB of held results", float64(g.lastBatch.bytes)/(1<<20))
+	}
+}
