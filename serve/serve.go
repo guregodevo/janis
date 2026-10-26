@@ -331,15 +331,41 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req chat
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	flusher, _ := w.(http.Flusher)
+	var wmu sync.Mutex
 	send := func(v any) {
 		b, _ := json.Marshal(v)
+		wmu.Lock()
 		_, _ = w.Write([]byte("data: "))
 		_, _ = w.Write(b)
 		_, _ = w.Write([]byte("\n\n"))
 		if flusher != nil {
 			flusher.Flush()
 		}
+		wmu.Unlock()
 	}
+	// A comment line every few seconds while the model is silent: the prefill
+	// of a long prompt and the whole of a tool call (held back until it is
+	// complete) send no delta, and a client's idle watchdog gave up on a
+	// 27B's edit call after a minute (Memdoor, 2026-10-26). A comment is
+	// bytes on the stream and no event to any SSE client.
+	quiet := make(chan struct{})
+	go func() {
+		t := time.NewTicker(keepaliveEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-quiet:
+				return
+			case <-t.C:
+				wmu.Lock()
+				_, _ = w.Write([]byte(": keepalive\n\n"))
+				if flusher != nil {
+					flusher.Flush()
+				}
+				wmu.Unlock()
+			}
+		}
+	}()
 	chunk := func(delta map[string]any, finish any) map[string]any {
 		return map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": s.name,
 			"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": finish}}}
@@ -368,6 +394,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req chat
 		}
 	}
 	reply := s.current.ChatStream(msgs, opts, onDelta)
+	close(quiet)
 	_, calls := parseCalls(reply)
 	finish := "stop"
 	switch {
@@ -395,6 +422,10 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req chat
 }
 
 // ---- the Hermes protocol ----
+
+// keepaliveEvery is how often a streamed answer carries a comment line while
+// the model sends no delta.
+const keepaliveEvery = 5 * time.Second
 
 const (
 	openTag  = "<tool_call>"
