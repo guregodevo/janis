@@ -464,9 +464,17 @@ func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx
 		// A dependency keeps an input's memory until this node is computed.
 		// An input that is itself pending has none yet, its node lives in
 		// the same context: holding it would keep a dropped temporary alive
-		// and make the flush give it memory of its own.
-		if in != nil && (check || !pendingInput(in)) {
+		// and make the flush give it memory of its own. What it reads is
+		// held in its place: a pending input's own dependencies, so the
+		// leaf at the bottom of a chain the model dropped stays until the
+		// chain is computed (freed under the graph on the 27B's load, 2026-10-26).
+		if in == nil {
+			continue
+		}
+		if check || !pendingInput(in) {
 			out.deps = append(out.deps, in)
+		} else {
+			out.deps = append(out.deps, in.deps...)
 		}
 	}
 	ref := pendingRef{node: node, wp: weak.Make(out), bytes: C.ggml_nbytes(node)}

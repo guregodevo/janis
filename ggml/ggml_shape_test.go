@@ -5,6 +5,7 @@ package ggml
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"testing"
 
 	"github.com/guregodevo/janis/cpu"
@@ -266,4 +267,31 @@ func TestTemporariesShareTheBatch(t *testing.T) {
 	if g.lastBatch.bytes > 16<<20 {
 		t.Errorf("the batch took %.1f MiB for 1 MiB of held results", float64(g.lastBatch.bytes)/(1<<20))
 	}
+}
+
+// TestADroppedChainKeepsItsLeaf: the model drops every link of a chain but
+// the last, the collector runs before the flush (reuseAbove 0), and the
+// leaf at the bottom must still be there when the graph reads it: a node
+// inherits a pending input's dependencies. Without that the 27B's load
+// freed a weight under the graph and died in ggml_build_forward_expand.
+func TestADroppedChainKeepsItsLeaf(t *testing.T) {
+	g := New()
+	defer g.Close()
+	c := cpu.New()
+	saved := reuseAbove
+	reuseAbove = 0
+	defer func() { reuseAbove = saved }()
+	data := rnd(64*64, 41)
+	chain := func(b engine.Backend) engine.Tensor {
+		y := b.SiLU(b.FromFloats(data, 64, 64)) // the leaf is held by nothing but the chain
+		for i := 0; i < 5; i++ {
+			y = b.SiLU(y)
+		}
+		return y
+	}
+	y := chain(g)
+	runtime.GC()
+	runtime.GC()
+	diffOK(t, "dropped chain", 2e-3, g.Floats(y), c.Floats(chain(c)))
+	t.Logf("batch: %d results, %d held", g.lastBatch.results, g.lastBatch.held)
 }
