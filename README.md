@@ -111,6 +111,7 @@ Measured, Qwen3 4-bit, 160 to 512 tokens generated:
 | Google g2-standard-4, 1× L4 | 0.6B | | | 52 to 56 (about 100 steady) | 9.4 | |
 | Google g2-standard-4, 1× L4 | 8B | | | 10 to 12 (about 38 steady) | 1.1 | |
 | Google g2-standard-4, 1× L4 | Qwen3-Coder-30B-A3B (MoE, 128 experts, 8 active) | | | 11 steady, after a 2-minute load | | |
+| Google g2-standard-16, 1× L4 | Qwen3.8-27B (the Qwen3.5 hybrid: Gated DeltaNet + attention) | | | 5.3 decode; prefill 250 to 265 tok/s, a 9.8K-token prompt in 37 s at 21.9 GB peak | | |
 
 The two CUDA figures per row are the whole run, which includes the one-time
 Q4_1 repack of every weight on the host (about 19 s for the 8B on four
@@ -123,8 +124,15 @@ stacked once on the device and the gather picks them by index
 model; the 30B-A3B takes 18 GB of the L4. Its 11 tok/s is overhead, not
 kernels: the router's top-k runs on the host, one sync per layer per token
 (the GPU sits at 13%), and the 16 GB repack on load is what the two minutes
-are. Both are the next changes, with a cached repack. Not in the ggml
-backend yet: the Qwen3.5 hybrid's scan and depthwise convolution.
+are. Both are the next changes, with a cached repack. The Qwen3.5 hybrid's
+two ops are ggml's own (`ggml_gated_delta_net`, `ggml_ssm_conv`, one node
+each, a CUDA kernel for head sizes 16 to 128), so the 27B runs on CUDA since
+2026-10-26. A flush lays its batch out with ggml's graph allocator: results
+the model dropped share memory in the order they die (the pending list holds
+them weakly, a batch over 64 MB asks the collector first), results it still
+holds get their own; a 32-token prefill chunk of the 27B that held 2.2 GB of
+temporaries holds a few tens of MB, and the prefill chunk can be 64 on a
+24 GB card (`MLX_PREFILL_CHUNK`).
 
 ## Build
 
