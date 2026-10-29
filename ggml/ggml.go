@@ -1891,6 +1891,12 @@ func (b *Backend) q4K(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 	n := ne(shape)
 	t := C.janis_new(ctx, C.GGML_TYPE_Q4_K, n[0], n[1], n[2], n[3])
 	buf := C.ggml_backend_alloc_ctx_tensors_from_buft(ctx, b.repack)
+	if buf != nil && t.extra == nil {
+		// No kernel for this weight on this CPU (an ARM build without
+		// dotprod): ggml's set would dereference the missing one.
+		C.ggml_backend_buffer_free(buf)
+		buf = nil
+	}
 	if buf == nil {
 		C.ggml_free(ctx)
 		return nil

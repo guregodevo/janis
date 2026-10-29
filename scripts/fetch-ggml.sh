@@ -45,11 +45,16 @@ if [ "$(uname -s)" = Linux ]; then
 	# architecture, an hour on four cores.
 	gpu=(); targets=(ggml ggml-base ggml-cpu); shared=ON; omp=ON
 	[ -n "$static" ] && shared=OFF omp=OFF
+	# Not -march=native, so a build runs on the next machine: AVX2 on x86 (the
+	# default without it); on ARM the dot-product extension (Graviton2 and
+	# newer, a Raspberry Pi 5, GitHub's ARM runners), which the Q4_K kernels
+	# need: the baseline build has none and janis falls back to Q4_1.
+	arm=(); [ "$(uname -m)" = aarch64 ] && arm=(-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod)
 	if [ -n "$cuda" ]; then
 		gpu=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${GGML_CUDA_ARCH:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')}")
 		targets+=(ggml-cuda)
 	fi
-	cmake -S "$src" -B "$tmp/build" "${gpu[@]}" -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=$shared -DGGML_OPENMP=$omp \
+	cmake -S "$src" -B "$tmp/build" "${gpu[@]}" "${arm[@]}" -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=$shared -DGGML_OPENMP=$omp \
 		-DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_BUILD_TYPE=Release \
 		-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF >/dev/null
 	cmake --build "$tmp/build" --config Release -j"$(nproc)" --target "${targets[@]}" 2>&1 | tail -3
