@@ -21,6 +21,10 @@ jobs:
     name: ${{ matrix.workflow }} (local model)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # pr-triage runs `go test ./...`: the pure-Go build, since the ggml and
+    # tokenizer libraries (scripts/fetch-ggml.sh) are not on the runner.
+    env:
+      CGO_ENABLED: '0'
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v5
