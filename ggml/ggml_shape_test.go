@@ -358,10 +358,12 @@ func TestPackQ4KKeepsAnAffineRow(t *testing.T) {
 		q := (binary.LittleEndian.Uint32(codes[4*(e/8):]) >> uint((e%8)*4)) & 0xF
 		row[e] = float32(q)*sc[e/gs] + bi[e/gs]
 	}
-	raw := make([]byte, in/256*q4KBlock)
-	for k := 0; k < in/256; k++ {
-		packQ4K(row[k*256:(k+1)*256], raw[k*q4KBlock:])
+	words := make([]int32, in/8)
+	for i := range words {
+		words[i] = int32(binary.LittleEndian.Uint32(codes[4*i:]))
 	}
+	raw := make([]byte, in/256*q4KBlock)
+	packQ4KRow(words, sc, bi, gs, raw)
 	worst := 0.0
 	for i, v := range unpackQ4K(raw, in) {
 		worst = math.Max(worst, math.Abs(float64(v-row[i])))

@@ -1849,9 +1849,9 @@ func (b *Backend) q4_1(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 // does about 30. A weight whose input carries an outlier channel is still
 // kept as Q8_0 (packed): the activations are quantized to 8 bits per block
 // here too, and an outlier flattens the rest of its block. The MLX affine values are dequantized and quantized
-// again into Q4_K (packQ4K: sub-blocks of 32 with their own scale and min,
-// the same affine form), so the result is within Q4_K's rounding of the
-// source. nil when this weight cannot go there: not on the
+// again into Q4_K (packQ4KRow: sub-blocks of 32 with their own scale and
+// min, the same affine form), so the result is within Q4_K's rounding of
+// the source. nil when this weight cannot go there: not on the
 // CPU, not 4-bit, not 2D, rows not a multiple of 8 or a row not of whole
 // 256-value blocks, or the check and trace modes, which read weights back.
 func (b *Backend) q4K(tw, ts, tb *tensor, groupSize, bits int) *tensor {
@@ -1861,7 +1861,7 @@ func (b *Backend) q4K(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 	P := tw.shape[1]
 	in := P * 8
 	rows := tw.shape[0]
-	if in%256 != 0 || rows%8 != 0 || groupSize <= 0 || in%groupSize != 0 {
+	if in%256 != 0 || rows%8 != 0 || groupSize <= 0 || groupSize%32 != 0 || in%groupSize != 0 {
 		return nil
 	}
 	words := b.Ints(tw)
@@ -1875,20 +1875,12 @@ func (b *Backend) q4K(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			row := make([]float32, in)
 			for {
 				r := int(next.Add(1)) - 1
 				if r >= rows {
 					return
 				}
-				for e := range row {
-					q := (uint32(words[r*P+e/8]) >> uint((e%8)*4)) & 0xF
-					g := r*G + e/groupSize
-					row[e] = float32(q)*sc[g] + bi[g]
-				}
-				for k := 0; k < in/256; k++ {
-					packQ4K(row[k*256:(k+1)*256], raw[r*rowBytes+k*q4KBlock:])
-				}
+				packQ4KRow(words[r*P:(r+1)*P], sc[r*G:(r+1)*G], bi[r*G:(r+1)*G], groupSize, raw[r*rowBytes:(r+1)*rowBytes])
 			}
 		}()
 	}
@@ -1918,69 +1910,78 @@ func (b *Backend) q4K(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 // scales and mins, 128 bytes of 4-bit codes for 256 values.
 const q4KBlock = 144
 
-// packQ4K writes 256 values as one block_q4_K. Each sub-block of 32 is
-// affine already when it comes from an MLX weight (a group of 64 is two of
-// them), so its scale and min are read off its range, with no search: the
-// min clamped to at most zero as Q4_K stores it (y = d·sc·q − dmin·m, m ≥ 0),
-// the scale the range over 15. Those two lists go to 6 bits against their
-// largest, and each code is picked again against the rounded pair. ggml's
-// reference quantizer searches twenty candidate scales per sub-block
-// instead, which took 281 s for an 8B on a GitHub runner's four cores.
-func packQ4K(x []float32, out []byte) {
-	var scales, mins [8]float32
-	var maxScale, maxMin float32
-	for j := 0; j < 8; j++ {
-		lo, hi := x[32*j], x[32*j]
-		for _, v := range x[32*j : 32*j+32] {
-			lo, hi = min(lo, v), max(hi, v)
+// packQ4KRow writes one row of an MLX affine 4-bit weight (eight codes a
+// word; a scale and a bias per group of groupSize, a multiple of 32) as
+// block_q4_K, one per 256 values. A sub-block of 32 lies in one group, so
+// it holds at most the sixteen values s·q + b: Q4_K's scale and min for it
+// are that grid's (the min clamped to at most zero, as Q4_K stores it:
+// y = d·sc·q − dmin·m with m ≥ 0), rounded to 6 bits against the block's
+// largest, and each old code maps to its new one through a table of
+// sixteen: no arithmetic per value. ggml's reference quantizer searches
+// twenty scales per sub-block from the dequantized floats instead (281 s
+// for an 8B on a GitHub runner's four cores).
+func packQ4KRow(words []int32, sc, bi []float32, groupSize int, out []byte) {
+	for k := 0; k < len(words)*8/256; k++ {
+		blk := out[k*q4KBlock : (k+1)*q4KBlock]
+		var grid [8][2]float32 // per sub-block: s and b of its group
+		var scales, mins [8]float32
+		var maxScale, maxMin float32
+		for j := 0; j < 8; j++ {
+			g := (k*256 + 32*j) / groupSize
+			s, b := sc[g], bi[g]
+			grid[j] = [2]float32{s, b}
+			lo, hi := min(b, b+15*s), max(b, b+15*s)
+			lo = min(lo, 0)
+			scales[j], mins[j] = (hi-lo)/15, -lo
+			maxScale, maxMin = max(maxScale, scales[j]), max(maxMin, mins[j])
 		}
-		lo = min(lo, 0)
-		scales[j], mins[j] = (hi-lo)/15, -lo
-		maxScale, maxMin = max(maxScale, scales[j]), max(maxMin, mins[j])
-	}
-	var invScale, invMin float32
-	if maxScale > 0 {
-		invScale = 63 / maxScale
-	}
-	if maxMin > 0 {
-		invMin = 63 / maxMin
-	}
-	sb := out[4:16]
-	for i := range sb {
-		sb[i] = 0
-	}
-	var ls, lm [8]uint8
-	for j := 0; j < 8; j++ {
-		ls[j] = uint8(min(63, int(math.Round(float64(invScale*scales[j])))))
-		lm[j] = uint8(min(63, int(math.Round(float64(invMin*mins[j])))))
-		if j < 4 {
-			sb[j], sb[j+4] = ls[j], lm[j]
-		} else {
-			sb[j+4] = ls[j]&0xF | (lm[j]&0xF)<<4
-			sb[j-4] |= (ls[j] >> 4) << 6
-			sb[j] |= (lm[j] >> 4) << 6
+		var invScale, invMin float32
+		if maxScale > 0 {
+			invScale = 63 / maxScale
 		}
-	}
-	dh, mh := f32tof16(maxScale/63), f32tof16(maxMin/63)
-	binary.LittleEndian.PutUint16(out[0:], dh)
-	binary.LittleEndian.PutUint16(out[2:], mh)
-	d, dmin := f16tof32(dh), f16tof32(mh)
-	var L [256]uint8
-	for j := 0; j < 8; j++ {
-		dj := d * float32(ls[j])
-		if dj == 0 {
-			continue
+		if maxMin > 0 {
+			invMin = 63 / maxMin
 		}
-		mj := dmin * float32(lm[j])
-		for i := 0; i < 32; i++ {
-			l := int(math.Round(float64((x[32*j+i] + mj) / dj)))
-			L[32*j+i] = uint8(max(0, min(15, l)))
+		sb := blk[4:16]
+		clear(sb)
+		var ls, lm [8]uint8
+		for j := 0; j < 8; j++ {
+			ls[j] = uint8(min(63, int(invScale*scales[j]+0.5)))
+			lm[j] = uint8(min(63, int(invMin*mins[j]+0.5)))
+			if j < 4 {
+				sb[j], sb[j+4] = ls[j], lm[j]
+			} else {
+				sb[j+4] = ls[j]&0xF | (lm[j]&0xF)<<4
+				sb[j-4] |= (ls[j] >> 4) << 6
+				sb[j] |= (lm[j] >> 4) << 6
+			}
 		}
-	}
-	qs := out[16 : 16+128]
-	for c := 0; c < 4; c++ {
-		for l := 0; l < 32; l++ {
-			qs[32*c+l] = L[64*c+l] | L[64*c+l+32]<<4
+		dh, mh := f32tof16(maxScale/63), f32tof16(maxMin/63)
+		binary.LittleEndian.PutUint16(blk[0:], dh)
+		binary.LittleEndian.PutUint16(blk[2:], mh)
+		d, dmin := f16tof32(dh), f16tof32(mh)
+		var L [256]uint8
+		for j := 0; j < 8; j++ {
+			dj := d * float32(ls[j])
+			if dj == 0 {
+				continue
+			}
+			mj := dmin * float32(lm[j])
+			var lut [16]uint8
+			for q := range lut {
+				v := (grid[j][0]*float32(q) + grid[j][1] + mj) / dj
+				lut[q] = uint8(max(0, min(15, int(v+0.5))))
+			}
+			w := words[(k*256+32*j)/8:]
+			for i := 0; i < 32; i++ {
+				L[32*j+i] = lut[(uint32(w[i/8])>>uint((i%8)*4))&0xF]
+			}
+		}
+		qs := blk[16 : 16+128]
+		for c := 0; c < 4; c++ {
+			for l := 0; l < 32; l++ {
+				qs[32*c+l] = L[64*c+l] | L[64*c+l+32]<<4
+			}
 		}
 	}
 }
