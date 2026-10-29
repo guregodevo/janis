@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	llm "github.com/guregodevo/janis"
 	"github.com/guregodevo/janis/hostfit"
@@ -388,6 +389,11 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req chat
 			return
 		}
 		safe := len(text) - len(openTag) + 1
+		// The cut never splits a character: an em dash sent a byte at a time
+		// reaches the client as three U+FFFD.
+		for safe > emitted && !utf8.RuneStart(text[safe]) {
+			safe--
+		}
 		if safe > emitted {
 			send(chunk(map[string]any{"content": text[emitted:safe]}, nil))
 			emitted = safe

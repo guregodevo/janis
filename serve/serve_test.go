@@ -150,6 +150,16 @@ func TestAPlainAnswerStreamedAndNot(t *testing.T) {
 	}
 }
 
+func TestAStreamNeverSplitsACharacter(t *testing.T) {
+	installFake(t, "Qwen3-8B-4bit", 40960)
+	reply := "apple — a fruit; café, naïve, 日本 — done"
+	srv := newTestServer(t, &fakeEngine{reply: reply})
+	resp, _ := post(t, srv.URL+"/v1/chat/completions", `{"model":"Qwen3-8B-4bit","stream":true,"messages":[{"role":"user","content":"Words?"}]}`)
+	if text, _, _, _ := readStream(t, resp); text != reply {
+		t.Fatalf("stream: %q, want %q", text, reply)
+	}
+}
+
 func TestAToolCallRoundTrip(t *testing.T) {
 	installFake(t, "Qwen3-8B-4bit", 40960)
 	eng := &fakeEngine{reply: "Let me look.\n<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"main.go\"}}\n</tool_call>"}
