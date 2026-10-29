@@ -36,6 +36,20 @@ static struct ggml_context * janis_ctx(size_t mem) {
 	struct ggml_init_params p = { mem, NULL, true };
 	return ggml_init(p);
 }
+// janis_repack_buft is the CPU backend's weight-repacking buffer type
+// (CPU_REPACK), or NULL: a weight placed in it is laid out once, when it is
+// set, for the tiled int8 matmul kernels of this CPU.
+static ggml_backend_buffer_type_t janis_repack_buft(ggml_backend_t be) {
+	ggml_backend_dev_t dev = ggml_backend_get_device(be);
+	if (dev == NULL) return NULL;
+	ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+	ggml_backend_dev_get_extra_bufts_t fn = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+	if (fn == NULL) return NULL;
+	for (ggml_backend_buffer_type_t * l = fn(dev); l != NULL && *l != NULL; l++) {
+		if (strcmp(ggml_backend_buft_name(*l), "CPU_REPACK") == 0) return *l;
+	}
+	return NULL;
+}
 static struct ggml_tensor * janis_new(struct ggml_context * c, enum ggml_type t, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
 	return ggml_new_tensor_4d(c, t, ne0, ne1, ne2, ne3);
 }
@@ -51,6 +65,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 	"weak"
@@ -63,6 +78,9 @@ import (
 type Backend struct {
 	be   C.ggml_backend_t
 	buft C.ggml_backend_buffer_type_t
+	// repack is the CPU's weight-repacking buffer type, nil on a device:
+	// where a dense 4-bit weight goes as Q4_K (see q4K).
+	repack C.ggml_backend_buffer_type_t
 	name string
 	mu   sync.Mutex
 
@@ -149,6 +167,9 @@ func New() *Backend {
 			threads = n
 		}
 		C.ggml_backend_cpu_set_n_threads(b.be, C.int(threads))
+		if os.Getenv("JANIS_GGML_REPACK") != "0" {
+			b.repack = C.janis_repack_buft(b.be)
+		}
 	}
 	b.buft = C.ggml_backend_get_default_buffer_type(b.be)
 	b.name = C.GoString(C.ggml_backend_name(b.be))
@@ -1597,7 +1618,8 @@ func rangeCheck(what string, shape []int, vals []float32) {
 }
 
 // packed is the device form of an affine weight, chosen once at its first
-// use: Q4_1 (the same 4-bit affine blocks, ggml's quantized kernels) unless
+// use: on the CPU Q4_K in the repack buffer (q4K), elsewhere Q4_1 (the same
+// 4-bit affine blocks, ggml's quantized kernels), unless
 // the input that meets it carries values past q8Threshold, in which case
 // Q8_0. ggml's Q4_1 kernels quantize the activations to q8_1 blocks whose
 // scale and block sum are f16, and a block holding a value past about
@@ -1627,6 +1649,9 @@ func (b *Backend) packed(x, tw, ts, tb *tensor, groupSize, bits int) *tensor {
 			}
 			return b.q8_0(tw, ts, tb, groupSize, bits)
 		}
+	}
+	if q := b.q4K(tw, ts, tb, groupSize, bits); q != nil {
+		return q
 	}
 	return b.q4_1(tw, ts, tb, groupSize, bits)
 }
@@ -1806,6 +1831,83 @@ func (b *Backend) q4_1(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 	tw.q4 = q
 	if !tw.gathered && tw.buf != nil && !check {
 		// The words are not needed again: one copy of the weight, not two.
+		C.ggml_backend_buffer_free(tw.buf)
+		C.ggml_free(tw.ctx)
+		tw.buf, tw.ctx, tw.t, tw.dropped = nil, nil, nil, true
+	}
+	return q
+}
+
+// q4K is the CPU form of a dense 4-bit weight: Q4_K in the CPU's repack
+// buffer, which ggml lays out once for its tiled int8 kernels (AVX2, ARM
+// dotprod and i8mm) — the matmul llama.cpp runs a Q4_K_M model with. Q4_1
+// has no such kernel: its row-by-row dot product prefilled a 3,335-token
+// prompt at 4.9 tok/s on a GitHub runner (2026-10-29), where llama.cpp
+// does about 30. A weight whose input carries an outlier channel is still
+// kept as Q8_0 (packed): the activations are quantized to 8 bits per block
+// here too, and an outlier flattens the rest of its block. The MLX affine values are dequantized and quantized
+// again by ggml's reference Q4_K quantizer (sub-blocks of 32 with their own
+// scale and min, the same affine form), so the result is within Q4_K's
+// rounding of the source. nil when this weight cannot go there: not on the
+// CPU, not 4-bit, not 2D, rows not a multiple of 8 or a row not of whole
+// 256-value blocks, or the check and trace modes, which read weights back.
+func (b *Backend) q4K(tw, ts, tb *tensor, groupSize, bits int) *tensor {
+	if b.repack == nil || bits != 4 || len(tw.shape) != 2 || check || trace {
+		return nil
+	}
+	P := tw.shape[1]
+	in := P * 8
+	rows := tw.shape[0]
+	if in%256 != 0 || rows%8 != 0 || groupSize <= 0 || in%groupSize != 0 {
+		return nil
+	}
+	words := b.Ints(tw)
+	sc, bi := b.Floats(ts), b.Floats(tb)
+	G := ts.shape[len(ts.shape)-1]
+	rowBytes := int(C.ggml_row_size(C.GGML_TYPE_Q4_K, C.int64_t(in)))
+	raw := make([]byte, rows*rowBytes)
+	C.ggml_quantize_init(C.GGML_TYPE_Q4_K)
+	const span = 64 // rows a worker dequantizes and quantizes at a time
+	var wg sync.WaitGroup
+	var next atomic.Int64
+	for w := 0; w < runtime.NumCPU(); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			vals := make([]float32, span*in)
+			for {
+				r0 := int(next.Add(span)) - span
+				if r0 >= rows {
+					return
+				}
+				n := min(span, rows-r0)
+				for r := r0; r < r0+n; r++ {
+					row := vals[(r-r0)*in : (r-r0+1)*in]
+					for e := range row {
+						q := (uint32(words[r*P+e/8]) >> uint((e%8)*4)) & 0xF
+						g := r*G + e/groupSize
+						row[e] = float32(q)*sc[g] + bi[g]
+					}
+				}
+				C.ggml_quantize_chunk(C.GGML_TYPE_Q4_K, (*C.float)(unsafe.Pointer(&vals[0])), unsafe.Pointer(&raw[r0*rowBytes]), 0, C.int64_t(n), C.int64_t(in), nil)
+			}
+		}()
+	}
+	wg.Wait()
+	shape := []int{rows, in}
+	ctx := C.janis_ctx(ctxMem)
+	n := ne(shape)
+	t := C.janis_new(ctx, C.GGML_TYPE_Q4_K, n[0], n[1], n[2], n[3])
+	buf := C.ggml_backend_alloc_ctx_tensors_from_buft(ctx, b.repack)
+	if buf == nil {
+		C.ggml_free(ctx)
+		return nil
+	}
+	logAlloc("Q4_K weight", C.ggml_nbytes(t), shape)
+	C.ggml_backend_tensor_set(t, unsafe.Pointer(&raw[0]), 0, C.size_t(len(raw)))
+	q := &tensor{t: t, ctx: ctx, buf: buf, shape: shape, dt: engine.F16, pin: true}
+	tw.q4 = q
+	if !tw.gathered && tw.buf != nil {
 		C.ggml_backend_buffer_free(tw.buf)
 		C.ggml_free(tw.ctx)
 		tw.buf, tw.ctx, tw.t, tw.dropped = nil, nil, nil, true

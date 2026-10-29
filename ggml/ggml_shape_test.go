@@ -14,26 +14,46 @@ import (
 )
 
 // The q_proj of Qwen3-0.6B: [2048, 1024] affine 4-bit against 13 tokens in
-// a 3-D batch, the first quantized matmul of a real forward.
+// a 3-D batch, the first quantized matmul of a real forward. On the CPU the
+// weight goes Q4_K in the repack buffer, quantized again from the affine
+// values (within Q4_K's rounding: random scales, a different one every 64
+// values, are its worst case); with the repack off it is Q4_1, the same
+// blocks as the source.
 func TestQuantMatmulAtModelShape(t *testing.T) {
-	g := New()
-	defer g.Close()
-	c := cpu.New()
-	const out, in, gs, bits = 2048, 1024, 64, 4
-	P, G := in*bits/32, in/gs
-	raw := rndPackedU32(out*P, 1)
-	sc, bi := rnd(out*G, 2), rnd(out*G, 3)
-	x := rnd(1*13*in, 4)
-	gW, cW := g.FromRaw(engine.U32, raw, out, P), c.FromRaw(engine.U32, raw, out, P)
-	gS, gB := g.Cast(g.FromFloats(sc, out, G), engine.F16), g.Cast(g.FromFloats(bi, out, G), engine.F16)
-	cS, cB := c.FromFloats(sc, out, G), c.FromFloats(bi, out, G)
-	relOK(t, "QuantMatmul(M=13, 3-D) on Q4_1", 1.5e-2,
-		g.Floats(g.QuantMatmul(g.FromFloats(x, 1, 13, in), gW, gS, gB, true, gs, bits)),
-		c.Floats(c.QuantMatmul(c.FromFloats(x, 1, 13, in), cW, cS, cB, true, gs, bits)))
-	x1 := rnd(in, 5)
-	relOK(t, "QuantMatmul(M=1, 3-D) on Q4_1", 1.5e-2,
-		g.Floats(g.QuantMatmul(g.FromFloats(x1, 1, 1, in), gW, gS, gB, true, gs, bits)),
-		c.Floats(c.QuantMatmul(c.FromFloats(x1, 1, 1, in), cW, cS, cB, true, gs, bits)))
+	for _, tc := range []struct {
+		name   string
+		repack bool
+		typ    int
+		tol    float64
+	}{{"Q4_K", true, 12, 3e-2}, {"Q4_1", false, 3, 1.5e-2}} {
+		g := New()
+		if !tc.repack {
+			g.repack = nil
+		} else if g.repack == nil {
+			g.Close()
+			continue
+		}
+		c := cpu.New()
+		const out, in, gs, bits = 2048, 1024, 64, 4
+		P, G := in*bits/32, in/gs
+		raw := rndPackedU32(out*P, 1)
+		sc, bi := rnd(out*G, 2), rnd(out*G, 3)
+		x := rnd(1*13*in, 4)
+		gW, cW := g.FromRaw(engine.U32, raw, out, P), c.FromRaw(engine.U32, raw, out, P)
+		gS, gB := g.Cast(g.FromFloats(sc, out, G), engine.F16), g.Cast(g.FromFloats(bi, out, G), engine.F16)
+		cS, cB := c.FromFloats(sc, out, G), c.FromFloats(bi, out, G)
+		relOK(t, "QuantMatmul(M=13, 3-D) on "+tc.name, tc.tol,
+			g.Floats(g.QuantMatmul(g.FromFloats(x, 1, 13, in), gW, gS, gB, true, gs, bits)),
+			c.Floats(c.QuantMatmul(c.FromFloats(x, 1, 13, in), cW, cS, cB, true, gs, bits)))
+		x1 := rnd(in, 5)
+		relOK(t, "QuantMatmul(M=1, 3-D) on "+tc.name, tc.tol,
+			g.Floats(g.QuantMatmul(g.FromFloats(x1, 1, 1, in), gW, gS, gB, true, gs, bits)),
+			c.Floats(c.QuantMatmul(c.FromFloats(x1, 1, 1, in), cW, cS, cB, true, gs, bits)))
+		if typ := int(gW.(*tensor).q4.t._type); typ != tc.typ {
+			t.Errorf("the weight is type %d, want %d (%s)", typ, tc.typ, tc.name)
+		}
+		g.Close()
+	}
 }
 
 // The MoE gather: a stack of E experts, K picked per token by global id,
