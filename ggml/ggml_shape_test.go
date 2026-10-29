@@ -3,6 +3,7 @@
 package ggml
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 	"runtime"
@@ -14,26 +15,46 @@ import (
 )
 
 // The q_proj of Qwen3-0.6B: [2048, 1024] affine 4-bit against 13 tokens in
-// a 3-D batch, the first quantized matmul of a real forward.
+// a 3-D batch, the first quantized matmul of a real forward. On the CPU the
+// weight goes Q4_K in the repack buffer, quantized again from the affine
+// values (within Q4_K's rounding: random scales, a different one every 64
+// values, are its worst case); with the repack off it is Q4_1, the same
+// blocks as the source.
 func TestQuantMatmulAtModelShape(t *testing.T) {
-	g := New()
-	defer g.Close()
-	c := cpu.New()
-	const out, in, gs, bits = 2048, 1024, 64, 4
-	P, G := in*bits/32, in/gs
-	raw := rndPackedU32(out*P, 1)
-	sc, bi := rnd(out*G, 2), rnd(out*G, 3)
-	x := rnd(1*13*in, 4)
-	gW, cW := g.FromRaw(engine.U32, raw, out, P), c.FromRaw(engine.U32, raw, out, P)
-	gS, gB := g.Cast(g.FromFloats(sc, out, G), engine.F16), g.Cast(g.FromFloats(bi, out, G), engine.F16)
-	cS, cB := c.FromFloats(sc, out, G), c.FromFloats(bi, out, G)
-	relOK(t, "QuantMatmul(M=13, 3-D) on Q4_1", 1.5e-2,
-		g.Floats(g.QuantMatmul(g.FromFloats(x, 1, 13, in), gW, gS, gB, true, gs, bits)),
-		c.Floats(c.QuantMatmul(c.FromFloats(x, 1, 13, in), cW, cS, cB, true, gs, bits)))
-	x1 := rnd(in, 5)
-	relOK(t, "QuantMatmul(M=1, 3-D) on Q4_1", 1.5e-2,
-		g.Floats(g.QuantMatmul(g.FromFloats(x1, 1, 1, in), gW, gS, gB, true, gs, bits)),
-		c.Floats(c.QuantMatmul(c.FromFloats(x1, 1, 1, in), cW, cS, cB, true, gs, bits)))
+	for _, tc := range []struct {
+		name   string
+		repack bool
+		typ    int
+		tol    float64
+	}{{"Q4_K", true, 12, 3e-2}, {"Q4_1", false, 3, 1.5e-2}} {
+		g := New()
+		if !tc.repack {
+			g.repack = nil
+		} else if g.repack == nil {
+			g.Close()
+			continue
+		}
+		c := cpu.New()
+		const out, in, gs, bits = 2048, 1024, 64, 4
+		P, G := in*bits/32, in/gs
+		raw := rndPackedU32(out*P, 1)
+		sc, bi := rnd(out*G, 2), rnd(out*G, 3)
+		x := rnd(1*13*in, 4)
+		gW, cW := g.FromRaw(engine.U32, raw, out, P), c.FromRaw(engine.U32, raw, out, P)
+		gS, gB := g.Cast(g.FromFloats(sc, out, G), engine.F16), g.Cast(g.FromFloats(bi, out, G), engine.F16)
+		cS, cB := c.FromFloats(sc, out, G), c.FromFloats(bi, out, G)
+		relOK(t, "QuantMatmul(M=13, 3-D) on "+tc.name, tc.tol,
+			g.Floats(g.QuantMatmul(g.FromFloats(x, 1, 13, in), gW, gS, gB, true, gs, bits)),
+			c.Floats(c.QuantMatmul(c.FromFloats(x, 1, 13, in), cW, cS, cB, true, gs, bits)))
+		x1 := rnd(in, 5)
+		relOK(t, "QuantMatmul(M=1, 3-D) on "+tc.name, tc.tol,
+			g.Floats(g.QuantMatmul(g.FromFloats(x1, 1, 1, in), gW, gS, gB, true, gs, bits)),
+			c.Floats(c.QuantMatmul(c.FromFloats(x1, 1, 1, in), cW, cS, cB, true, gs, bits)))
+		if typ := int(gW.(*tensor).q4.t._type); typ != tc.typ {
+			t.Errorf("the weight is type %d, want %d (%s)", typ, tc.typ, tc.name)
+		}
+		g.Close()
+	}
 }
 
 // The MoE gather: a stack of E experts, K picked per token by global id,
@@ -318,4 +339,37 @@ func TestAResidualChainHoldsItsAncestryOnce(t *testing.T) {
 		t.Fatalf("%d values in %s", len(out), time.Since(start))
 	}
 	t.Logf("60 residual links in %s; batch: %d results, %d held", time.Since(start).Round(time.Millisecond), g.lastBatch.results, g.lastBatch.held)
+}
+
+// An MLX row (codes 0..15, a positive scale and a negative bias per group of
+// 64) packed to Q4_K comes back through ggml's own dequantization within
+// Q4_K's rounding: the 6-bit scales and mins are the only loss.
+func TestPackQ4KKeepsAnAffineRow(t *testing.T) {
+	const in, gs = 1024, 64
+	codes, sc, bi := rndPackedU32(in/8, 7), rnd(in/gs, 8), rnd(in/gs, 9)
+	row := make([]float32, in)
+	var span float64
+	for g := range sc {
+		sc[g] = 0.002 + float32(math.Abs(float64(sc[g])))*0.01
+		bi[g] = -8 * sc[g] * (1 + bi[g]*0.2)
+		span = math.Max(span, float64(15*sc[g]))
+	}
+	for e := range row {
+		q := (binary.LittleEndian.Uint32(codes[4*(e/8):]) >> uint((e%8)*4)) & 0xF
+		row[e] = float32(q)*sc[e/gs] + bi[e/gs]
+	}
+	words := make([]int32, in/8)
+	for i := range words {
+		words[i] = int32(binary.LittleEndian.Uint32(codes[4*i:]))
+	}
+	raw := make([]byte, in/256*q4KBlock)
+	packQ4KRow(words, sc, bi, gs, raw)
+	worst := 0.0
+	for i, v := range unpackQ4K(raw, in) {
+		worst = math.Max(worst, math.Abs(float64(v-row[i])))
+	}
+	if worst > span/30 {
+		t.Fatalf("worst |Q4_K - source| %.4g, more than a 30th of the widest group's range %.4g", worst, span)
+	}
+	t.Logf("worst |Q4_K - source| %.4g against a widest range of %.4g", worst, span)
 }

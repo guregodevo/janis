@@ -92,13 +92,17 @@ about fifty ops); a backend is an implementation of it. Three exist:
 | janis-cuda | ggml, llama.cpp's tensor library: CUDA, Metal or CPU kernels | Linux with an NVIDIA GPU; also Metal and CPU on a Mac | `-tags ggml`, `JANIS_BACKEND=ggml`, `JANIS_GGML_DEVICE=gpu` |
 | janis-cpu | pure Go | anywhere | `CGO_ENABLED=0`, or `JANIS_BACKEND=cpu` |
 
-The ggml backend (package `ggml`, branch `ggml`, 2026-10-25) links the
-prebuilt libraries from llama.cpp's releases (`scripts/fetch-ggml.sh`; on a
-Linux GPU box `--cuda` builds them with cmake for the GPU present, about 20
-minutes once). Ops are recorded and flushed as one graph per step, tensors
-stay on the device, MLX's 4-bit weights are repacked once into ggml's Q4_1
-(the same affine formula), and the engine's pin/sweep protocol frees each
-step's temporaries. Every op matches the pure-Go backend to float
+The ggml backend (package `ggml`, 2026-10-25) links ggml at llama.cpp's
+pinned tag (`scripts/fetch-ggml.sh`: the prebuilt libraries on a Mac; on
+Linux built with cmake, about a minute for the CPU, `--cuda` about 20 minutes
+once for the GPU present, `--static` for the one-file release). Ops are
+recorded and flushed as one graph per step, tensors stay on the device, and
+the engine's pin/sweep protocol frees each step's temporaries. MLX's 4-bit
+weights are repacked once: on a GPU into ggml's Q4_1 (the same affine
+formula); on the CPU into Q4_K in ggml's repack buffer, the tiled int8 matmul
+llama.cpp runs a Q4_K_M model with, read straight off the MLX codes (a
+sub-block of 32 holds sixteen values at most, so each code maps to its new one
+through a table; 2026-10-29). Every op matches the pure-Go backend to float
 precision; the quantized matmul within llama.cpp's own 8-bit-activation
 precision.
 
@@ -107,7 +111,8 @@ Measured, Qwen3 4-bit, 160 to 512 tokens generated:
 | Machine | Model | MLX | ggml Metal | ggml CUDA | ggml CPU | pure Go |
 |---|---|---|---|---|---|---|
 | Mac M4 | 0.6B | 169 tok/s | 69 | | 66 (4 threads) | 17 |
-| Mac M4 | 8B | 18.8 | 13.0 | | 5.6 | |
+| Mac M4 | 8B | 18.8 | 13.0 | | 14 (4 threads, Q4_K; 5.6 on Q4_1); prefill 56 tok/s | |
+| GitHub runner `ubuntu-latest`, 4 vCPU (AMD EPYC 7763) | 8B | | | | 5.6, prefill 12 tok/s (Ollama on the same CPU: 4.45 and 12.6) | |
 | Google g2-standard-4, 1× L4 | 0.6B | | | 52 to 56 (about 100 steady) | 9.4 | |
 | Google g2-standard-4, 1× L4 | 8B | | | 10 to 12 (about 38 steady) | 1.1 | |
 | Google g2-standard-4, 1× L4 | Qwen3-Coder-30B-A3B (MoE, 128 experts, 8 active) | | | 11 steady, after a 2-minute load | | |
@@ -142,6 +147,14 @@ Apple Silicon with MLX:
 brew install mlx mlx-c          # mlx-c is linked from /opt/homebrew
 make build                      # provisions lib/libtokenizers.a, then go build ./...
 make test
+```
+
+Linux, one file (ggml's CPU kernels and the tokenizer linked in; a CI job
+downloads it and runs it):
+
+```bash
+curl -fsSL -o janis https://github.com/guregodevo/janis/releases/latest/download/janis-linux-amd64   # or -arm64
+chmod +x janis && ./janis pull Qwen3-8B-4bit && JANIS_BACKEND=ggml ./janis serve
 ```
 
 Anywhere, without MLX or cgo:
