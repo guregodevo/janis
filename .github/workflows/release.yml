@@ -47,7 +47,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "janis for Linux, one file: curl -fsSL https://github.com/guregodevo/janis/releases/latest/download/install.sh | sh" || true
-          gh release upload "$GITHUB_REF_NAME" janis-linux-${{ matrix.arch }} janis-linux-${{ matrix.arch }}.sha256 install.sh --clobber
+          files="janis-linux-${{ matrix.arch }} janis-linux-${{ matrix.arch }}.sha256"
+          # install.sh once: two jobs uploading it race (422, already exists).
+          [ "${{ matrix.arch }}" = amd64 ] && files="$files install.sh"
+          gh release upload "$GITHUB_REF_NAME" $files --clobber
 
   # The release as a user gets it: install.sh from the release just made, then
   # serve --detach, then one answer.
