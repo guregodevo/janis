@@ -35,9 +35,9 @@ jobs:
           ./bin/janis pull Qwen3-0.6B-4bit
           JANIS_BACKEND=ggml nohup ./bin/janis serve --model Qwen3-0.6B-4bit > janis.log 2>&1 &
           for i in $(seq 1 120); do curl -sf http://127.0.0.1:8090/v1/models >/dev/null && break; sleep 1; done
-          out=$(curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
-            -d '{"model":"Qwen3-0.6B-4bit","messages":[{"role":"user","content":"What is 2+3? Answer with the number."}],"max_tokens":8,"temperature":0}')
-          echo "$out"; tail -5 janis.log
+          out=$(curl -s --max-time 300 http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
+            -d '{"model":"Qwen3-0.6B-4bit","messages":[{"role":"user","content":"What is 2+3? Answer with the number."}],"max_tokens":8,"temperature":0}' || true)
+          echo "$out"; tail -40 janis.log; grep -o -m1 -E "asimddp|i8mm|sve" /proc/cpuinfo | sort -u | tr "\n" " "
           echo "$out" | grep -q '"content":"[^"]*5' || { echo "no 5 in the answer" >&2; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
