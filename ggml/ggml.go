@@ -81,8 +81,8 @@ type Backend struct {
 	// repack is the CPU's weight-repacking buffer type, nil on a device:
 	// where a dense 4-bit weight goes as Q4_K (see q4K).
 	repack C.ggml_backend_buffer_type_t
-	name string
-	mu   sync.Mutex
+	name   string
+	mu     sync.Mutex
 
 	rec     *C.struct_ggml_context // the recording context: nodes not yet computed
 	pending []pendingRef           // their results, in order, held weakly
