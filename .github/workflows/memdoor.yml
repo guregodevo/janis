@@ -1,0 +1,32 @@
+# Memdoor reviews and triages every pull request on a model inside the job:
+# Qwen3-8B on the runner's CPU, through janis. No key, so a pull request from
+# a fork is read too. pr-triage's verdict is advisory (the job never fails on
+# it); pr-review fails the check only on a P0.
+name: memdoor
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+  pull-requests: read
+concurrency:
+  group: memdoor-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  memdoor:
+    strategy:
+      fail-fast: false
+      matrix:
+        workflow: [pr-review, pr-triage]
+    name: ${{ matrix.workflow }} (local model)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: guregodevo/memdoor-action@v1
+        with:
+          workflow: ${{ matrix.workflow }}
+          local-model: Qwen3-8B-4bit
