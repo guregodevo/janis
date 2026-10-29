@@ -9,9 +9,11 @@ import (
 	"github.com/guregodevo/janis/engine"
 )
 
-// newBackend returns the portable pure-Go CPU backend (Linux, Intel Mac).
+// newBackend returns ggml in a build that links it (the Linux release, faster
+// on the same cores), else the portable pure-Go CPU backend (Linux, Intel Mac);
+// JANIS_BACKEND=cpu forces the pure-Go one.
 func newBackend() engine.Backend {
-	if os.Getenv("JANIS_BACKEND") == "ggml" && ggmlBackend != nil {
+	if ggmlBackend != nil && os.Getenv("JANIS_BACKEND") != "cpu" {
 		return ggmlBackend()
 	}
 	return cpu.New()

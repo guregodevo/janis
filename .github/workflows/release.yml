@@ -28,12 +28,11 @@ jobs:
           bash scripts/build-tokenizer.sh
           go build -tags ggml -trimpath -ldflags "-s -w" -o janis-linux-${{ matrix.arch }} ./cmd/janis
           ls -la janis-linux-${{ matrix.arch }}; ldd janis-linux-${{ matrix.arch }}
+          sha256sum janis-linux-${{ matrix.arch }} > janis-linux-${{ matrix.arch }}.sha256
       - name: Smoke test (Qwen3-0.6B, one answer)
         run: |
           mkdir -p "$RUNNER_TEMP/bin" && cp janis-linux-${{ matrix.arch }} "$RUNNER_TEMP/bin/janis" && cd "$RUNNER_TEMP"
-          ./bin/janis pull Qwen3-0.6B-4bit
-          JANIS_BACKEND=ggml nohup ./bin/janis serve --model Qwen3-0.6B-4bit > janis.log 2>&1 &
-          for i in $(seq 1 120); do curl -sf http://127.0.0.1:8090/v1/models >/dev/null && break; sleep 1; done
+          ./bin/janis serve --detach --model Qwen3-0.6B-4bit --log janis.log
           out=$(curl -s --max-time 300 http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
             -d '{"model":"Qwen3-0.6B-4bit","messages":[{"role":"user","content":"What is 2+3? Answer with the number."}],"max_tokens":8,"temperature":0}' || true)
           echo "$out"; tail -40 janis.log; grep -o -m1 -E "asimddp|i8mm|sve" /proc/cpuinfo | sort -u | tr "\n" " "
@@ -47,5 +46,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "janis for Linux, one file: janis-linux-amd64, janis-linux-arm64." || true
-          gh release upload "$GITHUB_REF_NAME" janis-linux-${{ matrix.arch }} --clobber
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "janis for Linux, one file: curl -fsSL https://github.com/guregodevo/janis/releases/latest/download/install.sh | sh" || true
+          gh release upload "$GITHUB_REF_NAME" janis-linux-${{ matrix.arch }} janis-linux-${{ matrix.arch }}.sha256 install.sh --clobber
+
+  # The release as a user gets it: install.sh from the release just made, then
+  # serve --detach, then one answer.
+  install:
+    needs: linux
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: install.sh, serve --detach, one answer
+        run: |
+          curl -fsSL "https://github.com/guregodevo/janis/releases/download/$GITHUB_REF_NAME/install.sh" | JANIS_VERSION="$GITHUB_REF_NAME" sh
+          export PATH="$HOME/.local/bin:$PATH"
+          janis serve --detach --model Qwen3-0.6B-4bit
+          out=$(curl -s --max-time 300 http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
+            -d '{"model":"Qwen3-0.6B-4bit","messages":[{"role":"user","content":"What is 2+3? Answer with the number."}],"max_tokens":8,"temperature":0}')
+          echo "$out"
+          echo "$out" | grep -q '"content":"[^"]*5' || { echo "no 5 in the answer" >&2; exit 1; }

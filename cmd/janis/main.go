@@ -3,7 +3,7 @@
 //
 //	janis pull [NAME]                download a model (none: the one that fits this machine)
 //	janis list                       the installed models
-//	janis serve [--port N] [--model NAME] [--host ADDR]
+//	janis serve [--port N] [--model NAME] [--host ADDR] [--detach]
 //
 // serve answers GET /v1/models and POST /v1/chat/completions (streamed or
 // not, with tools) on 127.0.0.1:8090 by default. A client on another
@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 
 	llm "github.com/guregodevo/janis"
 	"github.com/guregodevo/janis/hostfit"
@@ -42,7 +43,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: janis pull [NAME] | janis list | janis serve [--port 8090] [--host 127.0.0.1] [--model NAME]")
+	fmt.Fprintln(os.Stderr, "usage: janis pull [NAME] | janis list | janis serve [--port 8090] [--host 127.0.0.1] [--model NAME] [--detach]")
 }
 
 func list() {
@@ -66,7 +67,13 @@ func run(args []string) {
 	port := fs.Int("port", 8090, "the port to listen on")
 	host := fs.String("host", "127.0.0.1", "the address to bind (0.0.0.0 for the network)")
 	model := fs.String("model", "", "the installed model to load now (default: the first a request names)")
+	detach := fs.Bool("detach", false, "pull the model if missing, serve in the background, and return once it has answered")
+	logPath := fs.String("log", "", "with --detach, the server's output (default: janis-PORT.log in the temp directory)")
 	_ = fs.Parse(args)
+	if *detach {
+		detachServe(*host, *port, strings.TrimPrefix(*model, "mlx-community/"), *logPath)
+		return
+	}
 	srv, err := serve.New(*model)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

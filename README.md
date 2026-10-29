@@ -19,6 +19,22 @@ OpenAI-compatible client.
 
 Weights come from `huggingface.co/mlx-community` into `~/.cache/huggingface/`.
 
+## Install
+
+Linux (amd64, arm64), one file into `~/.local/bin`, sha256 checked:
+
+```bash
+curl -fsSL https://github.com/guregodevo/janis/releases/latest/download/install.sh | sh
+janis serve --detach --model Qwen3-8B-4bit   # pulls it, serves it, returns once it has answered
+```
+
+`--detach` is for a CI job or a script: the model is pulled when missing, the
+server runs in the background (its output in `janis-8090.log` in the temp
+directory, or `--log`), and the command returns once the model has answered
+a first request, so the first client does not pay for loading it. A taken
+port or a server that dies fails the command. `JANIS_VERSION=v0.1.2` pins a
+release. On a Mac janis builds from source with MLX ([Build](#build)).
+
 ## Serve
 
 `janis serve` runs the installed models the way llama.cpp or Ollama does,
@@ -89,7 +105,7 @@ about fifty ops); a backend is an implementation of it. Three exist:
 | Flavor | Backend | Where | How |
 |---|---|---|---|
 | janis | MLX | Apple Silicon | the default build (`make build`) |
-| janis-cuda | ggml, llama.cpp's tensor library: CUDA, Metal or CPU kernels | Linux with an NVIDIA GPU; also Metal and CPU on a Mac | `-tags ggml`, `JANIS_BACKEND=ggml`, `JANIS_GGML_DEVICE=gpu` |
+| janis-cuda | ggml, llama.cpp's tensor library: CUDA, Metal or CPU kernels | Linux with an NVIDIA GPU; also Metal and CPU on a Mac | `-tags ggml` (`JANIS_BACKEND=ggml` on a Mac; the default on Linux), `JANIS_GGML_DEVICE=gpu` |
 | janis-cpu | pure Go | anywhere | `CGO_ENABLED=0`, or `JANIS_BACKEND=cpu` |
 
 The ggml backend (package `ggml`, 2026-10-25) links ggml at llama.cpp's
@@ -149,13 +165,9 @@ make build                      # provisions lib/libtokenizers.a, then go build 
 make test
 ```
 
-Linux, one file (ggml's CPU kernels and the tokenizer linked in; a CI job
-downloads it and runs it):
-
-```bash
-curl -fsSL -o janis https://github.com/guregodevo/janis/releases/latest/download/janis-linux-amd64   # or -arm64
-chmod +x janis && ./janis pull Qwen3-8B-4bit && JANIS_BACKEND=ggml ./janis serve
-```
+Linux, one file (ggml's CPU kernels and the tokenizer linked in, ggml the
+backend unless `JANIS_BACKEND=cpu`): the release's `install.sh` ([Install](#install)),
+or `scripts/fetch-ggml.sh --static` and `go build -tags ggml ./cmd/janis`.
 
 Anywhere, without MLX or cgo:
 
