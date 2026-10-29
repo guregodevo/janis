@@ -3,6 +3,7 @@
 package ggml
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 	"runtime"
@@ -338,4 +339,35 @@ func TestAResidualChainHoldsItsAncestryOnce(t *testing.T) {
 		t.Fatalf("%d values in %s", len(out), time.Since(start))
 	}
 	t.Logf("60 residual links in %s; batch: %d results, %d held", time.Since(start).Round(time.Millisecond), g.lastBatch.results, g.lastBatch.held)
+}
+
+// An MLX row (codes 0..15, a positive scale and a negative bias per group of
+// 64) packed to Q4_K comes back through ggml's own dequantization within
+// Q4_K's rounding: the 6-bit scales and mins are the only loss.
+func TestPackQ4KKeepsAnAffineRow(t *testing.T) {
+	const in, gs = 1024, 64
+	codes, sc, bi := rndPackedU32(in/8, 7), rnd(in/gs, 8), rnd(in/gs, 9)
+	row := make([]float32, in)
+	var span float64
+	for g := range sc {
+		sc[g] = 0.002 + float32(math.Abs(float64(sc[g])))*0.01
+		bi[g] = -8 * sc[g] * (1 + bi[g]*0.2)
+		span = math.Max(span, float64(15*sc[g]))
+	}
+	for e := range row {
+		q := (binary.LittleEndian.Uint32(codes[4*(e/8):]) >> uint((e%8)*4)) & 0xF
+		row[e] = float32(q)*sc[e/gs] + bi[e/gs]
+	}
+	raw := make([]byte, in/256*q4KBlock)
+	for k := 0; k < in/256; k++ {
+		packQ4K(row[k*256:(k+1)*256], raw[k*q4KBlock:])
+	}
+	worst := 0.0
+	for i, v := range unpackQ4K(raw, in) {
+		worst = math.Max(worst, math.Abs(float64(v-row[i])))
+	}
+	if worst > span/30 {
+		t.Fatalf("worst |Q4_K - source| %.4g, more than a 30th of the widest group's range %.4g", worst, span)
+	}
+	t.Logf("worst |Q4_K - source| %.4g against a widest range of %.4g", worst, span)
 }
