@@ -23,8 +23,9 @@ package ggml
 /*
 #cgo CFLAGS: -I${SRCDIR}/third_party/macos-arm64/include -I${SRCDIR}/third_party/ubuntu-x64/include -I${SRCDIR}/third_party/ubuntu-arm64/include
 #cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/third_party/macos-arm64/lib -lggml -lggml-base -lggml-cpu -Wl,-rpath,${SRCDIR}/third_party/macos-arm64/lib
-#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/third_party/ubuntu-x64/lib -lggml -lggml-base -lggml-cpu -Wl,-rpath,${SRCDIR}/third_party/ubuntu-x64/lib
-#cgo linux,arm64 LDFLAGS: -L${SRCDIR}/third_party/ubuntu-arm64/lib -lggml -lggml-base -lggml-cpu -Wl,-rpath,${SRCDIR}/third_party/ubuntu-arm64/lib
+#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/third_party/ubuntu-x64/lib -lggml -lggml-cpu -lggml-base -Wl,-rpath,${SRCDIR}/third_party/ubuntu-x64/lib
+#cgo linux,arm64 LDFLAGS: -L${SRCDIR}/third_party/ubuntu-arm64/lib -lggml -lggml-cpu -lggml-base -Wl,-rpath,${SRCDIR}/third_party/ubuntu-arm64/lib
+#cgo linux LDFLAGS: -lstdc++ -lm
 #include <stdlib.h>
 #include <string.h>
 #include "ggml.h"

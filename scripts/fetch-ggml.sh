@@ -13,19 +13,23 @@
 # --cuda (Linux with an NVIDIA GPU) adds the CUDA kernels with the toolkit on
 # the machine (a Deep Learning VM has both); the backend loads
 # libggml-cuda.so at run time (JANIS_GGML_DEVICE=gpu).
+# --static builds the CPU kernels as static archives, ggml's own thread pool
+# in place of OpenMP: janis links them in and ships as one file (the
+# release; a CI job downloads it and runs it, nothing beside it).
 set -euo pipefail
 TAG=${GGML_TAG:-b8640}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 if [ "$(uname -s)" = Linux ]; then
-	cuda=; [ "${1:-}" = "--cuda" ] && cuda=1
+	cuda=; static=
+	case "${1:-}" in --cuda) cuda=1 ;; --static) static=1 ;; esac
 	command -v cmake >/dev/null || { echo "cmake is needed to build ggml on Linux" >&2; exit 1; }
 	[ -z "$cuda" ] || command -v nvcc >/dev/null || { echo "nvcc (the CUDA toolkit) is needed" >&2; exit 1; }
 	DEST="$ROOT/ggml/third_party/ubuntu-$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')"
-	flavor=${cuda:+cuda}; flavor=${flavor:-cpu}
+	flavor=cpu; [ -n "$cuda" ] && flavor=cuda; [ -n "$static" ] && flavor=cpu-static
 	if [ -f "$DEST/.tag" ] && [ "$(cat "$DEST/.tag")" = "$TAG-$flavor" ]; then
 		exit 0
 	fi
-	mkdir -p "$DEST/lib" "$DEST/include"
+	rm -rf "$DEST/lib" && mkdir -p "$DEST/lib" "$DEST/include"
 	# The source and the build live under the repo (gitignored), not /tmp: a
 	# machine stopped mid-build resumes where it was instead of starting over.
 	tmp="$ROOT/ggml/third_party/build-$flavor-$TAG"
@@ -39,15 +43,17 @@ if [ "$(uname -s)" = Linux ]; then
 	# (GGML_CUDA_ARCH names others, e.g. "75;86;89"; cmake 3.22 has no
 	# "native"): every fattn template instance otherwise compiles once per
 	# architecture, an hour on four cores.
-	gpu=(); targets=(ggml ggml-base ggml-cpu)
+	gpu=(); targets=(ggml ggml-base ggml-cpu); shared=ON; omp=ON
+	[ -n "$static" ] && shared=OFF omp=OFF
 	if [ -n "$cuda" ]; then
 		gpu=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${GGML_CUDA_ARCH:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')}")
 		targets+=(ggml-cuda)
 	fi
-	cmake -S "$src" -B "$tmp/build" "${gpu[@]}" -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release \
+	cmake -S "$src" -B "$tmp/build" "${gpu[@]}" -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=$shared -DGGML_OPENMP=$omp \
+		-DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_BUILD_TYPE=Release \
 		-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF >/dev/null
 	cmake --build "$tmp/build" --config Release -j"$(nproc)" --target "${targets[@]}" 2>&1 | tail -3
-	find "$tmp/build" -name 'libggml*.so*' -exec cp -a {} "$DEST/lib/" \;
+	find "$tmp/build" \( -name 'libggml*.so*' -o -name 'libggml*.a' \) -exec cp -a {} "$DEST/lib/" \;
 	cp "$src"/ggml/include/*.h "$DEST/include/"
 	echo "$TAG-$flavor" > "$DEST/.tag"
 	echo "✓ ggml $TAG ($flavor) → $DEST ($(ls "$DEST/lib" | wc -l | tr -d ' ') libraries)"
