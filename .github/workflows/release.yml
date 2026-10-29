@@ -5,7 +5,6 @@ name: release
 on:
   push:
     tags: ['v*']
-    branches: [linux-cpu]
   workflow_dispatch:
 permissions:
   contents: write
