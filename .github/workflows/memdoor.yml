@@ -1,7 +1,7 @@
 # Memdoor reviews and triages every pull request on a model inside the job:
 # Qwen3-8B on the runner's CPU, through janis. No key, so a pull request from
-# a fork is read too. pr-triage's verdict is advisory (the job never fails on
-# it); pr-review fails the check only on a P0.
+# a fork is read too. Both are advisory: pr-triage's verdict and, on a local
+# model, pr-review's P0s are in the job summary, never a failed check.
 name: memdoor
 on:
   pull_request:
