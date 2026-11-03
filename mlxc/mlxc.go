@@ -11,6 +11,7 @@ package mlxc
 #cgo darwin LDFLAGS: -L/opt/homebrew/lib -lmlxc -lmlx -lc++ -Wl,-rpath,/opt/homebrew/lib -framework Foundation -framework Metal -framework Accelerate
 #include <stdlib.h>
 #include "mlx/c/mlx.h"
+#include "compat.h"
 */
 import "C"
 
@@ -482,7 +483,7 @@ func (b *Backend) SDPA(q, k, v engine.Tensor, scale float32, causal bool) engine
 	mode := C.CString(modeStr)
 	defer C.free(unsafe.Pointer(mode))
 	var nullMask, nullSinks C.mlx_array
-	C.mlx_fast_scaled_dot_product_attention(&out, tq.arr, tk.arr, tv.arr, C.float(scale), mode, nullMask, nullSinks, b.stream)
+	C.janis_sdpa(&out, tq.arr, tk.arr, tv.arr, C.float(scale), mode, nullMask, nullSinks, b.stream)
 	return b.newT(out, cloneShape(tq.shape))
 }
 
@@ -608,7 +609,7 @@ func (b *Backend) GatherQuantMatmul(x, w, scales, biases, rhsIndices engine.Tens
 	mode := C.CString("affine")
 	defer C.free(unsafe.Pointer(mode))
 	var nullArr C.mlx_array // lhs_indices = null (no left gather)
-	C.mlx_gather_qmm(&out, tx.arr, tw.arr, ts.arr, tb.arr, nullArr, tr.arr,
+	C.janis_gather_qmm(&out, tx.arr, tw.arr, ts.arr, tb.arr, nullArr, tr.arr,
 		C.bool(transpose), optInt(groupSize), optInt(bits), mode, C.bool(false), b.stream)
 	// x is [..lead.., 1, 1, in] (mlx-lm's double expand_dims); the result keeps
 	// an M=1 axis -> shape = rhsIndices.shape + [1, w.out]. w is [E, out, in_p].
