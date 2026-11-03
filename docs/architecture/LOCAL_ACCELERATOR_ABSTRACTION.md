@@ -101,8 +101,9 @@ which took the CPU backend ~18× over the naive first cut.
 On a GPU the limit is RAM; on CPU it's compute. `memdoor llm auto` and the
 gateway's `resolveMLXModelDir` both branch on `llm.Accelerated()`:
 
-- **GPU (MLX):** scale with RAM — Qwen3 4B → 8B → 14B → 32B.
-- **CPU:** cap at a small **Qwen3-4B** regardless of RAM (an 8B fits but decodes
+- **GPU (MLX):** scale with RAM — Qwen3-4B, Qwen3.5-9B at 16 GB, Qwen3.8-27B
+  at 32 GB and up (`hostfit.Recommend`).
+- **CPU:** cap at a small **Qwen3-1.7B** regardless of RAM (an 8B fits but decodes
   too slowly). The resolver also caps the largest *cached* model it will load.
 
 `hostRAMGiB` reads `/proc/meminfo` on Linux, `sysctl hw.memsize` on macOS.

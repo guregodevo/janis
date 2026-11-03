@@ -54,13 +54,14 @@ func (h Host) Recommend() string {
 		return "Qwen3-1.7B-4bit"
 	}
 	switch {
-	case h.RAMGiB >= 64:
-		// Qwen3.8-27B is the model Memdoor's published result ran on (a team
-		// of five, LiveCodeBench Hard, 2026-10); about 16 GB of weights at
-		// 4-bit, room for a long context on 64 GB.
-		return "Qwen3.8-27B-4bit"
 	case h.RAMGiB >= 32:
-		return "Qwen3-14B-4bit"
+		// Qwen3.8-27B is the model Memdoor's published result ran on (a team
+		// of five, LiveCodeBench Hard, 2026-10). 15 GiB of weights at 4-bit;
+		// a hybrid with 16 full-attention layers of 64, so its KV cache is
+		// 2 GiB at 32K tokens, 8 GiB at 128K. On a 32 GB Mac the GPU may wire
+		// about 24 GiB: the weights and a 32K context fit, and the older
+		// Qwen3-14B it replaces lost a generation for no room gained.
+		return "Qwen3.8-27B-4bit"
 	case h.RAMGiB >= 16:
 		// Qwen3.5-9B replaced Qwen3-8B as the 16 GB default (2026-09-01): the
 		// hybrid linear-attention stack decodes FASTER in this engine (11.5 vs
