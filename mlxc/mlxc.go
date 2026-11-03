@@ -45,7 +45,7 @@ type Backend struct {
 
 // New constructs an MLX-C backend bound to the default GPU (Metal) stream.
 func New() *Backend {
-	b := &Backend{stream: C.mlx_default_gpu_stream_new()}
+	b := &Backend{stream: C.janis_gpu_stream()}
 	// Bound MLX's buffer-reuse cache. By default it's UNBOUNDED: freed Metal
 	// buffers are retained for reuse keyed by size, so a workload with varying
 	// tensor sizes (different prompt / page lengths) accumulates a buffer per

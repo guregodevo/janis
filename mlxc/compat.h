@@ -11,8 +11,31 @@
 #ifndef JANIS_MLXC_COMPAT_H
 #define JANIS_MLXC_COMPAT_H
 
+#include <dlfcn.h>
 #include <stdbool.h>
 #include "mlx/c/mlx.h"
+
+typedef mlx_stream (*janis_stream_new_thread_unsafe)(mlx_device);
+
+// janis_gpu_stream is the backend's one stream on the GPU. From mlx-c 0.8.0
+// (MLX 0.32) a stream is thread affine: its command encoder is registered on
+// the thread that made it, and evaluating from another thread fails with
+// "There is no Stream(gpu, 0) in current thread". Go moves goroutines between
+// threads, so janis asks for the stream "that can be used from any thread"
+// (mlx_stream_new_thread_unsafe) when the library has it, looked up by name
+// so the same source builds against 0.6.0, and the default GPU stream
+// otherwise. MLX applies no synchronization to such a stream; janis's gpuMu
+// serializes every call on it.
+static inline mlx_stream janis_gpu_stream(void) {
+	janis_stream_new_thread_unsafe any_thread =
+	    (janis_stream_new_thread_unsafe)dlsym(RTLD_DEFAULT, "mlx_stream_new_thread_unsafe");
+	if (any_thread == NULL)
+		return mlx_default_gpu_stream_new();
+	mlx_device gpu = mlx_device_new_type(MLX_GPU, 0);
+	mlx_stream s = any_thread(gpu);
+	mlx_device_free(gpu);
+	return s;
+}
 
 typedef int (*janis_sdpa_v06)(mlx_array*, mlx_array, mlx_array, mlx_array, float, const char*, mlx_array, mlx_array, mlx_stream);
 typedef int (*janis_sdpa_v08)(mlx_array*, mlx_array, mlx_array, mlx_array, float, const char*, mlx_array, mlx_array, bool, mlx_stream);
