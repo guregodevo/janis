@@ -30,7 +30,13 @@ jobs:
         run: brew install mlx mlx-c
       - name: make dist
         run: make dist
+      # GitHub's macOS VMs have no Metal device (MLX: "There is no Stream(gpu,
+      # 0)"), so there the answer comes from the pure-Go CPU backend; it still
+      # proves the archive launches with its bundled libraries, pulls, serves
+      # and answers. The GPU path is checked on hardware: make dist-check on a Mac.
       - name: make dist-check (Qwen3-0.6B-4bit, one answer)
+        env:
+          JANIS_BACKEND: ${{ runner.os == 'macOS' && 'cpu' || '' }}
         run: make dist-check
       - uses: actions/upload-artifact@v4
         with:
@@ -60,6 +66,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: install.sh, serve --detach, one answer
+        env:
+          JANIS_BACKEND: ${{ runner.os == 'macOS' && 'cpu' || '' }}
         run: |
           curl -fsSL "https://github.com/guregodevo/janis/releases/download/$GITHUB_REF_NAME/install.sh" | JANIS_VERSION="$GITHUB_REF_NAME" sh
           bash scripts/smoke.sh "$HOME/.local/bin/janis"
