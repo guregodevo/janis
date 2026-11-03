@@ -1,6 +1,7 @@
 package qwen35
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/guregodevo/janis/cpu"
@@ -8,11 +9,9 @@ import (
 	"github.com/guregodevo/janis/qwen"
 )
 
-// A hybrid session's recurrent layer cannot be cut back to a prefix, so the
-// second conversation sharing a system prompt with the first prefills from
-// scratch; it marks where the two parted, and the third starts there.
-func TestHybridSessionReturnsToTheMark(t *testing.T) {
-	b := cpu.New()
+// hybridSession is a two-layer session, one recurrent layer and one KV
+// layer, on a fake forward that records what it was asked to prefill.
+func hybridSession(b engine.Backend) (*qwen.Session, func() int, func()) {
 	var forwarded [][2]int // offset, tokens of each Forward
 	forward := func(b engine.Backend, _ engine.Tensor, n, offset int, caches []qwen.LayerCache) engine.Tensor {
 		forwarded = append(forwarded, [2]int{offset, n})
@@ -41,100 +40,130 @@ func TestHybridSessionReturnsToTheMark(t *testing.T) {
 		}
 		return n
 	}
+	return s, total, func() { forwarded = nil }
+}
+
+// A hybrid session's recurrent layer cannot be cut back to a prefix, so the
+// second conversation sharing a system prompt with the first prefills from
+// scratch; it marks where the two parted, and the third starts there.
+func TestHybridSessionReturnsToTheMark(t *testing.T) {
+	b := cpu.New()
+	s, total, reset := hybridSession(b)
 	system := []int32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
 	conversation := func(turn ...int32) []int32 { return append(append([]int32(nil), system...), turn...) }
-
-	s.Prefill(b, conversation(101, 102, 103), nil)
-	if total() != 13 || s.Mark != 0 {
-		t.Fatalf("the first conversation prefills everything and marks nothing: %d tokens, mark %d", total(), s.Mark)
+	step := func(name string, prompt []int32, wantForwarded int, wantMarks ...int) {
+		t.Helper()
+		reset()
+		s.Prefill(b, prompt, nil)
+		if total() != wantForwarded || fmt.Sprint(s.Marks()) != fmt.Sprint(wantMarks) {
+			t.Fatalf("%s: %d tokens prefilled, marks %v; want %d and %v", name, total(), s.Marks(), wantForwarded, wantMarks)
+		}
 	}
 
-	forwarded = nil
-	s.Prefill(b, conversation(201, 202), nil)
-	if total() != 12 || s.Mark != 10 {
-		t.Fatalf("the second shares the system prompt but the recurrent state cannot return to it: everything again (%d tokens), marked where they parted (%d)", total(), s.Mark)
+	step("the first conversation prefills everything and marks nothing", conversation(101, 102, 103), 13)
+	step("the second shares the system prompt but the recurrent state cannot return to it: everything again, a mark where they parted", conversation(201, 202), 12, 10)
+	linear := s.Caches[0].(*LinearCache)
+	if m, ok := linear.marks[10]; !ok || b.Floats(m.state)[0] != 10 {
+		t.Fatalf("the recurrent layer keeps its state at the mark: %v", linear.marks)
 	}
-	ends := map[int]bool{}
-	for _, f := range forwarded {
-		ends[f[0]+f[1]] = true
+	step("the third starts at the mark", conversation(301), 1, 10)
+	if linear.Len() != 11 || s.Caches[1].Len() != 11 {
+		t.Fatalf("both layers hold the prompt: %d %d", linear.Len(), s.Caches[1].Len())
 	}
-	if !ends[10] {
-		t.Fatalf("a chunk ends at the mark so the state kept is the one at that length: %v", forwarded)
+	step("a turn that extends the prompt prefills the new token only", conversation(301, 302), 1, 10)
+	step("a follow-up whose rendered reply differs from the generated one parts after the turn: back to the system prompt, a mark at the turn's end too", conversation(301, 303, 304), 3, 10, 11)
+	step("a new conversation after that still returns to the system prompt", conversation(401), 1, 10)
+	step("a prompt that parts before every mark drops them, prefills everything and marks the new parting", []int32{1, 2, 3, 99, 98}, 5, 3)
+	step("a prompt sharing the mark exactly returns to it", conversation(501), 8, 3)
+	step("a prompt sharing more than the mark returns to it and adds a mark where the two parted", conversation(601), 8, 3, 10)
+	step("the next one starts at the new mark", conversation(701), 1, 3, 10)
+}
+
+// The marks stay few: the least recently returned to goes first.
+func TestHybridSessionForgetsTheLeastUsedMark(t *testing.T) {
+	b := cpu.New()
+	s, _, reset := hybridSession(b)
+	prefix := func(n int, tail ...int32) []int32 {
+		ids := make([]int32, n)
+		for i := range ids {
+			ids[i] = int32(i + 1)
+		}
+		return append(ids, tail...)
+	}
+	// Marks nest: each is a prefix of the next. Two prompts parting at a
+	// length make its mark; in rising order they make 2, 4, 6, 8.
+	s.Prefill(b, prefix(10), nil)
+	for _, at := range []int{2, 4, 6, 8} {
+		reset()
+		s.Prefill(b, prefix(at, 90), nil)
+		reset()
+		s.Prefill(b, prefix(at, 91), nil)
+	}
+	if fmt.Sprint(s.Marks()) != "[2 4 6 8]" {
+		t.Fatalf("four marks: %v", s.Marks())
+	}
+	reset()
+	s.Prefill(b, prefix(2, 80), nil) // returns to 2: drops the marks past it
+	if fmt.Sprint(s.Marks()) != "[2]" {
+		t.Fatalf("a return to 2 drops the marks past it: %v", s.Marks())
+	}
+	for _, at := range []int{4, 6, 8} {
+		reset()
+		s.Prefill(b, prefix(at, 70, 71), nil)
+		reset()
+		s.Prefill(b, prefix(at, 72, 73), nil)
+	}
+	// Marks 2 (used first), 4, 6, 8 (each used by its second prompt): a fifth
+	// forgets 2, the least recently used.
+	reset()
+	s.Prefill(b, prefix(9, 60, 61), nil)
+	reset()
+	s.Prefill(b, prefix(9, 62), nil)
+	if fmt.Sprint(s.Marks()) != "[4 6 8 9]" {
+		t.Fatalf("a fifth mark forgets the least used: %v", s.Marks())
 	}
 	linear := s.Caches[0].(*LinearCache)
-	if linear.mark == nil || linear.mark.steps != 10 || b.Floats(linear.mark.state)[0] != 10 {
-		t.Fatalf("the recurrent layer keeps its state at the mark: %+v", linear.mark)
-	}
-
-	forwarded = nil
-	s.Prefill(b, conversation(301), nil)
-	if total() != 1 || s.Mark != 10 || linear.Len() != 11 || s.Caches[1].Len() != 11 {
-		t.Fatalf("the third starts at the mark: %d tokens prefilled, mark %d, lengths %d %d", total(), s.Mark, linear.Len(), s.Caches[1].Len())
-	}
-	if linear.mark == nil || linear.mark.steps != 10 {
-		t.Fatal("the mark stays for the next conversation")
-	}
-
-	forwarded = nil
-	s.Prefill(b, conversation(301, 302), nil)
-	if total() != 1 {
-		t.Fatalf("a turn that extends the prompt prefills the new token only: %d", total())
-	}
-
-	forwarded = nil
-	s.Prefill(b, []int32{1, 2, 3, 99, 98}, nil)
-	if total() != 5 || s.Mark != 3 || linear.mark == nil || linear.mark.steps != 3 {
-		t.Fatalf("a prompt that parts before the mark drops it, prefills everything and marks the new parting: %d tokens, mark %d", total(), s.Mark)
-	}
-
-	// A mark at 3, then prompts that share 10 with each other: the first
-	// returns to 3 (all it shares with the prompt before), the second returns
-	// to 3 and moves the mark to 10, the third starts at 10. The shape of a
-	// server's warm-up request ("ok", sharing the template's first token)
-	// followed by real conversations.
-	forwarded = nil
-	s.Prefill(b, conversation(401), nil)
-	if total() != 8 || s.Mark != 3 {
-		t.Fatalf("a prompt sharing the mark exactly returns to it: %d tokens, mark %d", total(), s.Mark)
-	}
-	forwarded = nil
-	s.Prefill(b, conversation(501), nil)
-	if total() != 8 || s.Mark != 10 || linear.mark.steps != 10 {
-		t.Fatalf("a prompt sharing more than the mark returns to it and moves the mark up: %d tokens, mark %d", total(), s.Mark)
-	}
-	forwarded = nil
-	s.Prefill(b, conversation(601), nil)
-	if total() != 1 {
-		t.Fatalf("the next one starts at the moved mark: %d tokens", total())
+	if len(linear.marks) != 4 || len(linear.Tensors()) != 2+2*4 {
+		t.Fatalf("the recurrent layer forgot it too: %d marks, %d tensors", len(linear.marks), len(linear.Tensors()))
 	}
 }
 
-// The mark's tensors are in the cache's tensor list, so the sweeper keeps
-// them, and a reset drops them.
-func TestLinearCacheMark(t *testing.T) {
+// The marks' tensors are in the cache's tensor list, so the sweeper keeps
+// them; a truncation drops the marks past it, a reset drops them all.
+func TestLinearCacheMarks(t *testing.T) {
 	b := cpu.New()
 	c := &LinearCache{}
 	c.Mark()
-	if c.mark != nil {
+	if len(c.marks) != 0 {
 		t.Fatal("an empty cache marks nothing")
 	}
-	c.Conv, c.State, c.steps = b.FromFloats([]float32{1}, 1), b.FromFloats([]float32{1}, 1), 4
-	c.Mark()
-	c.Conv, c.State, c.steps = b.FromFloats([]float32{2}, 1), b.FromFloats([]float32{2}, 1), 7
-	if len(c.Tensors()) != 4 {
-		t.Fatalf("live state and mark are both kept: %d tensors", len(c.Tensors()))
+	at := func(n int) {
+		c.Conv, c.State, c.steps = b.FromFloats([]float32{float32(n)}, 1), b.FromFloats([]float32{float32(n)}, 1), n
 	}
-	for n, want := range map[int]bool{0: true, 3: false, 4: true, 5: false, 7: true, 9: true} {
+	at(4)
+	c.Mark()
+	at(7)
+	c.Mark()
+	at(9)
+	if len(c.Tensors()) != 6 {
+		t.Fatalf("live state and two marks are kept: %d tensors", len(c.Tensors()))
+	}
+	for n, want := range map[int]bool{0: true, 3: false, 4: true, 5: false, 7: true, 9: true, 12: true} {
 		if c.CanTruncate(n) != want {
 			t.Errorf("CanTruncate(%d) = %v", n, !want)
 		}
 	}
 	c.Truncate(b, 4)
-	if c.Len() != 4 || b.Floats(c.State)[0] != 1 || c.mark == nil {
-		t.Fatalf("Truncate to the mark restores its state and keeps the mark: len %d", c.Len())
+	if c.Len() != 4 || b.Floats(c.State)[0] != 4 || len(c.marks) != 1 {
+		t.Fatalf("Truncate to a mark restores its state and drops the marks past it: len %d, %d marks", c.Len(), len(c.marks))
 	}
+	c.Forget(4)
+	if len(c.marks) != 0 || len(c.Tensors()) != 2 {
+		t.Fatal("a forgotten mark is gone")
+	}
+	c.Mark()
 	c.Truncate(b, 0)
-	if c.Len() != 0 || c.mark != nil || len(c.Tensors()) != 0 {
-		t.Fatal("a reset drops the state and the mark")
+	if c.Len() != 0 || len(c.marks) != 0 || len(c.Tensors()) != 0 {
+		t.Fatal("a reset drops the state and the marks")
 	}
 }

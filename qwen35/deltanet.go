@@ -16,61 +16,74 @@ import (
 
 // LinearCache is a Gated DeltaNet layer's cross-step state: the causal-conv
 // tail (last K-1 input rows) and the recurrent delta-rule state. Unlike a KV
-// cache it holds no per-token history, so it can be cut back to one
-// mid-history point only: the mark, a copy of the state kept where the
-// session asked for it (the end of the prompt two conversations shared).
+// cache it holds no per-token history, so it can be cut back only to a
+// mark: a copy of the state kept at a length the session asked for (where
+// two prompts parted: the end of a shared system prompt, the end of a
+// turn). The session keeps the set small (Forget).
 type LinearCache struct {
 	Conv  engine.Tensor // [1, K-1, convDim], activation dtype
 	State engine.Tensor // [1, Hv, Dv, Dk], float32
 	steps int
 
-	mark *linearMark
+	marks map[int]linearMark // by length
 }
 
 // linearMark is the state at one earlier length. The forward pass makes new
 // tensors each step and never writes into these, so they stay as they were.
 type linearMark struct {
 	conv, state engine.Tensor
-	steps       int
 }
 
 func (c *LinearCache) Len() int { return c.steps }
 
 func (c *LinearCache) CanTruncate(n int) bool {
-	return n == 0 || n >= c.steps || (c.mark != nil && n == c.mark.steps)
+	if n == 0 || n >= c.steps {
+		return true
+	}
+	_, ok := c.marks[n]
+	return ok
 }
 
-// Truncate returns to the mark when n is its length, else resets; a reset
-// drops the mark too, since the prefix before it has changed.
+// Truncate returns to the mark at n, or resets when n is 0. The marks past
+// n go: the prefix they were made on changes from n.
 func (c *LinearCache) Truncate(_ engine.Backend, n int) {
-	switch {
-	case n >= c.steps:
+	if n >= c.steps {
 		return
-	case c.mark != nil && n == c.mark.steps:
-		c.Conv, c.State, c.steps = c.mark.conv, c.mark.state, c.mark.steps
-	default:
-		c.Conv, c.State, c.steps, c.mark = nil, nil, 0, nil
+	}
+	if m, ok := c.marks[n]; ok {
+		c.Conv, c.State, c.steps = m.conv, m.state, n
+	} else {
+		c.Conv, c.State, c.steps = nil, nil, 0
+	}
+	for at := range c.marks {
+		if at > n {
+			delete(c.marks, at)
+		}
 	}
 }
 
 func (c *LinearCache) Mark() {
 	if c.steps == 0 {
-		c.mark = nil
 		return
 	}
-	c.mark = &linearMark{conv: c.Conv, state: c.State, steps: c.steps}
+	if c.marks == nil {
+		c.marks = map[int]linearMark{}
+	}
+	c.marks[c.steps] = linearMark{conv: c.Conv, state: c.State}
 }
 
+func (c *LinearCache) Forget(n int) { delete(c.marks, n) }
+
 func (c *LinearCache) Tensors() []engine.Tensor {
-	ts := make([]engine.Tensor, 0, 4)
+	ts := make([]engine.Tensor, 0, 2+2*len(c.marks))
 	if c.Conv != nil {
 		ts = append(ts, c.Conv)
 	}
 	if c.State != nil {
 		ts = append(ts, c.State)
 	}
-	if c.mark != nil {
-		ts = append(ts, c.mark.conv, c.mark.state)
+	for _, m := range c.marks {
+		ts = append(ts, m.conv, m.state)
 	}
 	return ts
 }

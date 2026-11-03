@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sort"
 	"strconv"
 
 	"github.com/guregodevo/janis/engine"
@@ -52,12 +53,86 @@ type Session struct {
 	IDs    []int32 // tokens currently materialized in the caches
 	Caches []LayerCache
 
-	// Mark is the length every cache can return to, 0 for none: where the
-	// last two prompts that shared a prefix parted (a coder's system prompt
-	// and tools, the same in every conversation). A KV cache returns to any
-	// length; a recurrent one only to its mark, so without one a hybrid
-	// model prefilled every new conversation from its first token.
-	Mark int
+	// marks are the lengths every cache can return to: where two prompts
+	// that shared a prefix parted (the end of a coder's system prompt and
+	// tools, the same in every conversation; the end of a turn whose reply
+	// the client renders differently). A KV cache returns to any length; a
+	// recurrent one only to a mark, so without them a hybrid model prefilled
+	// every new conversation from its first token. At most maxMarks, the
+	// least recently returned to forgotten first.
+	marks []sessionMark
+	uses  int
+}
+
+type sessionMark struct{ at, used int }
+
+// maxMarks bounds what the recurrent layers keep: for the 27B about 100 MB
+// a mark across its 48 linear layers.
+const maxMarks = 4
+
+// Marks lists the lengths the session can return to, for tests and traces.
+func (s *Session) Marks() []int {
+	out := make([]int, len(s.marks))
+	for i, m := range s.marks {
+		out[i] = m.at
+	}
+	sort.Ints(out)
+	return out
+}
+
+// markBelow is the largest mark at or below n, 0 for none.
+func (s *Session) markBelow(n int) int {
+	best := 0
+	for _, m := range s.marks {
+		if m.at <= n && m.at > best {
+			best = m.at
+		}
+	}
+	return best
+}
+
+// returned records a return to the mark at n and drops the marks past n,
+// whose prefix changes from there.
+func (s *Session) returned(n int) {
+	s.uses++
+	kept := s.marks[:0]
+	for _, m := range s.marks {
+		if m.at == n {
+			m.used = s.uses
+		}
+		if m.at <= n {
+			kept = append(kept, m)
+		}
+	}
+	s.marks = kept
+}
+
+// mark keeps every cache's state at its current length, n, forgetting the
+// least recently used mark when there are too many.
+func (s *Session) mark(n int) {
+	for _, c := range s.Caches {
+		c.Mark()
+	}
+	s.uses++
+	for i := range s.marks {
+		if s.marks[i].at == n {
+			s.marks[i].used = s.uses
+			return
+		}
+	}
+	s.marks = append(s.marks, sessionMark{at: n, used: s.uses})
+	if len(s.marks) > maxMarks {
+		old := 0
+		for i, m := range s.marks {
+			if m.used < s.marks[old].used {
+				old = i
+			}
+		}
+		for _, c := range s.Caches {
+			c.Forget(s.marks[old].at)
+		}
+		s.marks = append(s.marks[:old], s.marks[old+1:]...)
+	}
 }
 
 func (s *Session) newCache(layer int) LayerCache {
@@ -126,20 +201,22 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 		// prefix: the session returns to the mark when the prompts share it,
 		// else resets, re-prefills from scratch and marks where they parted.
 		// Prefix EXTENSION (the common multi-turn case) never lands here.
-		// The mark follows the latest parting point: a prompt sharing more
-		// than the mark moves it up (a server's warm-up request shares only
-		// the template's first token with the prompts that follow, and a
-		// mark left there would hold every later prompt to one reused token).
+		// Else the largest mark at or below P, and a new mark at P: the
+		// prompts parted there, the next one may part there too (a server's
+		// warm-up request shares one token with the prompts after it; a
+		// follow-up turn parts at the end of the last turn; a new
+		// conversation at the end of the system prompt). Each gets a mark,
+		// the set stays small, the least used goes first.
 		if !canTruncate(s.Caches, P) {
-			if s.Mark > 0 && s.Mark < P && canTruncate(s.Caches, s.Mark) {
-				want, P = P, s.Mark
-			} else {
-				want, P, s.Mark = P, 0, 0
+			want, P = P, s.markBelow(P)
+			if !canTruncate(s.Caches, P) {
+				P = 0
 			}
 		}
 		for _, c := range s.Caches {
 			c.Truncate(b, P)
 		}
+		s.returned(P)
 	}
 
 	// A previous prompt whose caches are not reused, or only a prefix of
@@ -174,7 +251,7 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 
 	if debugPrefill {
 		head := func(ids []int32) []int32 { return ids[:min(4, len(ids))] }
-		debugLog("prefill: total=%d reused=%d new=%d (chunk=%d) mark=%d had=%v got=%v", len(newIDs), P, len(suffix), chunkSize, s.Mark, head(s.IDs), head(newIDs))
+		debugLog("prefill: total=%d reused=%d new=%d (chunk=%d) marks=%v had=%v got=%v", len(newIDs), P, len(suffix), chunkSize, s.Marks(), head(s.IDs), head(newIDs))
 	}
 	var logits engine.Tensor
 	for i := 0; i < len(suffix); {
@@ -193,10 +270,7 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 		logits = s.Forward(b, b.FromInt32(chunk, len(chunk)), len(chunk), offset, s.Caches)
 		offset += len(chunk)
 		if want > 0 && offset == want {
-			for _, c := range s.Caches {
-				c.Mark()
-			}
-			s.Mark = want
+			s.mark(want)
 		}
 		if sw != nil {
 			// Force this chunk's compute so its intermediates become free, then
