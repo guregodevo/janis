@@ -126,9 +126,13 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 		// prefix: the session returns to the mark when the prompts share it,
 		// else resets, re-prefills from scratch and marks where they parted.
 		// Prefix EXTENSION (the common multi-turn case) never lands here.
+		// The mark follows the latest parting point: a prompt sharing more
+		// than the mark moves it up (a server's warm-up request shares only
+		// the template's first token with the prompts that follow, and a
+		// mark left there would hold every later prompt to one reused token).
 		if !canTruncate(s.Caches, P) {
-			if s.Mark > 0 && s.Mark <= P && canTruncate(s.Caches, s.Mark) {
-				P = s.Mark
+			if s.Mark > 0 && s.Mark < P && canTruncate(s.Caches, s.Mark) {
+				want, P = P, s.Mark
 			} else {
 				want, P, s.Mark = P, 0, 0
 			}
@@ -169,7 +173,8 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 	}
 
 	if debugPrefill {
-		debugLog("prefill: total=%d reused=%d new=%d (chunk=%d)", len(newIDs), P, len(suffix), chunkSize)
+		head := func(ids []int32) []int32 { return ids[:min(4, len(ids))] }
+		debugLog("prefill: total=%d reused=%d new=%d (chunk=%d) mark=%d had=%v got=%v", len(newIDs), P, len(suffix), chunkSize, s.Mark, head(s.IDs), head(newIDs))
 	}
 	var logits engine.Tensor
 	for i := 0; i < len(suffix); {

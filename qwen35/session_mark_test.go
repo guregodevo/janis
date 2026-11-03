@@ -86,6 +86,27 @@ func TestHybridSessionReturnsToTheMark(t *testing.T) {
 	if total() != 5 || s.Mark != 3 || linear.mark == nil || linear.mark.steps != 3 {
 		t.Fatalf("a prompt that parts before the mark drops it, prefills everything and marks the new parting: %d tokens, mark %d", total(), s.Mark)
 	}
+
+	// A mark at 3, then prompts that share 10 with each other: the first
+	// returns to 3 (all it shares with the prompt before), the second returns
+	// to 3 and moves the mark to 10, the third starts at 10. The shape of a
+	// server's warm-up request ("ok", sharing the template's first token)
+	// followed by real conversations.
+	forwarded = nil
+	s.Prefill(b, conversation(401), nil)
+	if total() != 8 || s.Mark != 3 {
+		t.Fatalf("a prompt sharing the mark exactly returns to it: %d tokens, mark %d", total(), s.Mark)
+	}
+	forwarded = nil
+	s.Prefill(b, conversation(501), nil)
+	if total() != 8 || s.Mark != 10 || linear.mark.steps != 10 {
+		t.Fatalf("a prompt sharing more than the mark returns to it and moves the mark up: %d tokens, mark %d", total(), s.Mark)
+	}
+	forwarded = nil
+	s.Prefill(b, conversation(601), nil)
+	if total() != 1 {
+		t.Fatalf("the next one starts at the moved mark: %d tokens", total())
+	}
 }
 
 // The mark's tensors are in the cache's tensor list, so the sweeper keeps
