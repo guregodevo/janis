@@ -51,6 +51,13 @@ type Session struct {
 
 	IDs    []int32 // tokens currently materialized in the caches
 	Caches []LayerCache
+
+	// Mark is the length every cache can return to, 0 for none: where the
+	// last two prompts that shared a prefix parted (a coder's system prompt
+	// and tools, the same in every conversation). A KV cache returns to any
+	// length; a recurrent one only to its mark, so without one a hybrid
+	// model prefilled every new conversation from its first token.
+	Mark int
 }
 
 func (s *Session) newCache(layer int) LayerCache {
@@ -79,6 +86,16 @@ func cachedLen(caches []LayerCache) int {
 	return caches[0].Len()
 }
 
+// canTruncate reports whether every cache can be cut back to n.
+func canTruncate(caches []LayerCache, n int) bool {
+	for _, c := range caches {
+		if !c.CanTruncate(n) {
+			return false
+		}
+	}
+	return true
+}
+
 // prefill runs the chunked prefill of newIDs over the reused prefix and returns
 // the last-position logits on the host; false means cancel fired first. The
 // caller owns s.IDs: Prefill records the whole prompt, Generate appends the
@@ -94,20 +111,26 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 	if P > len(newIDs)-1 {
 		P = len(newIDs) - 1
 	}
+	// want is where to mark during this prefill, 0 for nowhere: the point
+	// the prompts parted when no cache could return to it, so the next
+	// prompt that shares it starts there.
+	want := 0
 	if s.Caches == nil {
 		s.Caches = make([]LayerCache, s.NLayers)
 		for i := range s.Caches {
 			s.Caches[i] = s.newCache(i)
 		}
 	} else if P < cachedLen(s.Caches) {
-		// A recurrent (linear-attention) cache stores only its latest state, so
-		// it cannot be cut back to a mid-history prefix: when any layer can't
-		// truncate to P, the whole session resets and re-prefills from scratch.
+		// A recurrent (linear-attention) cache stores only its latest state
+		// and its mark, so it cannot be cut back to any other mid-history
+		// prefix: the session returns to the mark when the prompts share it,
+		// else resets, re-prefills from scratch and marks where they parted.
 		// Prefix EXTENSION (the common multi-turn case) never lands here.
-		for _, c := range s.Caches {
-			if !c.CanTruncate(P) {
-				P = 0
-				break
+		if !canTruncate(s.Caches, P) {
+			if s.Mark > 0 && s.Mark <= P && canTruncate(s.Caches, s.Mark) {
+				P = s.Mark
+			} else {
+				want, P, s.Mark = P, 0, 0
 			}
 		}
 		for _, c := range s.Caches {
@@ -123,7 +146,7 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 	// tensors and stay.
 	if sw != nil && P < prevLen {
 		pinCaches(sw, s.Caches)
-		sw.Unpin(old...)
+		unpinGone(sw, old, cacheTensors(s.Caches))
 		sw.Sweep()
 		old = nil
 	}
@@ -149,15 +172,27 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 		debugLog("prefill: total=%d reused=%d new=%d (chunk=%d)", len(newIDs), P, len(suffix), chunkSize)
 	}
 	var logits engine.Tensor
-	for i := 0; i < len(suffix); i += chunkSize {
+	for i := 0; i < len(suffix); {
 		end := i + chunkSize
 		if end > len(suffix) {
 			end = len(suffix)
 		}
+		// A chunk ends at the mark, so the state kept is the one at exactly
+		// that length.
+		if m := want - P; m > i && m < end {
+			end = m
+		}
 		chunk := suffix[i:end]
+		i = end
 		prev := cacheTensors(s.Caches)
 		logits = s.Forward(b, b.FromInt32(chunk, len(chunk)), len(chunk), offset, s.Caches)
 		offset += len(chunk)
+		if want > 0 && offset == want {
+			for _, c := range s.Caches {
+				c.Mark()
+			}
+			s.Mark = want
+		}
 		if sw != nil {
 			// Force this chunk's compute so its intermediates become free, then
 			// sweep them. Keep the caches (state) and the running logits (needed
@@ -165,7 +200,7 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 			sw.Pin(logits)
 			b.Eval(append(cacheTensors(s.Caches), logits)...)
 			pinCaches(sw, s.Caches)
-			sw.Unpin(prev...)
+			unpinGone(sw, prev, cacheTensors(s.Caches))
 			sw.Sweep()
 		}
 		if cancel != nil && cancel() {
@@ -180,7 +215,7 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 	if sw != nil {
 		sw.Unpin(logits)
 		pinCaches(sw, s.Caches)
-		sw.Unpin(old...)
+		unpinGone(sw, old, cacheTensors(s.Caches))
 		sw.Sweep()
 	}
 	return floats, true
@@ -259,7 +294,7 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 		offset++
 		if sw != nil {
 			pinCaches(sw, s.Caches)
-			sw.Unpin(prev...)
+			unpinGone(sw, prev, cacheTensors(s.Caches))
 			sw.Sweep()
 		}
 	}

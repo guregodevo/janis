@@ -214,7 +214,7 @@ func SampledGenerate(b engine.Backend, prompt []int32, nGen, nLayers, vocab int,
 		offset++
 		if sw != nil {
 			pinCaches(sw, caches)
-			sw.Unpin(old...)
+			unpinGone(sw, old, cacheTensors(caches))
 			sw.Sweep()
 		}
 	}
@@ -399,8 +399,8 @@ func GreedyGenerate(b engine.Backend, prompt []int32, nGen, nLayers int, forward
 		}
 		if sw != nil {
 			pinCaches(sw, caches)
-			sw.Pin(tokT)     // keep every device token for the final readback
-			sw.Unpin(old...) // release the replaced caches
+			sw.Pin(tokT) // keep every device token for the final readback
+			unpinGone(sw, old, cacheTensors(caches))
 			sw.Sweep()
 		}
 	}
@@ -424,5 +424,21 @@ func cacheTensors(caches []LayerCache) []engine.Tensor {
 func pinCaches(sw engine.Sweeper, caches []LayerCache) {
 	for _, c := range caches {
 		sw.Pin(c.Tensors()...)
+	}
+}
+
+// unpinGone unpins the tensors of old that kept no longer holds. Pins are
+// flags, not counts: a tensor a cache keeps across steps (a recurrent
+// layer's mark, or the state the mark restored) is in both lists, and an
+// unpin of all of old would hand it to the next sweep.
+func unpinGone(sw engine.Sweeper, old, kept []engine.Tensor) {
+	live := make(map[engine.Tensor]bool, len(kept))
+	for _, t := range kept {
+		live[t] = true
+	}
+	for _, t := range old {
+		if !live[t] {
+			sw.Unpin(t)
+		}
 	}
 }

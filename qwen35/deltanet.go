@@ -16,32 +16,61 @@ import (
 
 // LinearCache is a Gated DeltaNet layer's cross-step state: the causal-conv
 // tail (last K-1 input rows) and the recurrent delta-rule state. Unlike a KV
-// cache it holds no per-token history, so it can only ever be reset — never
-// cut back to a mid-history prefix.
+// cache it holds no per-token history, so it can be cut back to one
+// mid-history point only: the mark, a copy of the state kept where the
+// session asked for it (the end of the prompt two conversations shared).
 type LinearCache struct {
 	Conv  engine.Tensor // [1, K-1, convDim], activation dtype
 	State engine.Tensor // [1, Hv, Dv, Dk], float32
 	steps int
+
+	mark *linearMark
+}
+
+// linearMark is the state at one earlier length. The forward pass makes new
+// tensors each step and never writes into these, so they stay as they were.
+type linearMark struct {
+	conv, state engine.Tensor
+	steps       int
 }
 
 func (c *LinearCache) Len() int { return c.steps }
 
-func (c *LinearCache) CanTruncate(n int) bool { return n == 0 || n >= c.steps }
+func (c *LinearCache) CanTruncate(n int) bool {
+	return n == 0 || n >= c.steps || (c.mark != nil && n == c.mark.steps)
+}
 
+// Truncate returns to the mark when n is its length, else resets; a reset
+// drops the mark too, since the prefix before it has changed.
 func (c *LinearCache) Truncate(_ engine.Backend, n int) {
-	if n >= c.steps {
+	switch {
+	case n >= c.steps:
+		return
+	case c.mark != nil && n == c.mark.steps:
+		c.Conv, c.State, c.steps = c.mark.conv, c.mark.state, c.mark.steps
+	default:
+		c.Conv, c.State, c.steps, c.mark = nil, nil, 0, nil
+	}
+}
+
+func (c *LinearCache) Mark() {
+	if c.steps == 0 {
+		c.mark = nil
 		return
 	}
-	c.Conv, c.State, c.steps = nil, nil, 0
+	c.mark = &linearMark{conv: c.Conv, state: c.State, steps: c.steps}
 }
 
 func (c *LinearCache) Tensors() []engine.Tensor {
-	ts := make([]engine.Tensor, 0, 2)
+	ts := make([]engine.Tensor, 0, 4)
 	if c.Conv != nil {
 		ts = append(ts, c.Conv)
 	}
 	if c.State != nil {
 		ts = append(ts, c.State)
+	}
+	if c.mark != nil {
+		ts = append(ts, c.mark.conv, c.mark.state)
 	}
 	return ts
 }

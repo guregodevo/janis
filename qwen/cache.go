@@ -16,7 +16,13 @@ type LayerCache interface {
 	CanTruncate(n int) bool
 	// Truncate cuts the cache back to n steps (n == 0 resets it).
 	Truncate(b engine.Backend, n int)
-	// Tensors returns the live state tensors (for Pin/Unpin/Eval).
+	// Mark keeps the state at the current length as a point Truncate can
+	// return to. A KV cache can return anywhere and keeps nothing; a
+	// recurrent state keeps a copy of itself. One mark at a time: the next
+	// replaces it, a reset drops it.
+	Mark()
+	// Tensors returns the live state tensors, the mark's included (for
+	// Pin/Unpin/Eval).
 	Tensors() []engine.Tensor
 }
 
@@ -36,6 +42,9 @@ func (c *KVCache) Len() int {
 
 // CanTruncate: a KV cache can be cut to any prefix.
 func (c *KVCache) CanTruncate(int) bool { return true }
+
+// Mark keeps nothing: Truncate reaches any prefix already.
+func (c *KVCache) Mark() {}
 
 // Truncate keeps only the first n time steps (for prefix reuse across requests).
 func (c *KVCache) Truncate(b engine.Backend, n int) {
