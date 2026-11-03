@@ -14,7 +14,7 @@ func TestRecommendTiers(t *testing.T) {
 		{16, true, "Qwen3.5-9B-MLX-4bit"},
 		{24, true, "Qwen3.5-9B-MLX-4bit"},
 		{32, true, "Qwen3-14B-4bit"},
-		{64, true, "Qwen3-32B-4bit"},
+		{64, true, "Qwen3.8-27B-4bit"},
 		{64, false, "Qwen3-1.7B-4bit"}, // CPU is compute-bound regardless of RAM
 	}
 	for _, c := range cases {

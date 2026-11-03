@@ -55,7 +55,10 @@ func (h Host) Recommend() string {
 	}
 	switch {
 	case h.RAMGiB >= 64:
-		return "Qwen3-32B-4bit"
+		// Qwen3.8-27B is the model Memdoor's published result ran on (a team
+		// of five, LiveCodeBench Hard, 2026-10); about 16 GB of weights at
+		// 4-bit, room for a long context on 64 GB.
+		return "Qwen3.8-27B-4bit"
 	case h.RAMGiB >= 32:
 		return "Qwen3-14B-4bit"
 	case h.RAMGiB >= 16:
