@@ -1,7 +1,9 @@
 name: release
-# janis for Linux as one file: ggml's CPU kernels linked in (scripts/fetch-ggml.sh
-# --static), the tokenizer library too. A tag v* publishes it as a release asset;
-# a CI job downloads the file and runs it, nothing to install beside it.
+# janis as a user gets it, built by `make dist` on each runner: Linux as one
+# file (ggml's CPU kernels and the tokenizer linked in), macOS as an archive
+# of the binary with the MLX libraries it loads. A tag v* publishes them as
+# release assets; a CI job downloads one and runs it, nothing to install
+# beside it.
 on:
   push:
     tags: ['v*']
@@ -9,62 +11,55 @@ on:
 permissions:
   contents: write
 jobs:
-  linux:
+  build:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-22.04, arch: amd64 }
-          - { os: ubuntu-22.04-arm, arch: arm64 }
+          - { os: ubuntu-22.04, asset: janis-linux-amd64 }
+          - { os: ubuntu-22.04-arm, asset: janis-linux-arm64 }
+          - { os: macos-15, asset: janis-darwin-arm64.tar.gz }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Build
-        run: |
-          bash scripts/fetch-ggml.sh --static
-          bash scripts/build-tokenizer.sh
-          go build -tags ggml -trimpath -ldflags "-s -w" -o janis-linux-${{ matrix.arch }} ./cmd/janis
-          ls -la janis-linux-${{ matrix.arch }}; ldd janis-linux-${{ matrix.arch }}
-          sha256sum janis-linux-${{ matrix.arch }} > janis-linux-${{ matrix.arch }}.sha256
-      - name: Smoke test (Qwen3-0.6B, one answer)
-        run: |
-          mkdir -p "$RUNNER_TEMP/bin" && cp janis-linux-${{ matrix.arch }} "$RUNNER_TEMP/bin/janis" && cd "$RUNNER_TEMP"
-          ./bin/janis serve --detach --model Qwen3-0.6B-4bit --log janis.log
-          out=$(curl -s --max-time 300 http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
-            -d '{"model":"Qwen3-0.6B-4bit","messages":[{"role":"user","content":"What is 2+3? Answer with the number."}],"max_tokens":8,"temperature":0}' || true)
-          echo "$out"; tail -40 janis.log; grep -o -m1 -E "asimddp|i8mm|sve" /proc/cpuinfo | sort -u | tr "\n" " "
-          echo "$out" | grep -q '"content":"[^"]*5' || { echo "no 5 in the answer" >&2; exit 1; }
+      - name: MLX from Homebrew (macOS)
+        if: runner.os == 'macOS'
+        run: brew install mlx mlx-c
+      - name: make dist
+        run: make dist
+      - name: make dist-check (Qwen3-0.6B-4bit, one answer)
+        run: make dist-check
       - uses: actions/upload-artifact@v4
         with:
-          name: janis-linux-${{ matrix.arch }}
-          path: janis-linux-${{ matrix.arch }}
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
       - name: Release asset
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "janis for Linux, one file: curl -fsSL https://github.com/guregodevo/janis/releases/latest/download/install.sh | sh" || true
-          files="janis-linux-${{ matrix.arch }} janis-linux-${{ matrix.arch }}.sha256"
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "janis for Linux and macOS (Apple silicon): curl -fsSL https://github.com/guregodevo/janis/releases/latest/download/install.sh | sh" || true
+          files="dist/${{ matrix.asset }} dist/${{ matrix.asset }}.sha256"
           # install.sh once: two jobs uploading it race (422, already exists).
-          [ "${{ matrix.arch }}" = amd64 ] && files="$files install.sh"
+          [ "${{ matrix.asset }}" = janis-linux-amd64 ] && files="$files install.sh"
           gh release upload "$GITHUB_REF_NAME" $files --clobber
 
-  # The release as a user gets it: install.sh from the release just made, then
-  # serve --detach, then one answer.
+  # The release as a user gets it, on each OS: install.sh from the release
+  # just made, then one answer.
   install:
-    needs: linux
+    needs: build
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
     steps:
+      - uses: actions/checkout@v5
       - name: install.sh, serve --detach, one answer
         run: |
           curl -fsSL "https://github.com/guregodevo/janis/releases/download/$GITHUB_REF_NAME/install.sh" | JANIS_VERSION="$GITHUB_REF_NAME" sh
-          export PATH="$HOME/.local/bin:$PATH"
-          janis serve --detach --model Qwen3-0.6B-4bit
-          out=$(curl -s --max-time 300 http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
-            -d '{"model":"Qwen3-0.6B-4bit","messages":[{"role":"user","content":"What is 2+3? Answer with the number."}],"max_tokens":8,"temperature":0}')
-          echo "$out"
-          echo "$out" | grep -q '"content":"[^"]*5' || { echo "no 5 in the answer" >&2; exit 1; }
+          bash scripts/smoke.sh "$HOME/.local/bin/janis"

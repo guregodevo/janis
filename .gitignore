@@ -2,3 +2,4 @@ lib/**/*.a
 *.test
 *.prof
 ggml/third_party/
+dist/

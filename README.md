@@ -21,7 +21,8 @@ Weights come from `huggingface.co/mlx-community` into `~/.cache/huggingface/`.
 
 ## Install
 
-Linux (amd64, arm64), one file into `~/.local/bin`, sha256 checked:
+Linux (amd64, arm64) and macOS (Apple silicon), into `~/.local/bin`, sha256
+checked. On a Mac the MLX libraries the binary loads go to `~/.local/lib/janis`:
 
 ```bash
 curl -fsSL https://github.com/guregodevo/janis/releases/latest/download/install.sh | sh
@@ -33,7 +34,8 @@ server runs in the background (its output in `janis-8090.log` in the temp
 directory, or `--log`), and the command returns once the model has answered
 a first request, so the first client does not pay for loading it. A taken
 port or a server that dies fails the command. `JANIS_VERSION=v0.1.2` pins a
-release. On a Mac janis builds from source with MLX ([Build](#build)).
+release. `make dist` builds the release asset for the machine it runs on
+([Build](#build)).
 
 ## Serve
 
