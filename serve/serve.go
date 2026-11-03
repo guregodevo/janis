@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -53,7 +54,7 @@ var traceTokens = os.Getenv("JANIS_TRACE_TOKENS") == "1"
 // Server serves one engine at a time behind the OpenAI endpoints.
 type Server struct {
 	load    Loader
-	mu      sync.Mutex // one generation at a time, and the swap under it
+	work    chan func() // every call into the engine, one at a time, on one OS thread
 	current Generator
 	name    string // the installed model's name the engine was opened from
 	logf    func(string, ...any)
@@ -64,7 +65,9 @@ type Server struct {
 func New(preload string) (*Server, error) {
 	s := NewWithLoader(func(dir string) (Generator, error) { return llm.Open(dir) })
 	if preload != "" {
-		if err := s.ensure(preload); err != nil {
+		var err error
+		s.onEngine(func() { err = s.ensure(preload) })
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -73,7 +76,32 @@ func New(preload string) (*Server, error) {
 
 // NewWithLoader is New with the loader injected.
 func NewWithLoader(load Loader) *Server {
-	return &Server{load: load, logf: log.Printf}
+	s := &Server{load: load, logf: log.Printf, work: make(chan func())}
+	go s.engineThread()
+	return s
+}
+
+// engineThread runs every call into the engine, loading included, on one
+// OS thread. MLX keeps its default streams and command encoders per thread
+// (0.32 on): an array made on one thread and evaluated on another fails with
+// "There is no Stream(gpu, N) in current thread", and Go moves goroutines
+// between threads. One thread is also the one generation at a time the
+// server always had.
+func (s *Server) engineThread() {
+	runtime.LockOSThread()
+	for f := range s.work {
+		f()
+	}
+}
+
+// onEngine runs f on the engine thread and returns when it has.
+func (s *Server) onEngine(f func()) {
+	done := make(chan struct{})
+	s.work <- func() {
+		defer close(done)
+		f()
+	}
+	<-done
 }
 
 // Handler routes the endpoints.
@@ -90,12 +118,12 @@ func (s *Server) Handler() http.Handler {
 
 // Close releases the loaded engine.
 func (s *Server) Close() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.current != nil {
-		s.current.Close()
-		s.current, s.name = nil, ""
-	}
+	s.onEngine(func() {
+		if s.current != nil {
+			s.current.Close()
+			s.current, s.name = nil, ""
+		}
+	})
 }
 
 // ---- models ----
@@ -120,9 +148,8 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	}
 	// The loaded model first: a client that takes the first listed (a probe,
 	// a default) gets the one that answers now, not a swap to another.
-	s.mu.Lock()
-	loaded := s.name
-	s.mu.Unlock()
+	var loaded string
+	s.onEngine(func() { loaded = s.name })
 	for i, c := range cards {
 		if c.ID == loaded && i > 0 {
 			cards = append([]modelCard{c}, append(cards[:i:i], cards[i+1:]...)...)
@@ -263,66 +290,66 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "messages is empty")
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.ensure(req.Model); err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
-		return
-	}
-	msgs := renderChat(req)
-	opts := llm.Options{Temp: float32(defaultTemp), TopP: float32(defaultTopP), MaxTokens: defaultMaxTokens}
-	if req.Temperature != nil {
-		opts.Temp = float32(*req.Temperature)
-	}
-	if req.TopP != nil {
-		opts.TopP = float32(*req.TopP)
-	}
-	if req.MaxCompletionTokens > 0 {
-		opts.MaxTokens = req.MaxCompletionTokens
-	} else if req.MaxTokens > 0 {
-		opts.MaxTokens = req.MaxTokens
-	}
-	if req.Seed != nil {
-		opts.Seed = *req.Seed
-	} else {
-		opts.Seed = uint64(time.Now().UnixNano()) // each request its own draw, unless the client fixes it
-	}
-	ctx := r.Context()
-	opts.Cancel = func() bool { return ctx.Err() != nil }
-	if len(req.Tools) > 0 {
-		opts.ToolCallGrammar = true
-		opts.ForceToolCall = string(req.ToolChoice) == `"required"`
-	}
-	if traceTokens {
-		opts.OnToken = func(id int32, text string) { s.logf("token %d %q", id, text) }
-	}
-	inTokens := 0
-	for _, m := range msgs {
-		inTokens += s.current.NumTokens(m.Content)
-	}
-	id := "chatcmpl-" + fmt.Sprint(time.Now().UnixNano())
-	created := time.Now().Unix()
-	if !req.Stream {
-		reply := s.current.ChatStream(msgs, opts, nil)
-		text, calls := parseCalls(reply)
-		finish := "stop"
-		if len(calls) > 0 {
-			finish = "tool_calls"
+	s.onEngine(func() {
+		if err := s.ensure(req.Model); err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
 		}
-		u := usage{PromptTokens: inTokens, CompletionTokens: s.current.NumTokens(reply)}
-		u.TotalTokens = u.PromptTokens + u.CompletionTokens
-		msg := map[string]any{"role": "assistant", "content": text}
-		if len(calls) > 0 {
-			msg["tool_calls"] = calls
+		msgs := renderChat(req)
+		opts := llm.Options{Temp: float32(defaultTemp), TopP: float32(defaultTopP), MaxTokens: defaultMaxTokens}
+		if req.Temperature != nil {
+			opts.Temp = float32(*req.Temperature)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"id": id, "object": "chat.completion", "created": created, "model": s.name,
-			"choices": []map[string]any{{"index": 0, "message": msg, "finish_reason": finish}},
-			"usage":   u,
-		})
-		return
-	}
-	s.streamChat(w, ctx, req, msgs, opts, id, created, inTokens)
+		if req.TopP != nil {
+			opts.TopP = float32(*req.TopP)
+		}
+		if req.MaxCompletionTokens > 0 {
+			opts.MaxTokens = req.MaxCompletionTokens
+		} else if req.MaxTokens > 0 {
+			opts.MaxTokens = req.MaxTokens
+		}
+		if req.Seed != nil {
+			opts.Seed = *req.Seed
+		} else {
+			opts.Seed = uint64(time.Now().UnixNano()) // each request its own draw, unless the client fixes it
+		}
+		ctx := r.Context()
+		opts.Cancel = func() bool { return ctx.Err() != nil }
+		if len(req.Tools) > 0 {
+			opts.ToolCallGrammar = true
+			opts.ForceToolCall = string(req.ToolChoice) == `"required"`
+		}
+		if traceTokens {
+			opts.OnToken = func(id int32, text string) { s.logf("token %d %q", id, text) }
+		}
+		inTokens := 0
+		for _, m := range msgs {
+			inTokens += s.current.NumTokens(m.Content)
+		}
+		id := "chatcmpl-" + fmt.Sprint(time.Now().UnixNano())
+		created := time.Now().Unix()
+		if !req.Stream {
+			reply := s.current.ChatStream(msgs, opts, nil)
+			text, calls := parseCalls(reply)
+			finish := "stop"
+			if len(calls) > 0 {
+				finish = "tool_calls"
+			}
+			u := usage{PromptTokens: inTokens, CompletionTokens: s.current.NumTokens(reply)}
+			u.TotalTokens = u.PromptTokens + u.CompletionTokens
+			msg := map[string]any{"role": "assistant", "content": text}
+			if len(calls) > 0 {
+				msg["tool_calls"] = calls
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"id": id, "object": "chat.completion", "created": created, "model": s.name,
+				"choices": []map[string]any{{"index": 0, "message": msg, "finish_reason": finish}},
+				"usage":   u,
+			})
+			return
+		}
+		s.streamChat(w, ctx, req, msgs, opts, id, created, inTokens)
+	})
 }
 
 // streamChat writes server-sent events: the role, text deltas as they come
@@ -619,28 +646,28 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 		}
 		qs = append(qs, q)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// A decision client names its own model (jev-latest): the loaded model
-	// answers unless the name is one installed here.
-	model := req.Model
-	if !installed(model) {
-		model = ""
-	}
-	if err := s.ensure(model); err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
-		return
-	}
-	ds, err := s.current.Decide(req.State, qs)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	answers := make(map[string]wireAnswer, len(ids))
-	for i, id := range ids {
-		answers[id] = toAnswer(req.Questions[id].Type, qs[i], ds[i])
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"model": s.name, "answers": answers})
+	s.onEngine(func() {
+		// A decision client names its own model (jev-latest): the loaded model
+		// answers unless the name is one installed here.
+		model := req.Model
+		if !installed(model) {
+			model = ""
+		}
+		if err := s.ensure(model); err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		ds, err := s.current.Decide(req.State, qs)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		answers := make(map[string]wireAnswer, len(ids))
+		for i, id := range ids {
+			answers[id] = toAnswer(req.Questions[id].Type, qs[i], ds[i])
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"model": s.name, "answers": answers})
+	})
 }
 
 func installed(name string) bool {
