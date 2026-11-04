@@ -48,6 +48,17 @@ type RawReader interface {
 // KV caches each step), Unpin the replaced ones, then Sweep frees the rest.
 // ValueCache is a backend that keeps an attention value cache in a layout of
 // its own: AppendValues is Concat along the token axis (2) for it.
+// KVAppender is implemented by backends that write a step's keys or values
+// into a buffer kept with spare room, as mlx-lm's KVCache does, instead of
+// concatenating a new cache every step: a concatenation copies the whole
+// cache, every layer, every token.
+type KVAppender interface {
+	// AppendKV writes x [B, H, L, D] into buf at token n (axis 2), growing
+	// buf when it has no room (buf nil: a new one; then view, if set, is
+	// copied in first), and returns the buffer and its first n+L tokens.
+	AppendKV(buf, view Tensor, n int, x Tensor) (newBuf, newView Tensor)
+}
+
 type ValueCache interface {
 	AppendValues(cache, x Tensor) Tensor
 }

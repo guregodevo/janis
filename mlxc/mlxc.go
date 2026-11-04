@@ -39,8 +39,9 @@ func (t *tensor) Shape() []int { return t.shape }
 
 // Backend holds the default GPU stream and tracks created arrays for sweeping.
 type Backend struct {
-	stream  C.mlx_stream
-	tracked []*tensor
+	stream    C.mlx_stream
+	tracked   []*tensor
+	kvReserve int // tokens the current request reserved (ReserveCache)
 }
 
 // New constructs an MLX-C backend bound to the default GPU (Metal) stream.
@@ -254,11 +255,64 @@ func MemoryStatsMB() (active, cache, peak float64) {
 	return float64(a) / (1 << 20), float64(c) / (1 << 20), float64(p) / (1 << 20)
 }
 
+// ResetPeakMemory restarts MLX's peak-memory count from the current use.
+func ResetPeakMemory() { C.mlx_reset_peak_memory() }
+
 // SetCacheLimit bounds MLX's buffer-reuse cache (bytes); above it, freed buffers
 // go back to the OS instead of being retained. 0 disables caching entirely.
 func (b *Backend) SetCacheLimit(bytes uint64) {
 	var prev C.size_t
 	C.mlx_set_cache_limit(&prev, C.size_t(bytes))
+}
+
+// kvStep is the unit a KV buffer is sized in; kvAhead the most it is made
+// larger than needed now, when the request reserved more.
+const (
+	kvStep  = 256
+	kvAhead = 2048
+)
+
+// ReserveCache sizes the next KV buffers for a request of this many tokens
+// (prompt plus max_tokens), so they are made once (engine.CacheReserver).
+func (b *Backend) ReserveCache(tokens int) { b.kvReserve = tokens }
+
+// AppendKV writes x into buf at token n in place when MLX can donate buf
+// (nothing else holds it), as mlx-lm's KVCache does (engine.KVAppender).
+func (b *Backend) AppendKV(buf, view engine.Tensor, n int, x engine.Tensor) (engine.Tensor, engine.Tensor) {
+	tx := x.(*tensor)
+	B, H, L, D := tx.shape[0], tx.shape[1], tx.shape[2], tx.shape[3]
+	need := n + L
+	var tb *tensor
+	if buf != nil {
+		tb = buf.(*tensor)
+	}
+	if tb == nil || tb.shape[2] < need {
+		// Room for what the request reserved, but no more than kvAhead past
+		// what is needed now: max_tokens is a ceiling, rarely reached.
+		capT := max(need, min(b.kvReserve, need+kvAhead))
+		capT = (capT + kvStep - 1) / kvStep * kvStep
+		shape := []C.int{C.int(B), C.int(H), C.int(capT), C.int(D)}
+		z := C.mlx_array_new()
+		C.mlx_zeros(&z, &shape[0], C.size_t(len(shape)), C.mlx_array_dtype(tx.arr), b.stream)
+		grown := b.newT(z, []int{B, H, capT, D})
+		if n > 0 && view != nil {
+			grown = b.sliceUpdate(grown, b.Slice(view, 2, 0, n), 0)
+		}
+		tb = grown
+	}
+	nb := b.sliceUpdate(tb, tx, n)
+	return nb, b.Slice(nb, 2, 0, need)
+}
+
+// sliceUpdate writes src into dst at token at (axis 2).
+func (b *Backend) sliceUpdate(dst *tensor, src engine.Tensor, at int) *tensor {
+	ts := src.(*tensor)
+	start := []C.int{0, 0, C.int(at), 0}
+	stop := []C.int{C.int(ts.shape[0]), C.int(ts.shape[1]), C.int(at + ts.shape[2]), C.int(ts.shape[3])}
+	strides := []C.int{1, 1, 1, 1}
+	out := C.mlx_array_new()
+	C.mlx_slice_update(&out, dst.arr, ts.arr, &start[0], 4, &stop[0], 4, &strides[0], 4, b.stream)
+	return b.newT(out, cloneShape(dst.shape))
 }
 
 // --- constructors ---

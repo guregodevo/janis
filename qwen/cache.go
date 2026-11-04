@@ -31,6 +31,11 @@ type LayerCache interface {
 // shaped [B, n_kv_heads, T, head_dim] and growing along axis 2 (time).
 type KVCache struct {
 	K, V engine.Tensor
+
+	// kBuf, vBuf hold K and V with spare room on a backend that appends in
+	// place (engine.KVAppender); K and V are views of their first Len()
+	// tokens. Nil elsewhere, and after a reset.
+	kBuf, vBuf engine.Tensor
 }
 
 // Len is the number of cached time steps.
@@ -55,7 +60,7 @@ func (c *KVCache) Truncate(b engine.Backend, n int) {
 		return
 	}
 	if n <= 0 {
-		c.K, c.V = nil, nil
+		c.K, c.V, c.kBuf, c.vBuf = nil, nil, nil, nil
 		return
 	}
 	if n >= c.K.Shape()[2] {
@@ -70,6 +75,9 @@ func (c *KVCache) Tensors() []engine.Tensor {
 	if c.K == nil {
 		return nil
 	}
+	if c.kBuf != nil {
+		return []engine.Tensor{c.K, c.V, c.kBuf, c.vBuf}
+	}
 	return []engine.Tensor{c.K, c.V}
 }
 
@@ -82,6 +90,12 @@ func (c *KVCache) Tensors() []engine.Tensor {
 func (c *KVCache) Update(b engine.Backend, kNew, vNew engine.Tensor) (engine.Tensor, engine.Tensor) {
 	if rr, ok := b.(engine.RawReader); ok && rr.DTypeOf(kNew) == engine.F32 {
 		kNew, vNew = b.Cast(kNew, engine.F16), b.Cast(vNew, engine.F16)
+	}
+	if ap, ok := b.(engine.KVAppender); ok {
+		n := c.Len()
+		c.kBuf, c.K = ap.AppendKV(c.kBuf, c.K, n, kNew)
+		c.vBuf, c.V = ap.AppendKV(c.vBuf, c.V, n, vNew)
+		return c.K, c.V
 	}
 	if c.K == nil {
 		c.K, c.V = kNew, vNew
