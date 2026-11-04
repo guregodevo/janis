@@ -267,6 +267,13 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 		chunk := suffix[i:end]
 		i = end
 		prev := cacheTensors(s.Caches)
+		if sw != nil && logits != nil {
+			// Only the last chunk's logits are read. An earlier chunk's stayed
+			// pinned for good: a vocab-wide row per chunk, about 1 MB, on
+			// every request (22 MB for a 5,600-token prompt in 256-token
+			// chunks, measured on Qwen3.5-0.8B).
+			sw.Unpin(logits)
+		}
 		logits = s.Forward(b, b.FromInt32(chunk, len(chunk)), len(chunk), offset, s.Caches)
 		offset += len(chunk)
 		if want > 0 && offset == want {
