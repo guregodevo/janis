@@ -11,10 +11,12 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/guregodevo/janis/hostfit"
 )
 
-// detachServe is `serve --detach`, for a CI job or a script: the model pulled
-// when it is missing, the server started in the background on the same flags,
+// detachServe is `serve --detach`, for a CI job or a script: the model named,
+// else the one that fits this machine, pulled when it is missing, the server started in the background on the same flags,
 // and the command returns once that server has answered one request with the
 // model. Its first answer lays the weights out for the CPU's kernels (half a
 // minute for an 8B on four vCPUs): paid here, not by the first client. The
@@ -27,7 +29,12 @@ func detachServe(host string, port int, model, logPath string) {
 	} else {
 		l.Close()
 	}
-	if model != "" && !installed(model) {
+	if model == "" {
+		host, _ := hostfit.Detect()
+		model = host.Recommend()
+		fmt.Printf("no model named: %s fits this machine (%d GiB)\n", model, host.RAMGiB)
+	}
+	if !installed(model) {
 		pull([]string{model})
 	}
 	if logPath == "" {
@@ -41,10 +48,7 @@ func detachServe(host string, port int, model, logPath string) {
 	if err != nil {
 		fail(err)
 	}
-	args := []string{"serve", "--host", host, "--port", fmt.Sprint(port)}
-	if model != "" {
-		args = append(args, "--model", model)
-	}
+	args := []string{"serve", "--host", host, "--port", fmt.Sprint(port), "--model", model}
 	cmd := exec.Command(self, args...)
 	cmd.Stdout, cmd.Stderr = log, log
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -83,18 +87,16 @@ func detachServe(host string, port int, model, logPath string) {
 		}
 		time.Sleep(time.Second)
 	}
-	if model != "" {
-		body, _ := json.Marshal(map[string]any{"model": model, "max_tokens": 1,
-			"messages": []map[string]string{{"role": "user", "content": "ok"}}})
-		client := &http.Client{Timeout: 30 * time.Minute}
-		resp, err := client.Post(base+"/chat/completions", "application/json", bytes.NewReader(body))
-		if err != nil {
-			dead("failed its first answer: " + err.Error())
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			dead("failed its first answer: " + resp.Status)
-		}
+	body, _ := json.Marshal(map[string]any{"model": model, "max_tokens": 1,
+		"messages": []map[string]string{{"role": "user", "content": "ok"}}})
+	client := &http.Client{Timeout: 30 * time.Minute}
+	resp, err := client.Post(base+"/chat/completions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		dead("failed its first answer: " + err.Error())
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		dead("failed its first answer: " + resp.Status)
 	}
 	pid := cmd.Process.Pid
 	_ = cmd.Process.Release()

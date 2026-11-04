@@ -61,4 +61,5 @@ case ":$PATH:" in
   *":$dir:"*) ;;
   *) echo "  $dir is not on PATH: export PATH=\"$dir:\$PATH\"" ;;
 esac
-echo "  janis serve --detach --model Qwen3-8B-4bit   pulls it, serves it on 127.0.0.1:8090/v1, returns once it answers"
+echo "  janis serve --detach   pulls the model that fits this machine, serves it on 127.0.0.1:8090/v1"
+echo "                         by RAM: 32 GB and up Qwen3.8-27B, 16 GB Qwen3.5-9B, less Qwen3-4B"

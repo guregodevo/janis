@@ -19,7 +19,6 @@ import (
 	"os"
 	"strings"
 
-	llm "github.com/guregodevo/janis"
 	"github.com/guregodevo/janis/hostfit"
 	"github.com/guregodevo/janis/serve"
 )
@@ -56,7 +55,7 @@ func list() {
 		fmt.Println("no model installed: janis serves the mlx-community models in ~/.cache/huggingface/hub")
 		return
 	}
-	host, _ := hostfit.Detect(llm.HasLocalEngine())
+	host, _ := hostfit.Detect()
 	for _, m := range models {
 		fmt.Printf("%s %-40s %s\n", host.Rate(m.Name).Flag(), m.Name, hostfit.HumanSize(m.SizeBytes))
 	}
@@ -66,7 +65,7 @@ func run(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	port := fs.Int("port", 8090, "the port to listen on")
 	host := fs.String("host", "127.0.0.1", "the address to bind (0.0.0.0 for the network)")
-	model := fs.String("model", "", "the installed model to load now (default: the first a request names)")
+	model := fs.String("model", "", "the installed model to load now (default: the first a request names; with --detach, the model that fits this machine)")
 	detach := fs.Bool("detach", false, "pull the model if missing, serve in the background, and return once it has answered")
 	logPath := fs.String("log", "", "with --detach, the server's output (default: janis-PORT.log in the temp directory)")
 	_ = fs.Parse(args)
