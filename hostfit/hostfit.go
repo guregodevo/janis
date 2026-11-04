@@ -19,40 +19,26 @@ import (
 	"strings"
 )
 
-// Host is the machine an LLM runs on — the constraint that decides which models
-// fit. RAMGiB is the binding limit on the accelerated (MLX/GPU) path; the CPU
-// path is compute-bound, modeled by Accelerated=false.
+// Host is the machine an LLM runs on: its RAM decides which models fit.
 type Host struct {
-	RAMGiB      int
-	Accelerated bool
+	RAMGiB int
 }
 
 // Detect reads the machine's installed RAM (Linux /proc/meminfo MemTotal, macOS
-// and other BSD via `sysctl hw.memsize`). `accelerated` reflects whether a
-// GPU/MLX backend is in use — the caller knows this (it links the engine).
-func Detect(accelerated bool) (Host, error) {
+// and other BSD via `sysctl hw.memsize`).
+func Detect() (Host, error) {
 	gib, err := ramGiB()
 	if err != nil {
 		return Host{}, err
 	}
-	return Host{RAMGiB: gib, Accelerated: accelerated}, nil
+	return Host{RAMGiB: gib}, nil
 }
 
 // Recommend returns the mlx-community model name best suited to this host — the
-// single source of truth for "what should I run here".
-//
-// On a GPU (MLX) backend the limit is RAM — bigger models run fast, so scale up
-// with installed memory. On the CPU backend the limit is COMPUTE, not RAM: an 8B
-// fits in 16 GB but decodes painfully slowly, so cap at a small model regardless
-// of RAM.
+// single source of truth for "what should I run here". The tiers are by RAM
+// on every backend: a machine with no GPU runs the same model, slower (a 1.7B
+// on four cores read a coder prompt at 15 tokens a second and called no tool).
 func (h Host) Recommend() string {
-	if !h.Accelerated {
-		// CPU: compute- AND memory-bound. A 1.7B is the right default — measured
-		// ~1.7 tok/s on the pure-Go backend (vs ~1.4 for a 4B), but the bigger win
-		// for weak hardware is footprint: ~1 GB download and much less RAM than a
-		// 4B (~2.5 GB), so it's likelier to run at all on an old box.
-		return "Qwen3-1.7B-4bit"
-	}
 	switch {
 	case h.RAMGiB >= 32:
 		// Qwen3.8-27B is the model Memdoor's published result ran on (a team
@@ -250,7 +236,7 @@ func ramGiB() (int, error) {
 			if err != nil {
 				return 0, err
 			}
-			return int(kb / (1024 * 1024)), nil
+			return memTotalGiB(kb), nil
 		}
 		return 0, fmt.Errorf("MemTotal not found in /proc/meminfo")
 	}
@@ -263,4 +249,12 @@ func ramGiB() (int, error) {
 		return 0, err
 	}
 	return int(bytes / (1024 * 1024 * 1024)), nil
+}
+
+// memTotalGiB is the installed RAM a MemTotal in kB stands for: the kernel
+// keeps some back, so a 32 GB machine reports about 31.3 GiB, and rounding
+// down would put it in the tier below.
+func memTotalGiB(kb int64) int {
+	const gib = 1024 * 1024
+	return int((kb + gib - 1) / gib)
 }

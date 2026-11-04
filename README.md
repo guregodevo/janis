@@ -26,7 +26,7 @@ checked. On a Mac the MLX libraries the binary loads go to `~/.local/lib/janis`:
 
 ```bash
 curl -fsSL https://github.com/guregodevo/janis/releases/latest/download/install.sh | sh
-janis serve --detach --model Qwen3-8B-4bit   # pulls it, serves it, returns once it has answered
+janis serve --detach   # pulls the model that fits this machine, serves it, returns once it has answered
 ```
 
 `--detach` is for a CI job or a script: the model is pulled when missing, the

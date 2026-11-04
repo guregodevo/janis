@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	llm "github.com/guregodevo/janis"
 	"github.com/guregodevo/janis/hostfit"
 )
 
@@ -31,7 +30,7 @@ func pull(args []string) {
 		}
 		name = strings.TrimPrefix(a, "mlx-community/")
 	}
-	host, _ := hostfit.Detect(llm.HasLocalEngine())
+	host, _ := hostfit.Detect()
 	if name == "" {
 		name = host.Recommend()
 		fmt.Printf("no model named: %s fits this machine (%d GiB)\n", name, host.RAMGiB)
