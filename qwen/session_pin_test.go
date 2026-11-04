@@ -88,3 +88,42 @@ func TestAChunkedPrefillLeavesOnlyTheCachesPinned(t *testing.T) {
 		}
 	}
 }
+
+// DECODING LEAVES ONLY THE CACHES PINNED TOO.
+//
+// Each step pins its logits across the sweep that now runs before the read,
+// and must unpin them after: a pin left behind is the same leak, one row a
+// generated token.
+func TestDecodingLeavesOnlyTheCachesPinned(t *testing.T) {
+	const vocab = 16
+	spy := &pinSpy{Backend: cpu.New(), pinned: map[engine.Tensor]bool{}}
+	s := &Session{
+		NLayers:      2,
+		Vocab:        vocab,
+		PrefillChunk: 2,
+		NewCache:     func(int) LayerCache { return &stateCache{} },
+		Forward: func(b engine.Backend, _ engine.Tensor, seqLen, _ int, caches []LayerCache) engine.Tensor {
+			for _, c := range caches {
+				sc := c.(*stateCache)
+				sc.t = b.FromFloats([]float32{float32(sc.n + seqLen)}, 1)
+				sc.n += seqLen
+			}
+			logits := make([]float32, vocab)
+			logits[3] = 1
+			return b.FromFloats(logits, 1, 1, vocab)
+		},
+	}
+	gen := s.Generate(spy, []int32{1, 2, 3, 4, 5}, 6, SampleParams{})
+	if len(gen) != 6 {
+		t.Fatalf("generated %d tokens, want 6", len(gen))
+	}
+	live := map[engine.Tensor]bool{}
+	for _, ct := range cacheTensors(s.Caches) {
+		live[ct] = true
+	}
+	for p := range spy.pinned {
+		if !live[p] {
+			t.Fatalf("%d tensors pinned after decoding, %d of them the caches'", len(spy.pinned), len(live))
+		}
+	}
+}

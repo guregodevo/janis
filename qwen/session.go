@@ -280,14 +280,18 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 			s.mark(want)
 		}
 		if sw != nil {
-			// Force this chunk's compute so its intermediates become free, then
-			// sweep them. Keep the caches (state) and the running logits (needed
+			// Sweep this chunk's intermediates BEFORE its eval: the graph holds
+			// its own references to what it still needs, so MLX frees each
+			// buffer once its last consumer has run and reuses it within the
+			// pass. Swept after the eval, every layer's activations were alive
+			// at once: the 9B peaked 3.7 GB over its weights on a 256-token
+			// chunk. Keep the caches (state) and the running logits (needed
 			// for sampling after the last chunk) pinned across the sweep.
 			sw.Pin(logits)
-			b.Eval(append(cacheTensors(s.Caches), logits)...)
 			pinCaches(sw, s.Caches)
 			unpinGone(sw, prev, cacheTensors(s.Caches))
 			sw.Sweep()
+			b.Eval(append(cacheTensors(s.Caches), logits)...)
 		}
 		if cancel != nil && cancel() {
 			// Cancelled mid-prefill: the cache now holds `offset` tokens, so record
@@ -382,13 +386,19 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 		}
 		prev := cacheTensors(s.Caches)
 		logits = s.Forward(b, b.FromInt32([]int32{tok}, 1), 1, offset, s.Caches)
-		tok = sampleToken(b.Floats(logits), p, rng, gen)
-		offset++
 		if sw != nil {
+			// Swept before the eval, as in prefill: MLX frees and reuses each
+			// intermediate once its last consumer has run.
+			sw.Pin(logits)
 			pinCaches(sw, s.Caches)
 			unpinGone(sw, prev, cacheTensors(s.Caches))
 			sw.Sweep()
 		}
+		tok = sampleToken(b.Floats(logits), p, rng, gen)
+		if sw != nil {
+			sw.Unpin(logits)
+		}
+		offset++
 	}
 
 	s.IDs = append(append([]int32(nil), newIDs...), gen...)
