@@ -23,6 +23,23 @@ llama.cpp on Metal and mlx-lm.
 | llama-bench b12100 (`-p 512,8192 -n 128`, fa 0) | 215.8 tok/s | 194.6 tok/s | 18.7 tok/s |
 | mlx-lm (its own timing, 8,974 tokens) | — | 225.6 tok/s | 22.0 tok/s |
 
+## Decode after a long prompt, and at the server's defaults
+
+`bench/mlx_decode.py`: 128 tokens streamed, greedy after a ~9,000-token
+prompt, then the server's default sampling (temperature 0.6, top-p 0.95,
+repeat penalty; no `temperature` sent) after a short and a ~9,000-token
+prompt. Release tarballs and release-workflow builds of the branches, MLX
+0.32.4.
+
+| | greedy after 9k | default sampling, short | default sampling, after 9k |
+|---|---:|---:|---:|
+| janis v0.1.14 | 8.5 tok/s | 9.5 tok/s | 6.8 tok/s |
+| + bf16 stream, intermediates freed (#13) | 15.5 tok/s | 14.8 tok/s | 12.9 tok/s |
+| + KV written in place, top-p without a full sort | 17.4–17.9 tok/s | 16.9 tok/s | 16.6 tok/s |
+| mlx-lm 0.32.2 (its own timing, 8,990 tokens) | 19.7 tok/s | — | — |
+
+llama.cpp was not run after a long prompt.
+
 Peak memory on the 9B (janis's footprint over a 9,000-token prompt, local
 builds on Homebrew MLX 0.31.1): 10 GB before, 7.4 GB after. The weights
 take 5.3 GB.
@@ -37,6 +54,12 @@ take 5.3 GB.
   eval, not after. The Go-side handles had kept every layer's activations
   alive through the pass; MLX now frees each buffer once its last consumer
   has run.
+- On MLX, keys and values are written into a KV buffer with spare room
+  (`slice_update`, in place when nothing else holds the buffer), as mlx-lm's
+  KVCache does. A concatenation per step copied every attention layer's whole
+  cache every token.
+- Top-p ranks the best candidates with a bounded heap instead of sorting the
+  vocabulary: 18 ms a token at 248k, 1.9 ms after (`BenchmarkSampleToken`).
 - Each prefill chunk's logits are unpinned when the next chunk starts. They
   had stayed pinned for the life of the server, about 1 MB a chunk on every
   request.
@@ -46,6 +69,7 @@ take 5.3 GB.
 ```
 janis serve --port 18099 --model Qwen3.5-9B-MLX-4bit &
 python3 bench/mlx.py 18099 Qwen3.5-9B-MLX-4bit
+python3 bench/mlx_decode.py 18099 Qwen3.5-9B-MLX-4bit
 ```
 
 llama.cpp, from the macOS release:
