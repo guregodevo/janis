@@ -39,7 +39,7 @@ func pull(args []string) {
 		fmt.Printf("note: %s is likely too big for %d GiB; %s would fit\n", name, host.RAMGiB, host.Recommend())
 	}
 	if !force {
-		if installed, _ := hostfit.ListInstalled(); hasModel(installed, name) {
+		if installed(name) {
 			fmt.Printf("✓ %s is installed · janis serve --model %s (pull --force fetches it again)\n", name, name)
 			return
 		}
@@ -73,6 +73,12 @@ func pull(args []string) {
 		}
 	}
 	fmt.Printf("✓ %s installed · janis serve --model %s\n", name, name)
+}
+
+// installed is whether name is in the HuggingFace cache already.
+func installed(name string) bool {
+	list, _ := hostfit.ListInstalled()
+	return hasModel(list, name)
 }
 
 func hasModel(list []hostfit.InstalledModel, name string) bool {
