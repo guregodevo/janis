@@ -27,7 +27,7 @@ func detachServe(host string, port int, model, logPath string) {
 	} else {
 		l.Close()
 	}
-	if model != "" {
+	if model != "" && !installed(model) {
 		pull([]string{model})
 	}
 	if logPath == "" {
