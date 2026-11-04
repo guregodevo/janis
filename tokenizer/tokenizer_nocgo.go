@@ -20,7 +20,7 @@ type Tokenizer struct{}
 // ErrUnavailable is what every path returns here. It names the alternative,
 // because "unsupported" without a next step is a dead end.
 var ErrUnavailable = fmt.Errorf(
-	"local inference is not available in this build (no cgo tokenizer) — rent a GPU with `memdoor llm deploy <model>`")
+	"local inference is not available in this build (built without cgo, so no tokenizer): install the release (install.sh) or build it with `make dist`")
 
 func New(modelDir string) (*Tokenizer, error) { return nil, ErrUnavailable }
 

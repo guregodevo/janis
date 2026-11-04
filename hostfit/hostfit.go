@@ -1,6 +1,6 @@
 // Package hostfit is the domain model for "which local model fits this machine,
-// and how well". It answers two questions in one place — what `memdoor llm auto`
-// should install, and the traffic-light the /model picker shows — so the RAM
+// and how well". It answers two questions in one place — what `janis pull`
+// installs with no name, and the traffic-light the /model picker shows — so the RAM
 // tiers live once instead of being re-derived per call site.
 //
 // It deliberately has NO dependency on the cgo inference engine: whether the
