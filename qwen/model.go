@@ -127,31 +127,21 @@ func sampleToken(logits []float32, p SampleParams, rng *rand.Rand, recent []int3
 		probs[i] /= sum
 	}
 
-	idx := make([]int, n)
-	for i := range idx {
-		idx[i] = i
-	}
-	sort.Slice(idx, func(a, b int) bool { return probs[idx[a]] > probs[idx[b]] })
-
-	// Grammar constraint: keep only allowed candidates, in the same prob order, and
-	// sample within them. If the grammar allows none (shouldn't happen), fall back
-	// to the full set rather than deadlock. When no grammar is active idx is
-	// unchanged, so the sampling below is byte-identical to the unconstrained path.
-	if constrain {
-		filtered := make([]int, 0, len(idx))
-		for _, id := range idx {
-			if p.Grammar.Allows(int32(id)) {
-				filtered = append(filtered, id)
-			}
-		}
-		if len(filtered) > 0 {
-			idx = filtered
-		}
-	}
-
 	topP := float64(p.TopP)
 	if topP <= 0 || topP > 1 {
 		topP = 1.0
+	}
+
+	// Grammar constraint: only allowed candidates, in the same prob order. If
+	// the grammar allows none (shouldn't happen), fall back to the full set
+	// rather than deadlock.
+	var allow func(int) bool
+	if constrain {
+		allow = func(id int) bool { return p.Grammar.Allows(int32(id)) }
+	}
+	idx := topPCandidates(probs, topP, allow)
+	if len(idx) == 0 {
+		idx = topPCandidates(probs, topP, nil)
 	}
 	var cum float64
 	cut := len(idx)
@@ -441,4 +431,81 @@ func unpinGone(sw engine.Sweeper, old, kept []engine.Tensor) {
 			sw.Unpin(t)
 		}
 	}
+}
+
+// topPCandidates returns the candidates by descending probability (ties by
+// token id), at least up to where their mass reaches topP: what the top-p cut
+// reads. It ranks the best k with a bounded heap, k growing until they reach
+// topP, instead of sorting the whole vocabulary: that sort was 18 ms a token
+// on a 248k vocabulary, a third of a 9B's decode step on an M4. allow, when
+// set, keeps only the tokens it allows.
+func topPCandidates(probs []float64, topP float64, allow func(int) bool) []int {
+	for k := 64; ; k *= 8 {
+		if k >= len(probs) {
+			k = len(probs)
+		}
+		c := topProbs(probs, k, allow)
+		if len(c) < k || k == len(probs) {
+			return c // every allowed token is in c
+		}
+		var cum float64
+		for _, id := range c {
+			cum += probs[id]
+			if cum >= topP {
+				return c
+			}
+		}
+	}
+}
+
+// before is the candidate order: higher probability first, then lower id.
+func before(probs []float64, a, b int) bool {
+	if probs[a] != probs[b] {
+		return probs[a] > probs[b]
+	}
+	return a < b
+}
+
+// topProbs returns up to k allowed token ids in candidate order.
+func topProbs(probs []float64, k int, allow func(int) bool) []int {
+	h := make([]int, 0, k) // min-heap by candidate order: h[0] is the worst kept
+	down := func(i int) {
+		for {
+			l, r, m := 2*i+1, 2*i+2, i
+			if l < len(h) && before(probs, h[m], h[l]) {
+				m = l
+			}
+			if r < len(h) && before(probs, h[m], h[r]) {
+				m = r
+			}
+			if m == i {
+				return
+			}
+			h[i], h[m] = h[m], h[i]
+			i = m
+		}
+	}
+	for id := range probs {
+		if allow != nil && !allow(id) {
+			continue
+		}
+		if len(h) < k {
+			h = append(h, id)
+			for i := len(h) - 1; i > 0; {
+				parent := (i - 1) / 2
+				if !before(probs, h[parent], h[i]) {
+					break
+				}
+				h[i], h[parent] = h[parent], h[i]
+				i = parent
+			}
+			continue
+		}
+		if before(probs, id, h[0]) {
+			h[0] = id
+			down(0)
+		}
+	}
+	sort.Slice(h, func(a, b int) bool { return before(probs, h[a], h[b]) })
+	return h
 }
