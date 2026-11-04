@@ -38,25 +38,39 @@ func Detect() (Host, error) {
 // single source of truth for "what should I run here". The tiers are by RAM
 // on every backend: a machine with no GPU runs the same model, slower (a 1.7B
 // on four cores read a coder prompt at 15 tokens a second and called no tool).
-func (h Host) Recommend() string {
-	switch {
-	case h.RAMGiB >= 32:
-		// Qwen3.8-27B is the model Memdoor's published result ran on (a team
-		// of five, LiveCodeBench Hard, 2026-10). 15 GiB of weights at 4-bit;
-		// a hybrid with 16 full-attention layers of 64, so its KV cache is
-		// 2 GiB at 32K tokens, 8 GiB at 128K. On a 32 GB Mac the GPU may wire
-		// about 24 GiB: the weights and a 32K context fit, and the older
-		// Qwen3-14B it replaces lost a generation for no room gained.
-		return "Qwen3.8-27B-4bit"
-	case h.RAMGiB >= 16:
-		// Qwen3.5-9B replaced Qwen3-8B as the 16 GB default (2026-09-01): the
-		// hybrid linear-attention stack decodes FASTER in this engine (11.5 vs
-		// 8 tok/s measured) and only every 4th layer grows a KV cache, so long
-		// contexts cost far less memory.
-		return "Qwen3.5-9B-MLX-4bit"
-	default:
-		return "Qwen3-4B-Instruct-2507-4bit"
+func (h Host) Recommend() string { return h.Candidates()[0] }
+
+// tiers are the models Recommend picks from, largest first, each with the
+// RAM it needs.
+var tiers = []struct {
+	minGiB int
+	name   string
+}{
+	// Qwen3.8-27B is the model Memdoor's published result ran on (a team
+	// of five, LiveCodeBench Hard, 2026-10). 15 GiB of weights at 4-bit;
+	// a hybrid with 16 full-attention layers of 64, so its KV cache is
+	// 2 GiB at 32K tokens, 8 GiB at 128K. On a 32 GB Mac the GPU may wire
+	// about 24 GiB: the weights and a 32K context fit, and the older
+	// Qwen3-14B it replaces lost a generation for no room gained.
+	{32, "Qwen3.8-27B-4bit"},
+	// Qwen3.5-9B replaced Qwen3-8B as the 16 GB default (2026-09-01): the
+	// hybrid linear-attention stack decodes FASTER in this engine (11.5 vs
+	// 8 tok/s measured) and only every 4th layer grows a KV cache, so long
+	// contexts cost far less memory.
+	{16, "Qwen3.5-9B-MLX-4bit"},
+	{0, "Qwen3-4B-Instruct-2507-4bit"},
+}
+
+// Candidates is the model Recommend picks, then the smaller tiers, for a
+// disk without room for the first.
+func (h Host) Candidates() []string {
+	var out []string
+	for _, t := range tiers {
+		if h.RAMGiB >= t.minGiB || len(out) > 0 {
+			out = append(out, t.name)
+		}
 	}
+	return out
 }
 
 // Fit rates how well a model runs on a host.
@@ -135,11 +149,7 @@ type InstalledModel struct {
 // de-duplicated by name (first snapshot wins). The single inventory source the
 // CLI (`llm list`) and the TUI (/model) both read, so neither re-globs by hand.
 func ListInstalled() ([]InstalledModel, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-	matches, _ := filepath.Glob(filepath.Join(home, ".cache/huggingface/hub/models--mlx-community--*/snapshots/*"))
+	matches, _ := filepath.Glob(filepath.Join(CacheDir(), "models--mlx-community--*/snapshots/*"))
 	out := make([]InstalledModel, 0, len(matches))
 	seen := map[string]bool{}
 	for _, dir := range matches {

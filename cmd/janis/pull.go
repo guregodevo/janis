@@ -14,14 +14,15 @@ import (
 )
 
 // pull downloads an mlx-community model into the HuggingFace cache layout
-// hostfit reads (~/.cache/huggingface/hub/models--mlx-community--<name>/
+// hostfit reads (hostfit.CacheDir()/models--mlx-community--<name>/
 // snapshots/<revision>/), file by file, skipping what is already there. No
-// name: the model hostfit recommends for this machine's RAM. HF_TOKEN is
+// name: the model that fits this machine's RAM and disk (pickModel). A model
+// the disk has no room for is refused before a byte is fetched. HF_TOKEN is
 // sent when set (gated repositories); nothing else is sent.
 // hubBase is the Hub; a test points it at a local server.
 var hubBase = "https://huggingface.co"
 
-func pull(args []string) {
+func pull(args []string) error {
 	name, force := "", false
 	for _, a := range args {
 		if a == "--force" || a == "-f" {
@@ -30,31 +31,34 @@ func pull(args []string) {
 		}
 		name = strings.TrimPrefix(a, "mlx-community/")
 	}
+	client := &http.Client{Timeout: 0}
 	host, _ := hostfit.Detect()
 	if name == "" {
-		name = host.Recommend()
-		fmt.Printf("no model named: %s fits this machine (%d GiB)\n", name, host.RAMGiB)
+		var err error
+		if name, err = pickModel(client, host); err != nil {
+			return err
+		}
 	} else if host.Rate(name) == hostfit.FitTooBig {
 		fmt.Printf("note: %s is likely too big for %d GiB; %s would fit\n", name, host.RAMGiB, host.Recommend())
 	}
 	if !force {
 		if installed(name) {
 			fmt.Printf("✓ %s is installed · janis serve --model %s (pull --force fetches it again)\n", name, name)
-			return
+			return nil
 		}
 	}
 	repo := "mlx-community/" + name
-	client := &http.Client{Timeout: 0}
 	meta, err := repoFiles(client, repo)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", repo, err)
-		os.Exit(1)
+		return fmt.Errorf("%s: %w", repo, err)
 	}
-	home, _ := os.UserHomeDir()
-	dir := filepath.Join(home, ".cache/huggingface/hub/models--mlx-community--"+name, "snapshots", meta.SHA)
+	dir := snapshotDir(name, meta.SHA)
+	if need := missingBytes(meta, dir); !roomFor(need) {
+		free, _ := freeBytes(hostfit.CacheDir())
+		return fmt.Errorf("%s needs %s and %s is free in %s: HF_HOME=<a disk with room> puts the models there", name, hostfit.HumanSize(need), hostfit.HumanSize(int64(free)), hostfit.CacheDir())
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
 	var total int64
 	for _, f := range meta.Files {
@@ -67,11 +71,75 @@ func pull(args []string) {
 			continue
 		}
 		if err := download(client, hubBase+"/"+repo+"/resolve/"+meta.SHA+"/"+f.Name, dst, f.Size); err != nil {
-			fmt.Fprintf(os.Stderr, "\n%s: %v\n", f.Name, err)
-			os.Exit(1)
+			return fmt.Errorf("%s: %w", f.Name, err)
 		}
 	}
 	fmt.Printf("✓ %s installed · janis serve --model %s\n", name, name)
+	return nil
+}
+
+// pickModel is the model that fits this machine: its RAM tier, else the
+// largest smaller tier whose download fits the disk. An installed model
+// fits. The line it prints starts "no model named:", which memdoor's
+// connect local shows as it is.
+func pickModel(client *http.Client, host hostfit.Host) (string, error) {
+	dir := hostfit.CacheDir()
+	free, _ := freeBytes(dir)
+	for _, name := range host.Candidates() {
+		need := int64(0)
+		if !installed(name) {
+			meta, err := repoFiles(client, "mlx-community/"+name)
+			if err != nil {
+				return "", fmt.Errorf("mlx-community/%s: %w", name, err)
+			}
+			need = missingBytes(meta, snapshotDir(name, meta.SHA))
+		}
+		if roomFor(need) {
+			fmt.Printf("no model named: %s fits this machine (%d GiB, %s free in %s)\n", name, host.RAMGiB, hostfit.HumanSize(int64(free)), dir)
+			return name, nil
+		}
+		fmt.Printf("%s fits %d GiB but needs %s on disk, %s is free in %s\n", name, host.RAMGiB, hostfit.HumanSize(need), hostfit.HumanSize(int64(free)), dir)
+	}
+	return "", fmt.Errorf("no model fits the %s free in %s: HF_HOME=<a disk with room> puts the models there", hostfit.HumanSize(int64(free)), dir)
+}
+
+// freeBytes is hostfit.FreeBytes; a test sets a small disk.
+var freeBytes = hostfit.FreeBytes
+
+// headroom is the disk a pull leaves free beyond the model.
+const headroom = 512 << 20
+
+// roomFor is whether need more bytes fit on the cache's disk with headroom
+// left. An unknown free space lets the pull go ahead.
+func roomFor(need int64) bool {
+	if need == 0 {
+		return true
+	}
+	free, err := freeBytes(hostfit.CacheDir())
+	return err != nil || uint64(need)+headroom <= free
+}
+
+// snapshotDir is where a model's files go in the cache layout hostfit reads.
+func snapshotDir(name, sha string) string {
+	return filepath.Join(hostfit.CacheDir(), "models--mlx-community--"+name, "snapshots", sha)
+}
+
+// missingBytes is the disk a pull of meta into dir still takes: the files it
+// has to fetch, less the partial ones (.part) it starts over, whose room
+// comes back when it does.
+func missingBytes(meta repoMeta, dir string) int64 {
+	var n int64
+	for _, f := range meta.Files {
+		dst := filepath.Join(dir, f.Name)
+		if st, err := os.Stat(dst); err == nil && (f.Size == 0 || st.Size() == f.Size) {
+			continue
+		}
+		n += f.Size
+		if st, err := os.Stat(dst + ".part"); err == nil {
+			n -= min(st.Size(), f.Size)
+		}
+	}
+	return n
 }
 
 // installed is whether name is in the HuggingFace cache already.

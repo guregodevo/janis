@@ -17,7 +17,10 @@ OpenAI-compatible client.
   `gguf` is a container reader only (format, not architecture): it reads the
   GGML quantization types and leaves model-specific meaning to the caller.
 
-Weights come from `huggingface.co/mlx-community` into `~/.cache/huggingface/`.
+Weights come from `huggingface.co/mlx-community` into `~/.cache/huggingface/hub`,
+or `$HF_HOME/hub` (`HF_HUB_CACHE` when set). `janis pull` checks the free
+space first: a model the disk cannot hold is refused before the download,
+and with no name it takes the largest RAM tier that fits the disk.
 
 ## Install
 

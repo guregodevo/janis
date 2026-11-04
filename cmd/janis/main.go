@@ -32,7 +32,9 @@ func main() {
 	case "list":
 		list()
 	case "pull":
-		pull(os.Args[2:])
+		if err := pull(os.Args[2:]); err != nil {
+			fail(err)
+		}
 	case "serve":
 		run(os.Args[2:])
 	default:
@@ -52,7 +54,7 @@ func list() {
 		os.Exit(1)
 	}
 	if len(models) == 0 {
-		fmt.Println("no model installed: janis serves the mlx-community models in ~/.cache/huggingface/hub")
+		fmt.Println("no model installed: janis serves the mlx-community models in " + hostfit.CacheDir())
 		return
 	}
 	host, _ := hostfit.Detect()

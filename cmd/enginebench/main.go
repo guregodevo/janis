@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/guregodevo/janis"
+	"github.com/guregodevo/janis/hostfit"
 )
 
 type turnStat struct {
@@ -148,8 +149,7 @@ func buildTurns(system, seed, chunk string, turn int) []llm.Message {
 }
 
 func runMemdoor(modelSub, system, seed, chunk string, turns, gen int, outDir string) ([]turnStat, error) {
-	home, _ := os.UserHomeDir()
-	dirs, _ := filepath.Glob(filepath.Join(home, ".cache/huggingface/hub/models--mlx-community--"+modelSub+"*/snapshots/*"))
+	dirs, _ := filepath.Glob(filepath.Join(hostfit.CacheDir(), "models--mlx-community--"+modelSub+"*/snapshots/*"))
 	if len(dirs) == 0 {
 		return nil, fmt.Errorf("model %q not cached (janis pull %s)", modelSub, modelSub)
 	}

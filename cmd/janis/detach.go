@@ -31,11 +31,16 @@ func detachServe(host string, port int, model, logPath string) {
 	}
 	if model == "" {
 		host, _ := hostfit.Detect()
-		model = host.Recommend()
-		fmt.Printf("no model named: %s fits this machine (%d GiB)\n", model, host.RAMGiB)
+		m, err := pickModel(&http.Client{}, host)
+		if err != nil {
+			fail(err)
+		}
+		model = m
 	}
 	if !installed(model) {
-		pull([]string{model})
+		if err := pull([]string{model}); err != nil {
+			fail(err)
+		}
 	}
 	if logPath == "" {
 		logPath = filepath.Join(os.TempDir(), fmt.Sprintf("janis-%d.log", port))

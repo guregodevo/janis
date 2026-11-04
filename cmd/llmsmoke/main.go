@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/guregodevo/janis"
+	"github.com/guregodevo/janis/hostfit"
 )
 
 func main() {
@@ -28,8 +29,7 @@ func main() {
 		prompt = os.Args[2]
 	}
 
-	home, _ := os.UserHomeDir()
-	dirs, _ := filepath.Glob(filepath.Join(home, ".cache/huggingface/hub/models--mlx-community--"+model+"/snapshots/*"))
+	dirs, _ := filepath.Glob(filepath.Join(hostfit.CacheDir(), "models--mlx-community--"+model+"/snapshots/*"))
 	if len(dirs) == 0 {
 		fmt.Printf("model %q not cached\n", model)
 		os.Exit(1)

@@ -39,3 +39,30 @@ func TestMemTotalGiBRoundsUp(t *testing.T) {
 		}
 	}
 }
+
+// The cache is where the Hugging Face tools put it: HF_HUB_CACHE, then
+// HF_HOME/hub, then ~/.cache/huggingface/hub.
+func TestCacheDirFollowsTheHuggingFaceVariables(t *testing.T) {
+	t.Setenv("HOME", "/h")
+	t.Setenv("HF_HUB_CACHE", "")
+	t.Setenv("HF_HOME", "")
+	if got := CacheDir(); got != "/h/.cache/huggingface/hub" {
+		t.Errorf("default: %s", got)
+	}
+	t.Setenv("HF_HOME", "/big")
+	if got := CacheDir(); got != "/big/hub" {
+		t.Errorf("HF_HOME: %s", got)
+	}
+	t.Setenv("HF_HUB_CACHE", "/hub")
+	if got := CacheDir(); got != "/hub" {
+		t.Errorf("HF_HUB_CACHE: %s", got)
+	}
+}
+
+// Candidates starts at the RAM tier and goes down.
+func TestCandidatesStartAtTheRAMTier(t *testing.T) {
+	got := (Host{RAMGiB: 16}).Candidates()
+	if len(got) != 2 || got[0] != "Qwen3.5-9B-MLX-4bit" || got[1] != "Qwen3-4B-Instruct-2507-4bit" {
+		t.Errorf("Candidates(16 GiB) = %v", got)
+	}
+}
