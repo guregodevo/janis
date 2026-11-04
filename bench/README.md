@@ -1,5 +1,7 @@
 # CPU prefill against llama.cpp
 
+The GPU (MLX) numbers are in [mlx.md](mlx.md).
+
 How fast janis reads a long prompt on the CPU (ggml backend), next to
 llama.cpp at the ggml version janis links (b8640).
 
