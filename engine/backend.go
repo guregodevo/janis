@@ -46,6 +46,19 @@ type RawReader interface {
 //
 // Usage per decode step: Pin the survivors (weights are PinAll'd once; the new
 // KV caches each step), Unpin the replaced ones, then Sweep frees the rest.
+// ValueCache is a backend that keeps an attention value cache in a layout of
+// its own: AppendValues is Concat along the token axis (2) for it.
+type ValueCache interface {
+	AppendValues(cache, x Tensor) Tensor
+}
+
+// CacheReserver is a backend that makes a key/value cache once, at the size
+// the request will reach, instead of growing it while the prompt is read.
+type CacheReserver interface {
+	// ReserveCache sizes the caches made from now on for tokens positions.
+	ReserveCache(tokens int)
+}
+
 type Sweeper interface {
 	// PinAll pins everything created so far (used once after weight load).
 	PinAll()

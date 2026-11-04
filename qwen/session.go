@@ -311,6 +311,9 @@ func (s *Session) Prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 	if len(newIDs) == 0 {
 		return nil
 	}
+	if r, ok := b.(engine.CacheReserver); ok {
+		r.ReserveCache(len(newIDs))
+	}
 	floats, ok := s.prefill(b, newIDs, cancel)
 	if !ok {
 		return nil
@@ -327,6 +330,9 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 	}
 	rng := rand.New(rand.NewSource(int64(p.Seed)))
 	sw, _ := b.(engine.Sweeper)
+	if r, ok := b.(engine.CacheReserver); ok {
+		r.ReserveCache(len(newIDs) + nGen)
+	}
 	floats, ok := s.prefill(b, newIDs, p.Cancel)
 	if !ok {
 		return nil

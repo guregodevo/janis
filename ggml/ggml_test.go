@@ -193,3 +193,60 @@ func TestGGMLMatchesCPU(t *testing.T) {
 		}
 	}
 }
+
+// A value cache built by AppendValues (kept transposed without flash
+// attention) gives what a plain concatenation gives: through SDPA, read back
+// whole, and cut back by Slice (a truncate). The appends cross the reserved
+// size, so the cache moves to a bigger buffer on the way.
+func TestValueCacheMatchesConcat(t *testing.T) {
+	for _, flash := range []bool{false, true} {
+		g := New()
+		g.flash = flash
+		c := cpu.New()
+		const H, Hk, D = 4, 2, 8
+		steps := []int{3, 300, 1, 2}
+		total := 0
+		for _, n := range steps {
+			total += n
+		}
+		k, v := rnd(Hk*total*D, 21), rnd(Hk*total*D, 22)
+		part := func(x []float32, from, n int) []float32 { // [1, Hk, n, D] of [1, Hk, total, D]
+			out := make([]float32, 0, Hk*n*D)
+			for h := 0; h < Hk; h++ {
+				out = append(out, x[(h*total+from)*D:(h*total+from+n)*D]...)
+			}
+			return out
+		}
+		g.ReserveCache(100)
+		var gk, gv engine.Tensor
+		at := 0
+		for _, n := range steps {
+			kn := g.Cast(g.FromFloats(part(k, at, n), 1, Hk, n, D), engine.F16)
+			vn := g.Cast(g.FromFloats(part(v, at, n), 1, Hk, n, D), engine.F16)
+			if gk == nil {
+				gk, gv = kn, vn
+			} else {
+				gk, gv = g.Concat(gk, kn, 2), g.AppendValues(gv, vn)
+			}
+			at += n
+		}
+		name := map[bool]string{false: "transposed V", true: "flash"}[flash]
+		if grp := as(gv).grp; grp == nil || grp.vt == flash {
+			t.Fatalf("%s: the value cache's layout is not the one the mode keeps", name)
+		}
+		const tol = 5e-3
+		ck, cv := c.FromFloats(k, 1, Hk, total, D), c.FromFloats(v, 1, Hk, total, D)
+		diffOK(t, name+": V read back", tol, g.Floats(gv), c.Floats(cv))
+		q := rnd(H*2*D, 23)
+		scale := float32(1.0 / math.Sqrt(D))
+		diffOK(t, name+": SDPA", tol,
+			g.Floats(g.SDPA(g.FromFloats(q, 1, H, 2, D), gk, gv, scale, true)),
+			c.Floats(c.SDPA(c.FromFloats(q, 1, H, 2, D), ck, cv, scale, true)))
+		q8 := rnd(H*9*D, 24) // a prompt chunk of 9: read padded past the cache
+		diffOK(t, name+": SDPA, 9 queries", tol,
+			g.Floats(g.SDPA(g.FromFloats(q8, 1, H, 9, D), gk, gv, scale, true)),
+			c.Floats(c.SDPA(c.FromFloats(q8, 1, H, 9, D), ck, cv, scale, true)))
+		diffOK(t, name+": V sliced", tol, g.Floats(g.Slice(gv, 2, 0, 5)), c.Floats(c.Slice(cv, 2, 0, 5)))
+		g.Close()
+	}
+}

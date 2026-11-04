@@ -87,7 +87,11 @@ func (c *KVCache) Update(b engine.Backend, kNew, vNew engine.Tensor) (engine.Ten
 		c.K, c.V = kNew, vNew
 	} else {
 		c.K = b.Concat(c.K, kNew, 2)
-		c.V = b.Concat(c.V, vNew, 2)
+		if vc, ok := b.(engine.ValueCache); ok {
+			c.V = vc.AppendValues(c.V, vNew)
+		} else {
+			c.V = b.Concat(c.V, vNew, 2)
+		}
 	}
 	return c.K, c.V
 }

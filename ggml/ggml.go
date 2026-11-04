@@ -85,8 +85,15 @@ type Backend struct {
 	// repack is the CPU's weight-repacking buffer type, nil on a device:
 	// where a dense 4-bit weight goes as Q4_K (see q4K).
 	repack C.ggml_backend_buffer_type_t
-	name   string
-	mu     sync.Mutex
+	// cpu is whether the backend runs on the cores.
+	cpu bool
+	// flash is whether attention is ggml's fused flash attention (SDPA);
+	// else the value cache is kept transposed (AppendValues).
+	flash bool
+	// reserved is the positions a cache is made for (ReserveCache).
+	reserved int
+	name     string
+	mu       sync.Mutex
 
 	rec     *C.struct_ggml_context // the recording context: nodes not yet computed
 	pending []pendingRef           // their results, in order, held weakly
@@ -109,7 +116,7 @@ type Backend struct {
 	// Small constants every layer re-asks for: the RoPE positions of a step
 	// and the causal mask of a shape. Uploaded once, pinned.
 	positions map[[2]int]*tensor
-	masks     map[[2]int]*tensor
+	masks     map[[3]int]*tensor
 	// arenas are a few fixed buffers that batches are placed into with a
 	// linear allocator and reused once their results are gone: a flush is
 	// not a fresh device allocation of yet another size, which is what
@@ -166,6 +173,8 @@ func New() *Backend {
 	}
 	if b.be == nil {
 		b.be = C.ggml_backend_cpu_init()
+		b.cpu = true
+		b.flash = flashOnCPU()
 		threads := runtime.NumCPU()
 		if n, err := strconv.Atoi(os.Getenv("JANIS_GGML_THREADS")); err == nil && n > 0 {
 			threads = n
@@ -179,7 +188,7 @@ func New() *Backend {
 	b.name = C.GoString(C.ggml_backend_name(b.be))
 	b.tracked = map[weak.Pointer[tensor]]struct{}{}
 	b.positions = map[[2]int]*tensor{}
-	b.masks = map[[2]int]*tensor{}
+	b.masks = map[[3]int]*tensor{}
 	for _, sz := range arenaSizes {
 		if buf := C.ggml_backend_buft_alloc_buffer(b.buft, sz); buf != nil {
 			b.arenas = append(b.arenas, &arena{buf: buf, size: sz})
@@ -228,17 +237,17 @@ func (b *Backend) Close() {
 // tensor is one ggml tensor in its own buffer. shape is janis's row-major
 // shape; ggml's ne is the same list reversed (ne0 innermost).
 type tensor struct {
-	t     *C.struct_ggml_tensor
-	ctx   *C.struct_ggml_context  // a leaf's own context and buffer …
-	buf   C.ggml_backend_buffer_t //
-	grp   *batch                  // … or the batch a computed result lives in
-	deps  []*tensor               // the inputs a recorded node reads, held until it is computed
+	t    *C.struct_ggml_tensor
+	ctx  *C.struct_ggml_context  // a leaf's own context and buffer …
+	buf  C.ggml_backend_buffer_t //
+	grp  *batch                  // … or the batch a computed result lives in
+	deps []*tensor               // the inputs a recorded node reads, held until it is computed
 	// via holds what a pending input reads, through that input's own holder
 	// rather than the input itself (which may be a temporary the model
 	// drops): a residual chain shares its ancestry by reference, not by copy
 	// (a copied list doubled every layer and ate 64 GB of host memory on
 	// the 27B, 2026-10-26).
-	via *depHolder
+	via   *depHolder
 	shape []int
 	dt    engine.DType
 	where string     // the op's call site, kept when tracing or checking
@@ -268,6 +277,9 @@ type batch struct {
 	// every cache tensor a view of a prefix of it; Pin leaves it in place.
 	base *C.struct_ggml_tensor
 	cap  int // capacity along the token axis
+	// vt is a value cache laid out tokens innermost, the way attention's
+	// v·scores reads it (AppendValues); its views are permuted back.
+	vt bool
 }
 
 // memMu guards the refcounts and arena state that finalizers touch from
@@ -979,6 +991,10 @@ func (b *Backend) DTypeOf(t engine.Tensor) engine.DType { return as(t).dt }
 func (b *Backend) Bytes(t engine.Tensor) []byte {
 	b.flush()
 	x := as(t)
+	if !C.ggml_is_contiguous(x.t) { // a cache view: its bytes in order
+		x = as(b.op(x.dt, x.shape, []*tensor{x}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor { return C.ggml_cont(ctx, x.t) }))
+		b.flush()
+	}
 	n := int(C.ggml_nbytes(x.t))
 	out := make([]byte, n)
 	if n > 0 {
@@ -1178,7 +1194,7 @@ func (b *Backend) Concat(a, bb engine.Tensor, axis int) engine.Tensor {
 	shape := append([]int(nil), ta.shape...)
 	shape[axis] += tb.shape[axis]
 	if ta.dt == engine.F16 && tb.dt == engine.F16 && axis == nd-2 {
-		return b.appendCache(ta, tb, axis)
+		return b.appendCache(ta, tb, axis, false)
 	}
 	return b.op(engine.F32, shape, []*tensor{ta, tb}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		return C.ggml_concat(ctx, f32(ctx, ta), f32(ctx, tb), C.int(nd-1-axis))
@@ -1193,7 +1209,7 @@ func (b *Backend) Concat(a, bb engine.Tensor, axis int) engine.Tensor {
 // no old and new copies alive at once; a cache that has no room, or that
 // came from somewhere else (a slice, the first step), moves into a new
 // buffer first. The old view stays valid: it covers the prefix only.
-func (b *Backend) appendCache(ta, tb *tensor, axis int) engine.Tensor {
+func (b *Backend) appendCache(ta, tb *tensor, axis int, vt bool) engine.Tensor {
 	n, m := ta.shape[axis], tb.shape[axis]
 	need := n + m
 	shape := append([]int(nil), ta.shape...)
@@ -1204,22 +1220,30 @@ func (b *Backend) appendCache(ta, tb *tensor, axis int) engine.Tensor {
 		b.rec = C.janis_ctx(C.size_t(C.ggml_tensor_overhead())*maxNodes + C.ggml_graph_overhead_custom(maxNodes, false))
 	}
 	grp := ta.grp
-	if grp == nil || grp.base == nil || ta.cacheLen != n || grp.cap < need {
+	if grp == nil || grp.base == nil || ta.cacheLen != n || grp.cap < need || grp.vt != vt {
 		// A new buffer with room: the old cache is copied in by the flush.
+		spare := max(cacheSpare(need), b.reserved-need)
 		capShape := append([]int(nil), shape...)
-		capShape[axis] = need + cacheGrow
+		capShape[axis] = (need + spare + kvPad - 1) / kvPad * kvPad
 		// The buffer's context also holds every prefix view made over its
-		// life (one a step, up to cacheGrow of them): it must outlive the
-		// recording contexts those steps flush.
-		ctx := C.janis_ctx(ctxMem + C.size_t(C.ggml_tensor_overhead())*(cacheGrow+64))
+		// life (one a step, up to spare of them, two tensors each for a
+		// transposed value cache): it must outlive the recording contexts
+		// those steps flush.
+		ctx := C.janis_ctx(ctxMem + C.size_t(C.ggml_tensor_overhead())*C.size_t(2*(spare+64)))
 		cne := ne(capShape)
+		if vt {
+			cne[0], cne[1] = cne[1], cne[0]
+		}
 		base := C.janis_new(ctx, C.GGML_TYPE_F16, cne[0], cne[1], cne[2], cne[3])
 		buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
 		if buf == nil {
 			C.ggml_free(ctx)
 			panic("ggml: no room on the device for the cache")
 		}
-		grp = &batch{ctx: ctx, buf: buf, base: base, cap: capShape[axis]}
+		// Zeros past the cache: a prompt chunk reads up to kvPad of them,
+		// masked, and a masked garbage NaN would still poison the sum.
+		C.ggml_backend_buffer_clear(buf, 0)
+		grp = &batch{ctx: ctx, buf: buf, base: base, cap: capShape[axis], vt: vt}
 		logAlloc("cache", C.ggml_nbytes(base), capShape)
 		b.writeCache(grp, ta, 0)
 	}
@@ -1235,8 +1259,52 @@ func (b *Backend) appendCache(ta, tb *tensor, axis int) engine.Tensor {
 	return out
 }
 
-// cacheGrow is the spare room a cache buffer is made with, in tokens.
+// cacheGrow is the least spare room a cache buffer is made with, in tokens.
 const cacheGrow = 256
+
+// ReserveCache makes the caches made from now on hold tokens positions from
+// the start, the way llama.cpp and Ollama size theirs for the context: the
+// prompt is read without a cache being copied. Pages a cache never writes
+// are not touched on the CPU.
+func (b *Backend) ReserveCache(tokens int) {
+	b.mu.Lock()
+	b.reserved = tokens
+	b.mu.Unlock()
+}
+
+// AppendValues is Concat along the token axis for an attention value cache
+// (engine.ValueCache). Without flash attention the cache is kept transposed,
+// tokens innermost, as llama.cpp keeps it: v·scores reads it in place
+// instead of copying the whole cache transposed in every layer.
+func (b *Backend) AppendValues(cache, x engine.Tensor) engine.Tensor {
+	ta, tb := as(cache), as(x)
+	if b.flash || ta.dt != engine.F16 || tb.dt != engine.F16 || len(ta.shape) != 4 {
+		return b.Concat(cache, x, 2)
+	}
+	return b.appendCache(ta, tb, 2, true)
+}
+
+// flashOnCPU is whether the CPU backend uses flash attention:
+// JANIS_GGML_FLASH=1 or 0, else on x86 (prefill 14.9 → 19.1 tok/s on four
+// Xeon cores) and off on ARM, where llama.cpp's prompt reading is faster
+// without it (223.6 vs 174.8 tok/s on an M4's ten cores).
+func flashOnCPU() bool {
+	switch os.Getenv("JANIS_GGML_FLASH") {
+	case "1":
+		return true
+	case "0":
+		return false
+	}
+	return runtime.GOARCH != "arm64"
+}
+
+// cacheSpare is the room a cache buffer of need tokens is made with: half
+// again, so a long prompt copies its cache a few times in all rather than
+// once every other chunk (a fixed 256 copied 7.7 GB over an 8K-token
+// prefill of a 1.7B).
+func cacheSpare(need int) int {
+	return max(cacheGrow, need/2)
+}
 
 // gcEvery is how many flushes pass between collections (see flushLocked);
 // JANIS_GGML_GC overrides (0 turns it off), JANIS_GGML_GCSYNC=1 collects
@@ -1263,11 +1331,49 @@ func logAlloc(what string, bytes C.size_t, shape []int) {
 
 // cacheView is a view of the first shape[axis] tokens of a cache buffer.
 func (b *Backend) cacheView(grp *batch, shape []int) *C.struct_ggml_tensor {
+	return cachePrefix(grp.ctx, grp, shape)
+}
+
+// cachePrefix is a view, made in ctx, of the first shape[nd-2] tokens of a
+// cache buffer, in the cache's logical [B, H, L, D] order.
+func cachePrefix(ctx *C.struct_ggml_context, grp *batch, shape []int) *C.struct_ggml_tensor {
 	m := ne(shape)
 	base := grp.base
-	v := C.ggml_view_4d(grp.ctx, base, m[0], m[1], m[2], m[3], base.nb[1], base.nb[2], base.nb[3], 0)
+	if grp.vt {
+		v := C.ggml_view_4d(ctx, base, m[1], m[0], m[2], m[3], base.nb[1], base.nb[2], base.nb[3], 0)
+		C.ggml_backend_view_init(v)
+		p := C.ggml_permute(ctx, v, 1, 0, 2, 3)
+		C.ggml_backend_view_init(p)
+		return p
+	}
+	v := C.ggml_view_4d(ctx, base, m[0], m[1], m[2], m[3], base.nb[1], base.nb[2], base.nb[3], 0)
 	C.ggml_backend_view_init(v)
 	return v
+}
+
+// kvPad is the token multiple a prompt chunk reads the caches padded to.
+const kvPad = 32
+
+// paddedLen is the length a cache view can be read padded to, within its
+// buffer (whose room past the cache is zeros), or 0 for a tensor that is
+// not a cache view.
+func (t *tensor) paddedLen() int {
+	n := t.cacheLen
+	if t.grp == nil || t.grp.base == nil || n == 0 || len(t.shape) != 4 || t.shape[2] != n {
+		return 0
+	}
+	p := (n + kvPad - 1) / kvPad * kvPad
+	if p > t.grp.cap {
+		return 0
+	}
+	return p
+}
+
+// padTokens is shape with its token axis (nd-2) set to n.
+func padTokens(shape []int, n int) []int {
+	s := append([]int(nil), shape...)
+	s[len(s)-2] = n
+	return s
 }
 
 // writeCache records the copy of x into the cache buffer at token offset
@@ -1276,7 +1382,14 @@ func (b *Backend) cacheView(grp *batch, shape []int) *C.struct_ggml_tensor {
 func (b *Backend) writeCache(grp *batch, x *tensor, off int) {
 	m := ne(x.shape)
 	base := grp.base
-	dst := C.ggml_view_4d(b.rec, base, m[0], m[1], m[2], m[3], base.nb[1], base.nb[2], base.nb[3], C.size_t(off)*C.size_t(base.nb[1]))
+	var dst *C.struct_ggml_tensor
+	if grp.vt {
+		d := C.ggml_view_4d(b.rec, base, m[1], m[0], m[2], m[3], base.nb[1], base.nb[2], base.nb[3], C.size_t(off)*C.size_t(base.nb[0]))
+		C.ggml_backend_view_init(d)
+		dst = C.ggml_permute(b.rec, d, 1, 0, 2, 3)
+	} else {
+		dst = C.ggml_view_4d(b.rec, base, m[0], m[1], m[2], m[3], base.nb[1], base.nb[2], base.nb[3], C.size_t(off)*C.size_t(base.nb[1]))
+	}
 	C.ggml_backend_view_init(dst)
 	srcT := x.t
 	if x.dt != engine.F16 {
@@ -1304,6 +1417,9 @@ func (b *Backend) Slice(x engine.Tensor, axis, start, end int) engine.Tensor {
 	return b.op(tx.dt, shape, []*tensor{tx}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		m := ne(shape)
 		t := tx.t
+		if C.ggml_is_transposed(t) { // a value cache view (AppendValues)
+			t = C.ggml_cont(ctx, t)
+		}
 		offset := C.size_t(start) * C.size_t(t.nb[g])
 		return C.ggml_cont(ctx, C.ggml_view_4d(ctx, t, m[0], m[1], m[2], m[3], t.nb[1], t.nb[2], t.nb[3], offset))
 	})
@@ -1481,24 +1597,56 @@ func (b *Backend) rope(tx *tensor, dims int, traditional bool, base, scale float
 	})
 }
 
-// SDPA over [B, H, L, D] with GQA and the causal mask offset by Lk-Lq: the
-// classic three ops, scores = k·q, softmax with the mask and scale, then
-// v·scores, with ggml's head broadcasting doing the GQA share.
+// SDPA over [B, H, L, D] with GQA and the causal mask offset by Lk-Lq. On a
+// GPU, and a CPU without flash attention: the classic three ops, scores =
+// k·q, softmax with the mask and scale, then v·scores, with ggml's head
+// broadcasting doing the GQA share. With flash attention (flashOnCPU): ggml's
+// fused kernel, which does not hold the Lq×Lk scores of every head.
 func (b *Backend) SDPA(q, k, v engine.Tensor, scale float32, causal bool) engine.Tensor {
 	tq, tk, tv := as(q), as(k), as(v)
 	B, H, Lq := tq.shape[0], tq.shape[1], tq.shape[2]
 	Lk := tk.shape[2]
 	Dv := tv.shape[3]
+	// A prompt chunk reads the caches padded to kvPad tokens, the padding
+	// masked: ggml's f16 GEMM (tinyBLAS) takes only aligned sizes, and an
+	// exact Lk fell back to one dot product a row (40% of a prefill).
+	Lkp := Lk
+	if causal && Lq >= 8 && !b.flash {
+		if p := tk.paddedLen(); p > Lk && tv.paddedLen() == p {
+			Lkp = p
+		}
+	}
 	var tmask *tensor
 	if causal {
-		tmask = b.maskFor(Lq, Lk)
+		tmask = b.maskFor(Lq, Lk, Lkp)
 	}
 	shape := []int{B, H, Lq, Dv}
+	if b.flash {
+		return b.op(engine.F32, shape, []*tensor{tq, tk, tv, tmask}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+			kk, vv := tk.t, tv.t
+			if tk.dt != engine.F32 && tk.dt != engine.F16 {
+				kk = f32(ctx, tk)
+			}
+			if tv.dt != engine.F32 && tv.dt != engine.F16 {
+				vv = f32(ctx, tv)
+			}
+			var mask *C.struct_ggml_tensor
+			if tmask != nil {
+				mask = C.ggml_cast(ctx, tmask.t, C.GGML_TYPE_F16)
+			}
+			r := C.ggml_flash_attn_ext(ctx, f32(ctx, tq), kk, vv, mask, C.float(scale), 0, 0) // ne (Dv, H, Lq, B)
+			return C.ggml_cont(ctx, C.ggml_permute(ctx, r, 0, 2, 1, 3))                       // ne (Dv, Lq, H, B)
+		})
+	}
 	return b.op(engine.F32, shape, []*tensor{tq, tk, tv, tmask}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		// Keys and values may be f16 (the cache): mul_mat takes an f16
 		// first operand against f32 as it is, no cast over the whole cache.
 		qq := f32(ctx, tq)
 		kk, vv := tk.t, tv.t
+		if Lkp > Lk {
+			kk = cachePrefix(ctx, tk.grp, padTokens(tk.shape, Lkp))
+			vv = cachePrefix(ctx, tv.grp, padTokens(tv.shape, Lkp))
+		}
 		if tk.dt != engine.F32 && tk.dt != engine.F16 {
 			kk = f32(ctx, tk)
 		}
@@ -1511,8 +1659,13 @@ func (b *Backend) SDPA(q, k, v engine.Tensor, scale float32, causal bool) engine
 			mask = tmask.t
 		}
 		p := C.ggml_soft_max_ext(ctx, kq, mask, C.float(scale), 0)
-		vT := C.ggml_cont(ctx, C.ggml_transpose(ctx, vv)) // ne (Lk, Dv, Hk, B)
-		return C.ggml_mul_mat(ctx, vT, p)                 // ne (Dv, Lq, H, B)
+		// A value cache kept transposed (AppendValues) is read as it is;
+		// any other V is copied transposed.
+		vT := C.ggml_transpose(ctx, vv) // ne (Lk, Dv, Hk, B)
+		if !C.ggml_is_transposed(vv) {
+			vT = C.ggml_cont(ctx, vT)
+		}
+		return C.ggml_mul_mat(ctx, vT, p) // ne (Dv, Lq, H, B)
 	})
 }
 
@@ -1544,24 +1697,25 @@ func (b *Backend) positionsFor(offset, L int) *tensor {
 	return t
 }
 
-// maskFor is the pinned causal mask [Lq, Lk] (0 kept, -inf above the
-// diagonal offset by Lk-Lq), made once per shape.
-func (b *Backend) maskFor(Lq, Lk int) *tensor {
+// maskFor is the pinned causal mask [Lq, Lkp] (0 kept, -inf above the
+// diagonal offset by Lk-Lq, and on the padding past Lk), made once per shape.
+func (b *Backend) maskFor(Lq, Lk, Lkp int) *tensor {
+	key := [3]int{Lq, Lk, Lkp}
 	b.mu.Lock()
-	t, ok := b.masks[[2]int{Lq, Lk}]
+	t, ok := b.masks[key]
 	b.mu.Unlock()
 	if ok {
 		return t
 	}
-	m := make([]float32, Lk*Lq)
+	m := make([]float32, Lkp*Lq)
 	for i := 0; i < Lq; i++ {
-		for j := 0; j < Lk; j++ {
-			if j > i+(Lk-Lq) {
-				m[i*Lk+j] = float32(math.Inf(-1))
+		for j := 0; j < Lkp; j++ {
+			if j > i+(Lk-Lq) || j >= Lk {
+				m[i*Lkp+j] = float32(math.Inf(-1))
 			}
 		}
 	}
-	t = as(b.FromFloats(m, Lq, Lk))
+	t = as(b.FromFloats(m, Lq, Lkp))
 	t.pin = true
 	b.mu.Lock()
 	if len(b.masks) > 64 {
@@ -1569,9 +1723,9 @@ func (b *Backend) maskFor(Lq, Lk int) *tensor {
 		for _, old := range b.masks {
 			old.free()
 		}
-		b.masks = map[[2]int]*tensor{}
+		b.masks = map[[3]int]*tensor{}
 	}
-	b.masks[[2]int{Lq, Lk}] = t
+	b.masks[key] = t
 	b.mu.Unlock()
 	return t
 }
