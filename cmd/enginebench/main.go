@@ -151,7 +151,7 @@ func runMemdoor(modelSub, system, seed, chunk string, turns, gen int, outDir str
 	home, _ := os.UserHomeDir()
 	dirs, _ := filepath.Glob(filepath.Join(home, ".cache/huggingface/hub/models--mlx-community--"+modelSub+"*/snapshots/*"))
 	if len(dirs) == 0 {
-		return nil, fmt.Errorf("model %q not cached (memdoor llm auto --model %s)", modelSub, modelSub)
+		return nil, fmt.Errorf("model %q not cached (janis pull %s)", modelSub, modelSub)
 	}
 	eng, err := llm.Open(dirs[0])
 	if err != nil {

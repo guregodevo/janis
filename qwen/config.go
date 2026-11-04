@@ -189,7 +189,7 @@ func LoadConfig(modelDir string) (Config, error) {
 	// on an error, and the panic was the only thing that could bypass it).
 	if r.NumAttentionHeads == 0 || r.HiddenSize == 0 {
 		if hasNestedTextConfig(modelDir) {
-			return Config{}, fmt.Errorf("%s: multimodal config (fields nested under text_config) is not supported by this engine — pick a text-only model (`memdoor llm auto`)", modelDir)
+			return Config{}, fmt.Errorf("%s: multimodal config (fields nested under text_config) is not supported by this engine — pick a text-only model (`janis pull` with no name picks one)", modelDir)
 		}
 		return Config{}, fmt.Errorf("%s: config has no attention heads / hidden size — not a model this engine can load", modelDir)
 	}
