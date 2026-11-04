@@ -191,7 +191,7 @@ func (s *Server) ensure(name string) error {
 		return err
 	}
 	if len(installed) == 0 {
-		return fmt.Errorf("no model installed: janis serves the mlx-community models in ~/.cache/huggingface/hub")
+		return fmt.Errorf("no model installed: janis serves the mlx-community models in %s", hostfit.CacheDir())
 	}
 	pick := installed[0]
 	if name != "" {
