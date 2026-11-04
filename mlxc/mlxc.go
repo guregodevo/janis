@@ -254,6 +254,9 @@ func MemoryStatsMB() (active, cache, peak float64) {
 	return float64(a) / (1 << 20), float64(c) / (1 << 20), float64(p) / (1 << 20)
 }
 
+// ResetPeakMemory restarts MLX's peak-memory count from the current use.
+func ResetPeakMemory() { C.mlx_reset_peak_memory() }
+
 // SetCacheLimit bounds MLX's buffer-reuse cache (bytes); above it, freed buffers
 // go back to the OS instead of being retained. 0 disables caching entirely.
 func (b *Backend) SetCacheLimit(bytes uint64) {

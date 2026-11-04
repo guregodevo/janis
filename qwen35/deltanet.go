@@ -217,6 +217,12 @@ func (d *GatedDeltaNet) Forward(b engine.Backend, x engine.Tensor, cache *Linear
 	// Gated RMSNorm (norm over Dv, then silu(z) gate in f32), then out_proj.
 	yn := b.RMSNorm(ys, d.NormW, d.Eps)
 	out := b.Mul(b.SiLU(b.Cast(z, engine.F32)), yn) // [1, S, Hv, Dv]
+	// Back to the activation dtype, as the reference does (precise_swiglu's
+	// astype): left in f32 it made out_proj's output f32, and the residual
+	// add promoted the whole stream to f32 from the first layer on.
+	if rr, ok := b.(engine.RawReader); ok {
+		out = b.Cast(out, rr.DTypeOf(x))
+	}
 	return d.OutProj.Forward(b, b.Reshape(out, 1, S, d.VHeads*d.VDim))
 }
 
