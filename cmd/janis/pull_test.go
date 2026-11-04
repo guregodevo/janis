@@ -120,3 +120,22 @@ func TestPickModelStepsDownToWhatTheDiskHolds(t *testing.T) {
 		t.Fatal("no tier fits 1 GiB, want an error")
 	}
 }
+
+// A partial file from a stopped pull is started over, so its room counts as
+// free: the disk needs only the rest.
+func TestMissingBytesCountsAPartialFileAsFree(t *testing.T) {
+	dir := t.TempDir()
+	meta := repoMeta{SHA: "abc", Files: []struct {
+		Name string
+		Size int64
+	}{{"model.safetensors", 100}, {"config.json", 10}}}
+	if err := os.WriteFile(filepath.Join(dir, "model.safetensors.part"), make([]byte, 30), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), make([]byte, 10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := missingBytes(meta, dir); got != 70 {
+		t.Fatalf("missingBytes = %d, want 70", got)
+	}
+}

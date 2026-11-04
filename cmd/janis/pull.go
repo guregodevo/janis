@@ -124,14 +124,20 @@ func snapshotDir(name, sha string) string {
 	return filepath.Join(hostfit.CacheDir(), "models--mlx-community--"+name, "snapshots", sha)
 }
 
-// missingBytes is what a pull of meta into dir still has to download.
+// missingBytes is the disk a pull of meta into dir still takes: the files it
+// has to fetch, less the partial ones (.part) it starts over, whose room
+// comes back when it does.
 func missingBytes(meta repoMeta, dir string) int64 {
 	var n int64
 	for _, f := range meta.Files {
-		if st, err := os.Stat(filepath.Join(dir, f.Name)); err == nil && (f.Size == 0 || st.Size() == f.Size) {
+		dst := filepath.Join(dir, f.Name)
+		if st, err := os.Stat(dst); err == nil && (f.Size == 0 || st.Size() == f.Size) {
 			continue
 		}
 		n += f.Size
+		if st, err := os.Stat(dst + ".part"); err == nil {
+			n -= min(st.Size(), f.Size)
+		}
 	}
 	return n
 }
