@@ -1,65 +1,107 @@
-# janis
+<div align="center">
+  <h1>janis</h1>
+  <p><strong>Local inference for open-weight models, in Go.</strong><br>An OpenAI-compatible server and a library: MLX on Apple silicon, ggml on Linux and NVIDIA GPUs, pure Go anywhere. One binary, no Python.</p>
+  <p>
+    <a href="https://github.com/guregodevo/janis/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/tag/guregodevo/janis?sort=semver&label=release"></a>
+    <a href="LICENSE"><img alt="Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-blue"></a>
+    <a href="https://github.com/guregodevo/janis/actions/workflows/release.yml"><img alt="Release build" src="https://github.com/guregodevo/janis/actions/workflows/release.yml/badge.svg"></a>
+    <img alt="Go" src="https://img.shields.io/github/go-mod/go-version/guregodevo/janis">
+    <img alt="Platforms" src="https://img.shields.io/badge/macOS%20(Apple%20silicon)%20%C2%B7%20Linux%20amd64%20%C2%B7%20arm64-lightgrey">
+  </p>
+</div>
 
-Local inference for open-weight models — an Ollama for MLX. One Go module,
-no Python: an MLX backend on Apple Silicon, a pure-Go CPU backend elsewhere,
-and what it takes to run a model on the machine in front of you. Use it as a
-library, or run `janis serve` and talk to it like llama.cpp or Ollama from any
-OpenAI-compatible client.
+## Why janis, next to Ollama and llama.cpp
 
-- **serve, cmd/janis** — the OpenAI endpoints over the engine (`janis serve`,
-  `janis list`): models, chat completions streamed or not, tool calls.
-- **engine** — load a model, chat, stream, swap the loaded model live.
-- **qwen, qwen35, gemma** — model families (Qwen3, Qwen3.5 hybrid, Gemma).
-- **whisper, bge, reranker** — speech-to-text, embeddings, reranking.
-- **grammar** — constrained decoding for tool calls.
-- **hostfit** — which model fits this host's RAM, and how well it will run.
-- **mlxc, cpu, safetensors, gguf, tokenizer** — the backends and the loaders.
-  `gguf` is a container reader only (format, not architecture): it reads the
-  GGML quantization types and leaves model-specific meaning to the caller.
+Each row is one machine, one server at a time, 4-bit weights, versions and
+commands in [bench/mlx.md](bench/mlx.md) and [docs/backends.md](docs/backends.md):
 
-Weights come from `huggingface.co/mlx-community` into `~/.cache/huggingface/hub`,
-or `$HF_HOME/hub` (`HF_HUB_CACHE` when set). `janis pull` checks the free
-space first: a model the disk cannot hold is refused before the download,
-and with no name it takes the largest RAM tier that fits the disk.
+| | janis | llama.cpp | Ollama |
+|---|---:|---:|---:|
+| Qwen3-8B, M4 Mac 16 GB: prefill 600 tokens | 224.2 tok/s | 219.5 tok/s | 216.4 tok/s |
+| Qwen3-8B, M4 Mac 16 GB: prefill 9,000 tokens | 195.0 tok/s | 174.4 tok/s | 154.5 tok/s |
+| Qwen3-8B, M4 Mac 16 GB: decode | 22.8 tok/s | 19.9 tok/s | 20.3 tok/s |
+| Qwen3.5-9B, M4 Mac 16 GB: decode | 19.9 tok/s | 18.5 tok/s | not measured |
+| Qwen3-8B, GitHub runner, 4 vCPU: prefill / decode | 12 / 5.6 tok/s | not measured | 12.6 / 4.45 tok/s |
+| Qwen3-8B, NVIDIA L4: decode | 38 tok/s steady | 45 to 50 tok/s | not measured |
+
+On the Mac, janis runs `mlx-community`'s 4-bit weights (4.3 GB for the 8B)
+and llama.cpp and Ollama the Q4_K_M GGUF (5.2 GB). Decode reads every weight
+once per token, so part of the decode lead is the smaller file.
+
+What is different:
+
+- **MLX on a Mac.** The Apple-silicon build runs on MLX, Apple's array
+  framework, with the `mlx-community` weights as published. No GGUF
+  conversion. The same weights run on ggml and pure Go, repacked on load.
+- **A Go module.** `import "github.com/guregodevo/janis"` loads a model in
+  your process: no server beside your program, no Python.
+- **`janis pull` picks the model.** With no name it takes the largest model
+  this machine's RAM runs well and its disk can hold. A model that does not
+  fit is refused before the download.
+- **Typed decisions.** `POST /v1/systemone` answers yes/no, choice and score
+  questions with a probability read from one prefill, in tens of
+  milliseconds ([Decisions](#decisions-a-local-jev)). No decoding, nothing to
+  parse.
+- **Installs without root.** One file on Linux, into `~/.local/bin`, sha256
+  checked. `janis serve --detach` returns once the model has answered, so a
+  CI job can start it and use it on the next line.
+
+Use Ollama or llama.cpp instead for Windows, vision models, architectures
+janis does not load ([Models](#models)), several models loaded at once, or
+the fastest NVIDIA decode (llama.cpp's 45 to 50 tok/s against 38 on an
+L4).
 
 ## Install
 
 Linux (amd64, arm64) and macOS (Apple silicon), into `~/.local/bin`, sha256
-checked. On a Mac the MLX libraries the binary loads go to `~/.local/lib/janis`:
+checked. On a Mac the MLX libraries go to `~/.local/lib/janis`.
 
 ```bash
 curl -fsSL https://github.com/guregodevo/janis/releases/latest/download/install.sh | sh
-janis serve --detach   # pulls the model that fits this machine, serves it, returns once it has answered
+janis pull      # the mlx-community model that fits this machine's RAM and disk
+janis serve     # http://127.0.0.1:8090/v1
 ```
 
-`--detach` is for a CI job or a script: the model is pulled when missing, the
-server runs in the background (its output in `janis-8090.log` in the temp
-directory, or `--log`), and the command returns once the model has answered
-a first request, so the first client does not pay for loading it. A taken
-port or a server that dies fails the command. `JANIS_VERSION=v0.1.2` pins a
-release. `make dist` builds the release asset for the machine it runs on
-([Build](#build)).
+```bash
+curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "Qwen3-8B-4bit", "messages": [{"role": "user", "content": "2+3?"}]}'
+```
+
+`janis serve --detach` is for a CI job or a script: the model is pulled when
+missing, the server runs in the background (its output in `janis-8090.log` in
+the temp directory, or `--log`), and the command returns once the model has
+answered a first request, so the first client does not pay for loading it. A
+taken port or a server that dies fails the command. `JANIS_VERSION=v0.1.2`
+pins a release. `make dist` builds the release asset for the machine it runs
+on ([Build](#build)).
+
+## Models
+
+Weights are MLX safetensors from `huggingface.co/mlx-community`, kept in
+`~/.cache/huggingface/hub` (`$HF_HOME/hub`, or `HF_HUB_CACHE` when set).
+`janis pull` checks the free space first: a model the disk cannot hold is
+refused before the download, and with no name it takes the largest RAM tier
+that fits the disk. `janis list` shows the installed models and whether each
+fits.
+
+| Family | Package |
+|---|---|
+| Qwen2.5, Qwen3 and Llama, dense; Qwen3 MoE (Qwen3-Coder-30B-A3B) | `qwen` |
+| Qwen3.5 hybrid, Gated DeltaNet and attention (0.8B, 9B, Qwen3.8-27B) | `qwen35` |
+| Gemma 2 | `gemma` |
+| Whisper (speech to text), BGE (embeddings), a reranker | `whisper`, `bge`, `reranker`, from Go only |
 
 ## Serve
 
-`janis serve` runs the installed models the way llama.cpp or Ollama does,
-for any OpenAI-compatible client, on `http://127.0.0.1:8090/v1`:
-
-```bash
-go build -o janis ./cmd/janis
-./janis pull                         # the mlx-community model that fits this machine (or: pull Qwen3-8B-4bit)
-./janis list                         # the installed models, with whether each fits
-./janis serve                        # GET /v1/models, POST /v1/chat/completions
-```
-
-Streamed or not, with tools: the schemas are rendered into the system prompt
-the Hermes way, the engine's grammar keeps every `<tool_call>` well-formed,
-and the call comes back as OpenAI `tool_calls`. One model is loaded at a
-time; a request naming another installed model swaps it. `/v1/models`
-carries each model's `context_length` from its config. `--host 0.0.0.0`
-opens it to the network. Memdoor connects it with
-`memdoor connect local --base http://localhost:8090/v1`, no key, on this
-machine or on a box reached over ssh.
+`janis serve` serves the installed models to any OpenAI-compatible client:
+`GET /v1/models` and `POST /v1/chat/completions`, streamed or not, with tools.
+The tool schemas are rendered into the system prompt the Hermes way, the
+engine's grammar keeps every `<tool_call>` well-formed, and the call comes
+back as OpenAI `tool_calls`. One model is loaded at a time. A request naming
+another installed model swaps it. `/v1/models` carries each model's
+`context_length` from its config. `--host 0.0.0.0` opens it to the network.
+Memdoor connects it with `memdoor connect local --base http://localhost:8090/v1`,
+no key, on this machine or on a box reached over ssh.
 
 ### Decisions (a local Jev)
 
@@ -102,10 +144,42 @@ start the turn's effort, the tool routing, the judged reads and the stop
 verdict are decided here, with no key. The numbers above are illustrative;
 a 0.6B model answers the wire but judges poorly, an 8B is the sensible floor.
 
-## Backends and flavors
+## As a library
+
+```go
+import (
+	llm "github.com/guregodevo/janis"
+	"github.com/guregodevo/janis/hostfit"
+)
+
+models, _ := hostfit.ListInstalled()          // the snapshots in the Hugging Face cache
+e, err := llm.Open(models[0].Path)
+if err != nil {
+	return err
+}
+defer e.Close()
+reply := e.Chat([]llm.Message{{Role: "user", Content: "2+3?"}}, llm.Options{MaxTokens: 64})
+```
+
+`ChatStream` takes a callback per delta. `Options` carries temperature, top-p,
+a seed, a cancel hook and the tool-call grammar.
+
+| Package | What it is |
+|---|---|
+| `serve`, `cmd/janis` | the OpenAI endpoints over the engine (`janis serve`, `janis list`, `janis pull`) |
+| `janis` (the root package) | load a model, chat, stream, decide, swap the loaded model live |
+| `engine` | the tensor interface every backend implements |
+| `qwen`, `qwen35`, `gemma` | model families |
+| `whisper`, `bge`, `reranker` | speech to text, embeddings, reranking |
+| `grammar` | constrained decoding for tool calls |
+| `hostfit` | which model fits this host's RAM, and how well it will run |
+| `mlxc`, `ggml`, `cpu` | the backends |
+| `safetensors`, `gguf`, `tokenizer` | the loaders. `gguf` reads the container and the GGML quantization types and leaves the architecture to the caller. |
+
+## Backends
 
 The model code is written against one tensor interface (`engine.Backend`,
-about fifty ops); a backend is an implementation of it. Three exist:
+about fifty ops). A backend is an implementation of it.
 
 | Flavor | Backend | Where | How |
 |---|---|---|---|
@@ -113,52 +187,9 @@ about fifty ops); a backend is an implementation of it. Three exist:
 | janis-cuda | ggml, llama.cpp's tensor library: CUDA, Metal or CPU kernels | Linux with an NVIDIA GPU; also Metal and CPU on a Mac | `-tags ggml` (`JANIS_BACKEND=ggml` on a Mac; the default on Linux), `JANIS_GGML_DEVICE=gpu` |
 | janis-cpu | pure Go | anywhere | `CGO_ENABLED=0`, or `JANIS_BACKEND=cpu` |
 
-The ggml backend (package `ggml`, 2026-10-25) links ggml at llama.cpp's
-pinned tag (`scripts/fetch-ggml.sh`: the prebuilt libraries on a Mac; on
-Linux built with cmake, about a minute for the CPU, `--cuda` about 20 minutes
-once for the GPU present, `--static` for the one-file release). Ops are
-recorded and flushed as one graph per step, tensors stay on the device, and
-the engine's pin/sweep protocol frees each step's temporaries. MLX's 4-bit
-weights are repacked once: on a GPU into ggml's Q4_1 (the same affine
-formula); on the CPU into Q4_K in ggml's repack buffer, the tiled int8 matmul
-llama.cpp runs a Q4_K_M model with, read straight off the MLX codes (a
-sub-block of 32 holds sixteen values at most, so each code maps to its new one
-through a table; 2026-10-29). Every op matches the pure-Go backend to float
-precision; the quantized matmul within llama.cpp's own 8-bit-activation
-precision.
-
-Measured, Qwen3 4-bit, 160 to 512 tokens generated:
-
-| Machine | Model | MLX | ggml Metal | ggml CUDA | ggml CPU | pure Go |
-|---|---|---|---|---|---|---|
-| Mac M4 | 0.6B | 169 tok/s | 69 | | 66 (4 threads) | 17 |
-| Mac M4 | 8B | 18.8 | 13.0 | | 14 (4 threads, Q4_K; 5.6 on Q4_1); prefill 56 tok/s | |
-| GitHub runner `ubuntu-latest`, 4 vCPU (AMD EPYC 7763) | 8B | | | | 5.6, prefill 12 tok/s (Ollama on the same CPU: 4.45 and 12.6) | |
-| Google g2-standard-4, 1× L4 | 0.6B | | | 52 to 56 (about 100 steady) | 9.4 | |
-| Google g2-standard-4, 1× L4 | 8B | | | 10 to 12 (about 38 steady) | 1.1 | |
-| Google g2-standard-4, 1× L4 | Qwen3-Coder-30B-A3B (MoE, 128 experts, 8 active) | | | 11 steady, after a 2-minute load | | |
-| Google g2-standard-16, 1× L4 | Qwen3.8-27B (the Qwen3.5 hybrid: Gated DeltaNet + attention) | | | 5.3 decode; prefill 250 to 265 tok/s, a 9.8K-token prompt in 37 s at 21.9 GB peak | | |
-
-The two CUDA figures per row are the whole run, which includes the one-time
-Q4_1 repack of every weight on the host (about 19 s for the 8B on four
-vCPUs), and the steady rate the per-step compute timings give once that is
-done. llama.cpp runs the same 8B at 45 to 50 tok/s on an L4.
-
-MoE runs resident (`JANIS_MOE_RESIDENT=1`): every expert of a layer is
-stacked once on the device and the gather picks them by index
-(`ggml_mul_mat_id`), the shape of MoE on a GPU with room for the whole
-model; the 30B-A3B takes 18 GB of the L4. Its 11 tok/s is overhead, not
-kernels: the router's top-k runs on the host, one sync per layer per token
-(the GPU sits at 13%), and the 16 GB repack on load is what the two minutes
-are. Both are the next changes, with a cached repack. The Qwen3.5 hybrid's
-two ops are ggml's own (`ggml_gated_delta_net`, `ggml_ssm_conv`, one node
-each, a CUDA kernel for head sizes 16 to 128), so the 27B runs on CUDA since
-2026-10-26. A flush lays its batch out with ggml's graph allocator: results
-the model dropped share memory in the order they die (the pending list holds
-them weakly, a batch over 64 MB asks the collector first), results it still
-holds get their own; a 32-token prefill chunk of the 27B that held 2.2 GB of
-temporaries holds a few tens of MB, and the prefill chunk can be 64 on a
-24 GB card (`MLX_PREFILL_CHUNK`).
+[docs/backends.md](docs/backends.md) has how the ggml backend is built and
+how it repacks MLX's 4-bit weights, with the numbers on a Mac, a GitHub
+runner and an NVIDIA L4.
 
 ## Build
 
@@ -193,3 +224,7 @@ tokenizer also searches — the same place mlx-c comes from.
 `MEMDOOR_SHOW=local`. Memdoor imports janis as a module (its `make janis`
 runs `install-lib`); to edit both at once, a `go.work` in the Memdoor
 checkout points at `../janis`.
+
+## License
+
+[Apache 2.0](LICENSE).
