@@ -3,3 +3,4 @@ lib/**/*.a
 *.prof
 ggml/third_party/
 dist/
+/janis
