@@ -10,13 +10,40 @@
   </p>
 </div>
 
-Qwen3.5-9B, 4-bit, on an M4 Mac with 16 GB ([bench/mlx.md](bench/mlx.md)):
+## Why janis, next to Ollama and llama.cpp
 
-| | prefill, 600 tokens | prefill, 9,000 tokens | decode |
+Each row is one machine, one server at a time, 4-bit weights
+([bench/mlx.md](bench/mlx.md), [docs/backends.md](docs/backends.md)):
+
+| | janis | llama.cpp | Ollama |
 |---|---:|---:|---:|
-| janis | 208.8 tok/s | 202.5 tok/s | 19.9 tok/s |
-| llama.cpp b12100, Metal | 209.2 tok/s | 194.6 tok/s | 18.5 tok/s |
-| mlx-lm 0.32.2 | — | 225.6 tok/s | 22.0 tok/s |
+| Qwen3.5-9B, M4 Mac 16 GB: prefill 9,000 tokens | 202.5 tok/s (MLX) | 194.6 tok/s (Metal) | not measured |
+| Qwen3.5-9B, M4 Mac 16 GB: decode | 19.9 tok/s | 18.5 tok/s | not measured |
+| Qwen3-8B, GitHub runner, 4 vCPU: prefill / decode | 12 / 5.6 tok/s | not measured | 12.6 / 4.45 tok/s |
+| Qwen3-8B, NVIDIA L4: decode | 38 tok/s steady | 45 to 50 tok/s | not measured |
+
+What is different:
+
+- **MLX on a Mac.** The Apple-silicon build runs on MLX, Apple's array
+  framework, with the `mlx-community` weights as published. No GGUF
+  conversion. The same weights run on ggml and pure Go, repacked on load.
+- **A Go module.** `import "github.com/guregodevo/janis"` loads a model in
+  your process: no server beside your program, no Python.
+- **`janis pull` picks the model.** With no name it takes the largest model
+  this machine's RAM runs well and its disk can hold. A model that does not
+  fit is refused before the download.
+- **Typed decisions.** `POST /v1/systemone` answers yes/no, choice and score
+  questions with a probability read from one prefill, in tens of
+  milliseconds ([Decisions](#decisions-a-local-jev)). No decoding, nothing to
+  parse.
+- **Installs without root.** One file on Linux, into `~/.local/bin`, sha256
+  checked. `janis serve --detach` returns once the model has answered, so a
+  CI job can start it and use it on the next line.
+
+Use Ollama or llama.cpp instead for Windows, vision models, architectures
+janis does not load ([Models](#models)), several models loaded at once, or
+the fastest NVIDIA decode (llama.cpp's 45 to 50 tok/s against 38 on an
+L4).
 
 ## Install
 
