@@ -12,15 +12,21 @@
 
 ## Why janis, next to Ollama and llama.cpp
 
-Each row is one machine, one server at a time, 4-bit weights
-([bench/mlx.md](bench/mlx.md), [docs/backends.md](docs/backends.md)):
+Each row is one machine, one server at a time, 4-bit weights, versions and
+commands in [bench/mlx.md](bench/mlx.md) and [docs/backends.md](docs/backends.md):
 
 | | janis | llama.cpp | Ollama |
 |---|---:|---:|---:|
-| Qwen3.5-9B, M4 Mac 16 GB: prefill 9,000 tokens | 202.5 tok/s (MLX) | 194.6 tok/s (Metal) | not measured |
+| Qwen3-8B, M4 Mac 16 GB: prefill 600 tokens | 224.2 tok/s | 219.5 tok/s | 216.4 tok/s |
+| Qwen3-8B, M4 Mac 16 GB: prefill 9,000 tokens | 195.0 tok/s | 174.4 tok/s | 154.5 tok/s |
+| Qwen3-8B, M4 Mac 16 GB: decode | 22.8 tok/s | 19.9 tok/s | 20.3 tok/s |
 | Qwen3.5-9B, M4 Mac 16 GB: decode | 19.9 tok/s | 18.5 tok/s | not measured |
 | Qwen3-8B, GitHub runner, 4 vCPU: prefill / decode | 12 / 5.6 tok/s | not measured | 12.6 / 4.45 tok/s |
 | Qwen3-8B, NVIDIA L4: decode | 38 tok/s steady | 45 to 50 tok/s | not measured |
+
+On the Mac, janis runs `mlx-community`'s 4-bit weights (4.3 GB for the 8B)
+and llama.cpp and Ollama the Q4_K_M GGUF (5.2 GB). Decode reads every weight
+once per token, so part of the decode lead is the smaller file.
 
 What is different:
 
