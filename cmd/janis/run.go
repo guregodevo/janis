@@ -6,12 +6,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -112,8 +114,10 @@ type serveFlags struct {
 	host, model, log *string
 }
 
-func newServeFlags(name string) serveFlags {
-	fs := flag.NewFlagSet(name, flag.ExitOnError)
+func newServeFlags(name string) serveFlags { return newServeFlagSet(name, flag.ExitOnError) }
+
+func newServeFlagSet(name string, handling flag.ErrorHandling) serveFlags {
+	fs := flag.NewFlagSet(name, handling)
 	return serveFlags{
 		fs:    fs,
 		port:  fs.Int("port", defaultPort, "the port to listen on"),
@@ -193,11 +197,52 @@ func shutdown(hs *http.Server, srv *serve.Server, cancelInFlight context.CancelF
 	}
 }
 
+// serveProcess finds a `janis serve` on port by its command line, for a
+// server with no state file: one started by janis v0.1.15 or older, before
+// the file. Its host and model are read from its flags. ps, not lsof: Cloud
+// Shell and slim Linux images have no lsof.
+func serveProcess(port int) (runState, bool) {
+	out, err := exec.Command("ps", "-e", "-o", "pid=", "-o", "args=").Output()
+	if err != nil {
+		return runState{}, false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 || filepath.Base(f[1]) != "janis" || f[2] != "serve" {
+			continue
+		}
+		pid, err := strconv.Atoi(f[0])
+		if err != nil || pid == os.Getpid() {
+			continue
+		}
+		st, ok := parseServeArgs(f[3:])
+		if !ok || st.Port != port {
+			continue
+		}
+		st.PID = pid
+		return st, true
+	}
+	return runState{}, false
+}
+
+// parseServeArgs reads a `janis serve` command line's flags. ok is false for
+// `serve --detach`, which returns once its server answers, and for flags it
+// cannot read.
+func parseServeArgs(args []string) (runState, bool) {
+	f := newServeFlagSet("serve", flag.ContinueOnError)
+	f.fs.SetOutput(io.Discard)
+	detach := f.fs.Bool("detach", false, "")
+	if f.fs.Parse(args) != nil || *detach {
+		return runState{}, false
+	}
+	return runState{Host: *f.host, Port: *f.port, Model: f.modelName(), Log: *f.log}, true
+}
+
 // startCmd is `janis start`: `janis serve --detach`.
 func startCmd(args []string) {
 	f := newServeFlags("start")
 	_ = f.fs.Parse(args)
-	if st, err := readState(*f.port); err == nil && running(st.PID) {
+	if st, err := liveState(*f.port); err == nil {
 		fail(fmt.Errorf("janis is serving on port %d already (pid %d): janis restart replaces it", *f.port, st.PID))
 	}
 	detachServe(*f.host, *f.port, f.modelName(), *f.log)
@@ -221,11 +266,15 @@ func stopCmd(args []string) {
 	stopServer(st)
 }
 
-// liveState is port's state when its server runs; an error in words
+// liveState is port's state when its server runs: its state file, else a
+// `janis serve` found on the port (serveProcess). An error in words
 // otherwise. A state file left by a server that died is removed.
 func liveState(port int) (runState, error) {
 	st, err := readState(port)
 	if errors.Is(err, os.ErrNotExist) {
+		if old, ok := serveProcess(port); ok {
+			return old, nil
+		}
 		return st, notStarted(port)
 	}
 	if err != nil {
@@ -233,20 +282,22 @@ func liveState(port int) (runState, error) {
 	}
 	if !running(st.PID) {
 		_ = os.Remove(statePath(port))
+		if old, ok := serveProcess(port); ok {
+			return old, nil
+		}
 		return st, fmt.Errorf("janis on port %d (pid %d) had stopped already, without janis stop", port, st.PID)
 	}
 	return st, nil
 }
 
-// notStarted says no state file names a server on port, and whether
-// something else listens there.
+// notStarted says no janis serves port, and whether another program does.
 func notStarted(port int) error {
 	c, err := net.DialTimeout("tcp", net.JoinHostPort(defaultHost, fmt.Sprint(port)), time.Second)
 	if err != nil {
 		return fmt.Errorf("no janis server on port %d", port)
 	}
 	c.Close()
-	return fmt.Errorf("port %d is served, but not by a janis this version started (an older janis, or another program): lsof -tiTCP:%d -sTCP:LISTEN names the pid", port, port)
+	return fmt.Errorf("port %d is served by a program that is not janis", port)
 }
 
 func stopServer(st runState) {
@@ -270,14 +321,19 @@ func stopServer(st runState) {
 	fmt.Printf("✓ janis on port %d stopped (pid %d)\n", st.Port, st.PID)
 }
 
-// restartCmd is `janis restart`: stop, then start on the saved flags; a
-// flag on the command line replaces the saved one.
+// restartCmd is `janis restart`: stop, then start on the saved flags, or
+// on those of a `janis serve` found on the port with no state file (an older
+// janis); a flag on the command line replaces them.
 func restartCmd(args []string) {
 	f := newServeFlags("restart")
 	_ = f.fs.Parse(args)
 	st, err := readState(*f.port)
 	if errors.Is(err, os.ErrNotExist) {
-		fail(fmt.Errorf("%w: janis start starts one", notStarted(*f.port)))
+		old, ok := serveProcess(*f.port)
+		if !ok {
+			fail(fmt.Errorf("%w: janis start starts one", notStarted(*f.port)))
+		}
+		st, err = old, nil
 	}
 	if err != nil {
 		fail(err)
@@ -321,7 +377,11 @@ func statusCmd(args []string) {
 		model = "the first a request names"
 	}
 	base := "http://" + net.JoinHostPort(dialHost(st.Host), fmt.Sprint(port))
-	fmt.Printf("janis on %s/v1\n  pid     %d\n  model   %s\n  up      %s\n", base, st.PID, model, uptime(time.Since(st.Started)))
+	up := "unknown: started without a state file (janis v0.1.15 or older)"
+	if !st.Started.IsZero() {
+		up = uptime(time.Since(st.Started))
+	}
+	fmt.Printf("janis on %s/v1\n  pid     %d\n  model   %s\n  up      %s\n", base, st.PID, model, up)
 	if st.Log != "" {
 		fmt.Printf("  log     %s\n", st.Log)
 	}
