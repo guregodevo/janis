@@ -2,13 +2,18 @@ package serve
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	llm "github.com/guregodevo/janis"
 )
@@ -20,11 +25,25 @@ type fakeEngine struct {
 	opts      llm.Options
 	state     string
 	questions []llm.Question
+	decides   atomic.Int32
+	// generating, when set, makes ChatStream a long generation: it sends a
+	// first delta, closes generating and runs until opts.Cancel says stop.
+	generating chan struct{}
 }
 
 func (f *fakeEngine) ModelType() string { return "qwen3" }
 func (f *fakeEngine) ChatStream(msgs []llm.Message, opts llm.Options, onDelta func(string)) string {
 	f.got, f.opts = msgs, opts
+	if f.generating != nil {
+		if onDelta != nil {
+			onDelta("Half")
+		}
+		close(f.generating)
+		for !opts.Cancel() {
+			time.Sleep(5 * time.Millisecond)
+		}
+		return "Half"
+	}
 	if onDelta != nil {
 		for i := 0; i < len(f.reply); i += 3 { // three bytes at a time, like tokens
 			end := min(i+3, len(f.reply))
@@ -35,9 +54,10 @@ func (f *fakeEngine) ChatStream(msgs []llm.Message, opts llm.Options, onDelta fu
 }
 func (f *fakeEngine) NumTokens(text string) int { return len(strings.Fields(text)) }
 
-// Decide answers every question with a fixed distribution: the first option
+// DecideContext answers every question with a fixed distribution: the first option
 // at 0.8, the rest sharing 0.2; the state and questions are kept.
-func (f *fakeEngine) Decide(state string, qs []llm.Question) ([]llm.Decision, error) {
+func (f *fakeEngine) DecideContext(_ context.Context, state string, qs []llm.Question) ([]llm.Decision, error) {
+	f.decides.Add(1)
 	f.state, f.questions = state, qs
 	out := make([]llm.Decision, len(qs))
 	for i, q := range qs {
@@ -328,5 +348,164 @@ func TestTheLoadedModelIsListedFirst(t *testing.T) {
 	_ = json.NewDecoder(resp.Body).Decode(&v)
 	if len(v.Data) != 3 || v.Data[0].ID != "Z-last-1B" {
 		t.Fatalf("loaded first: %+v", v.Data)
+	}
+}
+
+// busyServer is a test server whose engine thread is held until release is
+// called: a long request in flight.
+// answered receives once each time a handler returns.
+func busyServer(t *testing.T, eng *fakeEngine) (url string, release func(), answered <-chan struct{}) {
+	t.Helper()
+	s := NewWithLoader(func(dir string) (Generator, error) { return eng, nil })
+	s.logf = t.Logf
+	done := make(chan struct{}, 16)
+	h := s.Handler()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { done <- struct{}{} }()
+		h.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	held, free := make(chan struct{}), make(chan struct{})
+	go s.onEngine(func() { close(held); <-free })
+	<-held
+	var once atomic.Bool
+	release = func() {
+		if once.CompareAndSwap(false, true) {
+			close(free)
+		}
+	}
+	t.Cleanup(release)
+	return srv.URL, release, done
+}
+
+const oneDecision = `{"state":"x","questions":{"q":{"type":"noul","instructions":"Is it?"}}}`
+
+// janis#19: a client that leaves while its request waits for the engine
+// costs no prefill. The request leaves the queue; the next one is answered.
+func TestADecisionWhoseClientLeftWhileQueuedIsNeverComputed(t *testing.T) {
+	installFake(t, "Qwen3-8B-4bit", 40960)
+	eng := &fakeEngine{}
+	url, release, answered := busyServer(t, eng)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url+"/v1/systemone", strings.NewReader(oneDecision))
+	if resp, err := http.DefaultClient.Do(req); err == nil {
+		resp.Body.Close()
+		t.Fatal("the request answered while the engine was held")
+	}
+	select {
+	case <-answered: // the server saw the connection close and left the queue
+	case <-time.After(5 * time.Second):
+		t.Fatal("the abandoned request stayed in the queue")
+	}
+	release()
+
+	resp, v := post(t, url+"/v1/systemone", oneDecision)
+	if resp.StatusCode != 200 {
+		t.Fatalf("the next request: %d %v", resp.StatusCode, v)
+	}
+	if n := eng.decides.Load(); n != 1 {
+		t.Fatalf("decisions computed: %d, want 1 (the abandoned one never runs)", n)
+	}
+}
+
+// janis#19: GET /v1/models answers while a long request holds the engine.
+func TestModelsAnswerWhileTheEngineIsBusy(t *testing.T) {
+	installFake(t, "Qwen3-8B-4bit", 40960)
+	url, _, _ := busyServer(t, &fakeEngine{})
+	c := &http.Client{Timeout: 2 * time.Second}
+	resp, err := c.Get(url + "/v1/models")
+	if err != nil {
+		t.Fatalf("/v1/models waited behind the engine: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+}
+
+// A request the stopping server cancels while it waits for the engine is
+// answered 503 in words, not an empty 200.
+func TestARequestCancelledByShutdownIsAnswered503(t *testing.T) {
+	installFake(t, "Qwen3-8B-4bit", 40960)
+	eng := &fakeEngine{}
+	s := NewWithLoader(func(dir string) (Generator, error) { return eng, nil })
+	s.logf = t.Logf
+	base, cancel := context.WithCancel(context.Background())
+	srv := httptest.NewUnstartedServer(s.Handler())
+	srv.Config.BaseContext = func(net.Listener) context.Context { return base }
+	srv.Start()
+	t.Cleanup(srv.Close)
+	held, free := make(chan struct{}), make(chan struct{})
+	go s.onEngine(func() { close(held); <-free })
+	<-held
+	defer close(free)
+
+	go func() { time.Sleep(100 * time.Millisecond); cancel() }()
+	resp, v := post(t, srv.URL+"/v1/systemone", oneDecision)
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(fmt.Sprint(v), "janis is stopping") {
+		t.Fatalf("%d %v", resp.StatusCode, v)
+	}
+	if eng.decides.Load() != 0 {
+		t.Fatal("computed after it was cancelled")
+	}
+}
+
+// stoppingServer is a test server whose request contexts stop is cancels,
+// as the stopping janis does.
+func stoppingServer(t *testing.T, eng *fakeEngine) (url string, stop func()) {
+	t.Helper()
+	s := NewWithLoader(func(dir string) (Generator, error) { return eng, nil })
+	s.logf = t.Logf
+	base, cancel := context.WithCancel(context.Background())
+	srv := httptest.NewUnstartedServer(s.Handler())
+	srv.Config.BaseContext = func(net.Listener) context.Context { return base }
+	srv.Start()
+	t.Cleanup(srv.Close)
+	t.Cleanup(cancel)
+	return srv.URL, cancel
+}
+
+// A generation the stopping server cuts short is answered 503, not 200 with
+// the half it had and finish_reason "stop".
+func TestAChatCutShortByShutdownIsAnswered503(t *testing.T) {
+	installFake(t, "Qwen3-8B-4bit", 40960)
+	eng := &fakeEngine{generating: make(chan struct{})}
+	url, stop := stoppingServer(t, eng)
+	go func() { <-eng.generating; stop() }()
+	resp, v := post(t, url+"/v1/chat/completions", `{"model":"Qwen3-8B-4bit","messages":[{"role":"user","content":"hi"}]}`)
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(fmt.Sprint(v), "janis is stopping") {
+		t.Fatalf("%d %v", resp.StatusCode, v)
+	}
+}
+
+// Streamed, it ends with an error event: no finish chunk and no [DONE], so a
+// client cannot take the half for the whole answer.
+func TestAStreamCutShortByShutdownEndsWithAnError(t *testing.T) {
+	installFake(t, "Qwen3-8B-4bit", 40960)
+	eng := &fakeEngine{generating: make(chan struct{})}
+	url, stop := stoppingServer(t, eng)
+	go func() { <-eng.generating; stop() }()
+	resp, _ := post(t, url+"/v1/chat/completions", `{"model":"Qwen3-8B-4bit","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	defer resp.Body.Close()
+	var events []string
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		if d, ok := strings.CutPrefix(sc.Text(), "data: "); ok {
+			events = append(events, d)
+		}
+	}
+	if len(events) == 0 {
+		t.Fatal("no events")
+	}
+	last := events[len(events)-1]
+	if !strings.Contains(last, `"error"`) || !strings.Contains(last, "janis is stopping") {
+		t.Fatalf("last event: %s", last)
+	}
+	for _, e := range events {
+		if e == "[DONE]" || strings.Contains(e, `"finish_reason":"stop"`) {
+			t.Fatalf("a cut-short stream said it finished: %v", events)
+		}
 	}
 }

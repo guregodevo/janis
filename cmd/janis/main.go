@@ -4,6 +4,10 @@
 //	janis pull [NAME]                download a model (none: the one that fits this machine)
 //	janis list                       the installed models
 //	janis serve [--port N] [--model NAME] [--host ADDR] [--detach]
+//	janis start [--port N] [--model NAME] [--host ADDR] [--log FILE]   serve --detach
+//	janis stop [--port N]            stop it gracefully (SIGKILL after 10 s)
+//	janis restart [--port N] [flags] stop, then start on the same flags, or the ones given
+//	janis status [--port N]          pid, model, uptime, and whether /health answers
 //
 // serve answers GET /v1/models and POST /v1/chat/completions (streamed or
 // not, with tools) on 127.0.0.1:8090 by default. A client on another
@@ -12,15 +16,10 @@
 package main
 
 import (
-	"flag"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
-	"strings"
 
 	"github.com/guregodevo/janis/hostfit"
-	"github.com/guregodevo/janis/serve"
 )
 
 func main() {
@@ -37,6 +36,14 @@ func main() {
 		}
 	case "serve":
 		run(os.Args[2:])
+	case "start":
+		startCmd(os.Args[2:])
+	case "stop":
+		stopCmd(os.Args[2:])
+	case "restart":
+		restartCmd(os.Args[2:])
+	case "status":
+		statusCmd(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -44,7 +51,13 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: janis pull [NAME] | janis list | janis serve [--port 8090] [--host 127.0.0.1] [--model NAME] [--detach]")
+	fmt.Fprintln(os.Stderr, `usage: janis pull [NAME]
+       janis list
+       janis serve   [--port 8090] [--host 127.0.0.1] [--model NAME] [--detach] [--log FILE]
+       janis start   [--port 8090] [--host 127.0.0.1] [--model NAME] [--log FILE]
+       janis stop    [--port 8090]
+       janis restart [--port 8090] [--host ADDR] [--model NAME] [--log FILE]
+       janis status  [--port 8090]`)
 }
 
 func list() {
@@ -64,27 +77,12 @@ func list() {
 }
 
 func run(args []string) {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	port := fs.Int("port", 8090, "the port to listen on")
-	host := fs.String("host", "127.0.0.1", "the address to bind (0.0.0.0 for the network)")
-	model := fs.String("model", "", "the installed model to load now (default: the first a request names; with --detach, the model that fits this machine)")
-	detach := fs.Bool("detach", false, "pull the model if missing, serve in the background, and return once it has answered")
-	logPath := fs.String("log", "", "with --detach, the server's output (default: janis-PORT.log in the temp directory)")
-	_ = fs.Parse(args)
+	f := newServeFlags("serve")
+	detach := f.fs.Bool("detach", false, "pull the model if missing, serve in the background, and return once it has answered (janis start)")
+	_ = f.fs.Parse(args)
 	if *detach {
-		detachServe(*host, *port, strings.TrimPrefix(*model, "mlx-community/"), *logPath)
+		detachServe(*f.host, *f.port, f.modelName(), *f.log)
 		return
 	}
-	srv, err := serve.New(*model)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	defer srv.Close()
-	addr := net.JoinHostPort(*host, fmt.Sprint(*port))
-	fmt.Printf("janis serving on http://%s/v1 — GET /v1/models, POST /v1/chat/completions\n", addr)
-	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
+	serveForeground(f)
 }

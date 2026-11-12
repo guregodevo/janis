@@ -67,13 +67,33 @@ curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model": "Qwen3-8B-4bit", "messages": [{"role": "user", "content": "2+3?"}]}'
 ```
 
-`janis serve --detach` is for a CI job or a script: the model is pulled when
-missing, the server runs in the background (its output in `janis-8090.log` in
-the temp directory, or `--log`), and the command returns once the model has
-answered a first request, so the first client does not pay for loading it. A
-taken port or a server that dies fails the command. `JANIS_VERSION=v0.1.2`
-pins a release. `make dist` builds the release asset for the machine it runs
-on ([Build](#build)).
+`janis start` (or `janis serve --detach`) is for a CI job or a script: the
+model is pulled when missing, the server runs in the background (its output
+appended to `janis-8090.log` in the temp directory, or `--log`), and the
+command returns once the model has answered a first request, so the first
+client does not pay for loading it. A taken port or a server that dies fails
+the command. `JANIS_VERSION=v0.1.2` pins a release. `make dist` builds the
+release asset for the machine it runs on ([Build](#build)).
+
+```bash
+janis start [--port 8090] [--host 127.0.0.1] [--model NAME] [--log FILE]
+janis status [--port 8090]    # pid, model, uptime, GET /health within 2 s; exit 1 if it does not answer
+janis stop [--port 8090]      # graceful; SIGKILL after 10 s
+janis restart [--port 8090]   # stop, then start on the same flags; --model X replaces the saved one
+```
+
+Every server, foreground or background, writes its pid and flags to
+`~/.janis/run/PORT.json` and removes it when it stops. `stop` and `restart`
+act on the server that file names. A port served by an older janis has no
+file: `stop` says so and exits 1. `restart` starts the server in the background,
+one first run with `janis serve` included.
+
+A server stops gracefully on `janis stop`, SIGTERM, Ctrl-C or its terminal
+closing. It takes no new connection, and requests in flight get 5 s to
+finish. Those still running are then cancelled: a generation ends at its
+next token, a decision before its next question, a request waiting for the
+engine leaves the queue. Each is answered 503; a stream cut short ends with
+an error event and no `[DONE]`. The model is unloaded last.
 
 ## Models
 
@@ -144,6 +164,12 @@ start the turn's effort, the tool routing, the judged reads and the stop
 verdict are decided here, with no key. The numbers above are illustrative;
 a 0.6B model answers the wire but judges poorly, an 8B is the sensible floor.
 
+Requests run one at a time on the engine. A request whose client has gone
+costs no more compute: it leaves the queue if it is waiting, or stops before
+its next question. `GET /v1/models` and `GET /health` answer while a request
+runs. `engine.DecideContext(ctx, state, questions)` is the Go call that stops
+with `ctx`.
+
 ## As a library
 
 ```go
@@ -166,7 +192,7 @@ a seed, a cancel hook and the tool-call grammar.
 
 | Package | What it is |
 |---|---|
-| `serve`, `cmd/janis` | the OpenAI endpoints over the engine (`janis serve`, `janis list`, `janis pull`) |
+| `serve`, `cmd/janis` | the OpenAI endpoints over the engine (`janis serve`, `start`, `stop`, `restart`, `status`, `list`, `pull`) |
 | `janis` (the root package) | load a model, chat, stream, decide, swap the loaded model live |
 | `engine` | the tensor interface every backend implements |
 | `qwen`, `qwen35`, `gemma` | model families |

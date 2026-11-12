@@ -1,6 +1,8 @@
 package llm
 
 import (
+	"context"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -31,6 +33,31 @@ func TestQuestionConstructorsFailFast(t *testing.T) {
 	if got := q.Values; got[0] != 1 || got[2] != 3 {
 		t.Fatalf("default values = %v, want 1..3", got)
 	}
+}
+
+// janis#19: a done context returns before the compute lock and before any
+// prefill. The zero engine has no tokenizer: reaching it would panic.
+func TestADoneContextDecidesNothing(t *testing.T) {
+	q, _ := NewYesNo("Is it?")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := (&Engine{}).DecideContext(ctx, "x", []Question{q}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// cancelAfter is a context done from its nth Err() check on.
+type cancelAfter struct {
+	context.Context
+	n, seen int
+}
+
+func (c *cancelAfter) Err() error {
+	c.seen++
+	if c.seen >= c.n {
+		return context.Canceled
+	}
+	return nil
 }
 
 func TestRenderQuestionLabelsOptions(t *testing.T) {
@@ -112,6 +139,12 @@ func TestDecideLive(t *testing.T) {
 	topic, _ := NewChoice("What is the ticket about?", []string{"Billing", "Shipping", "Account access", "Product question"})
 	escalate, _ := NewYesNo("Is the customer threatening to escalate?")
 	urgency, _ := NewScore("How urgent is this ticket?", []string{"not urgent", "somewhat urgent", "very urgent"}, nil)
+
+	// janis#19: a client gone after the first question stops the rest
+	// (checks: before the lock, before question 1, before question 2).
+	if _, err := eng.DecideContext(&cancelAfter{Context: context.Background(), n: 3}, ticket, []Question{topic, escalate, urgency}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled after one question: %v", err)
+	}
 
 	ds, err := eng.Decide(ticket, []Question{topic, escalate, urgency})
 	if err != nil {

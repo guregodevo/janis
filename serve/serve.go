@@ -38,7 +38,7 @@ import (
 type Generator interface {
 	ModelType() string
 	ChatStream(msgs []llm.Message, opts llm.Options, onDelta func(string)) string
-	Decide(state string, qs []llm.Question) ([]llm.Decision, error)
+	DecideContext(ctx context.Context, state string, qs []llm.Question) ([]llm.Decision, error)
 	NumTokens(text string) int
 	Close()
 }
@@ -58,6 +58,11 @@ type Server struct {
 	current Generator
 	name    string // the installed model's name the engine was opened from
 	logf    func(string, ...any)
+
+	// loaded is name for the handlers off the engine thread: GET /v1/models
+	// answers while a long request holds the engine (janis#19).
+	loadedMu sync.Mutex
+	loaded   string
 }
 
 // New makes a server with the default loader. Name preloads that installed
@@ -95,13 +100,37 @@ func (s *Server) engineThread() {
 }
 
 // onEngine runs f on the engine thread and returns when it has.
-func (s *Server) onEngine(f func()) {
+func (s *Server) onEngine(f func()) { _ = s.onEngineCtx(context.Background(), f) }
+
+// onEngineCtx is onEngine for a request: while f waits for the engine
+// thread, a done ctx (the client gone, the server stopping) takes it out of
+// the queue with ctx.Err(), and f never runs (janis#19). Once f runs, it
+// runs to its end; f reads ctx to stop early.
+func (s *Server) onEngineCtx(ctx context.Context, f func()) error {
 	done := make(chan struct{})
-	s.work <- func() {
+	job := func() {
 		defer close(done)
 		f()
 	}
+	select {
+	case s.work <- job:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	<-done
+	return nil
+}
+
+func (s *Server) setLoaded(name string) {
+	s.loadedMu.Lock()
+	s.loaded = name
+	s.loadedMu.Unlock()
+}
+
+func (s *Server) loadedName() string {
+	s.loadedMu.Lock()
+	defer s.loadedMu.Unlock()
+	return s.loaded
 }
 
 // Handler routes the endpoints.
@@ -122,6 +151,7 @@ func (s *Server) Close() {
 		if s.current != nil {
 			s.current.Close()
 			s.current, s.name = nil, ""
+			s.setLoaded("")
 		}
 	})
 }
@@ -148,8 +178,7 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	}
 	// The loaded model first: a client that takes the first listed (a probe,
 	// a default) gets the one that answers now, not a swap to another.
-	var loaded string
-	s.onEngine(func() { loaded = s.name })
+	loaded := s.loadedName()
 	for i, c := range cards {
 		if c.ID == loaded && i > 0 {
 			cards = append([]modelCard{c}, append(cards[:i:i], cards[i+1:]...)...)
@@ -217,6 +246,7 @@ func (s *Server) ensure(name string) error {
 		s.current.Close()
 	}
 	s.current, s.name = eng, pick.Name
+	s.setLoaded(pick.Name)
 	s.logf("loaded %s (%s)", pick.Name, eng.ModelType())
 	return nil
 }
@@ -290,7 +320,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "messages is empty")
 		return
 	}
-	s.onEngine(func() {
+	err := s.onEngineCtx(r.Context(), func() {
 		if err := s.ensure(req.Model); err != nil {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
@@ -330,6 +360,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		created := time.Now().Unix()
 		if !req.Stream {
 			reply := s.current.ChatStream(msgs, opts, nil)
+			if ctx.Err() != nil {
+				writeCancelled(w)
+				return
+			}
 			text, calls := parseCalls(reply)
 			finish := "stop"
 			if len(calls) > 0 {
@@ -350,6 +384,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		s.streamChat(w, ctx, req, msgs, opts, id, created, inTokens)
 	})
+	if err != nil {
+		writeCancelled(w)
+	}
 }
 
 // streamChat writes server-sent events: the role, text deltas as they come
@@ -428,6 +465,12 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req chat
 	}
 	reply := s.current.ChatStream(msgs, opts, onDelta)
 	close(quiet)
+	// A generation the stopping server cut short is not finished: no finish
+	// chunk and no [DONE], an error event a client raises instead.
+	if ctx.Err() != nil {
+		send(map[string]any{"error": cancelledError()})
+		return
+	}
 	_, calls := parseCalls(reply)
 	finish := "stop"
 	switch {
@@ -646,7 +689,10 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 		}
 		qs = append(qs, q)
 	}
-	s.onEngine(func() {
+	// A request cancelled while it waits for the engine or between questions
+	// (the client gone, the server stopping) computes nothing more (janis#19).
+	ctx := r.Context()
+	err := s.onEngineCtx(ctx, func() {
 		// A decision client names its own model (jev-latest): the loaded model
 		// answers unless the name is one installed here.
 		model := req.Model
@@ -657,7 +703,11 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		ds, err := s.current.Decide(req.State, qs)
+		ds, err := s.current.DecideContext(ctx, req.State, qs)
+		if ctx.Err() != nil {
+			writeCancelled(w)
+			return
+		}
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -668,6 +718,9 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"model": s.name, "answers": answers})
 	})
+	if err != nil {
+		writeCancelled(w)
+	}
 }
 
 func installed(name string) bool {
@@ -765,6 +818,21 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// writeCancelled answers a request cancelled before it was answered. A
+// client that has gone never reads it; one the stopping server cancelled
+// does, instead of an empty 200.
+func writeCancelled(w http.ResponseWriter) {
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": cancelledError()})
+}
+
+func cancelledError() map[string]any {
+	return errorBody(http.StatusServiceUnavailable, "cancelled: janis is stopping or the client left")
+}
+
 func writeError(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]any{"error": map[string]any{"message": msg, "type": "invalid_request_error", "code": code}})
+	writeJSON(w, code, map[string]any{"error": errorBody(code, msg)})
+}
+
+func errorBody(code int, msg string) map[string]any {
+	return map[string]any{"message": msg, "type": "invalid_request_error", "code": code}
 }
