@@ -34,10 +34,21 @@ else base=$repo/releases/download/$version; fi
 if command -v sha256sum >/dev/null 2>&1; then sha256() { sha256sum "$1"; }
 else sha256() { shasum -a 256 "$1"; }; fi
 
+# fetch FILE URL, up to 5 tries 3 s apart: a GitHub download can break
+# mid-stream (curl 92, HTTP/2 PROTOCOL_ERROR). A loop, not --retry-all-errors,
+# which curl before 7.71 does not know.
+fetch() {
+  n=1
+  until curl -fsSL -o "$1" "$2"; do
+    [ "$n" -ge 5 ] && { echo "janis: $2 failed 5 times" >&2; return 1; }
+    n=$((n + 1)); sleep 3
+  done
+}
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-curl -fsSL -o "$tmp/$asset" "$base/$asset"
-curl -fsSL -o "$tmp/$asset.sha256" "$base/$asset.sha256"
+fetch "$tmp/$asset" "$base/$asset"
+fetch "$tmp/$asset.sha256" "$base/$asset.sha256"
 want=$(cut -d' ' -f1 < "$tmp/$asset.sha256")
 got=$(sha256 "$tmp/$asset" | cut -d' ' -f1)
 [ "$want" = "$got" ] || { echo "sha256 mismatch for $asset: want $want, got $got" >&2; exit 1; }
