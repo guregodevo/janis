@@ -79,7 +79,7 @@ release asset for the machine it runs on ([Build](#build)).
 janis start [--port 8090] [--host 127.0.0.1] [--model NAME] [--log FILE]
 janis status [--port 8090]    # pid, model, uptime, GET /health within 2 s; exit 1 if it does not answer
 janis stop [--port 8090]      # graceful; SIGKILL after 10 s
-janis restart [--port 8090]   # stop, then start on the same flags; --model X replaces the saved one
+janis restart [--port 8090]   # stop, then start on the same flags; --model X replaces the saved one; none running: start
 ```
 
 Every server, foreground or background, writes its pid and flags to
@@ -88,7 +88,8 @@ act on the server that file names. A server started by janis v0.1.15 or
 older has no file: `stop`, `restart` and `status` find its `janis serve` on
 the port with `ps` and read its flags, so `janis restart` replaces it on the
 same model. `restart` starts the server in the background, one first run
-with `janis serve` included.
+with `janis serve` included. With no janis on the port, `restart` starts one
+as `janis start` does.
 
 A server stops gracefully on `janis stop`, SIGTERM, Ctrl-C or its terminal
 closing. It takes no new connection, and requests in flight get 5 s to

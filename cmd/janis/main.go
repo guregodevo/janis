@@ -6,7 +6,7 @@
 //	janis serve [--port N] [--model NAME] [--host ADDR] [--detach]
 //	janis start [--port N] [--model NAME] [--host ADDR] [--log FILE]   serve --detach
 //	janis stop [--port N]            stop it gracefully (SIGKILL after 10 s)
-//	janis restart [--port N] [flags] stop, then start on the same flags, or the ones given
+//	janis restart [--port N] [flags] stop, then start on the same flags, or the ones given; none running: start
 //	janis status [--port N]          pid, model, uptime, and whether /health answers
 //
 // serve answers GET /v1/models and POST /v1/chat/completions (streamed or
