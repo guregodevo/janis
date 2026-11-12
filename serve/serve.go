@@ -53,6 +53,10 @@ var traceTokens = os.Getenv("JANIS_TRACE_TOKENS") == "1"
 
 // Server serves one engine at a time behind the OpenAI endpoints.
 type Server struct {
+	// Version is the build's release tag, answered by GET /health ("" says
+	// nothing).
+	Version string
+
 	load    Loader
 	work    chan func() // every call into the engine, one at a time, on one OS thread
 	current Generator
@@ -138,7 +142,11 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		health := map[string]string{"status": "ok"}
+		if s.Version != "" {
+			health["version"] = s.Version
+		}
+		writeJSON(w, http.StatusOK, health)
 	})
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
 	mux.HandleFunc("POST /v1/systemone", s.handleDecide)

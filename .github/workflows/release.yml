@@ -29,7 +29,8 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install mlx mlx-c
       - name: make dist
-        run: make dist
+        # A tag stamps itself as the version (janis version, GET /health).
+        run: make dist ${{ startsWith(github.ref, 'refs/tags/v') && format('VERSION={0}', github.ref_name) || '' }}
       - name: make dist-check (Qwen3-0.6B-4bit, one answer)
         run: make dist-check
       - uses: actions/upload-artifact@v4

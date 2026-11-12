@@ -77,7 +77,8 @@ release asset for the machine it runs on ([Build](#build)).
 
 ```bash
 janis start [--port 8090] [--host 127.0.0.1] [--model NAME] [--log FILE]
-janis status [--port 8090]    # pid, model, uptime, GET /health within 2 s; exit 1 if it does not answer
+janis status [--port 8090]    # pid, version, model, uptime, GET /health within 2 s; exit 1 if it does not answer
+janis version                 # the release this binary is
 janis stop [--port 8090]      # graceful; SIGKILL after 10 s
 janis restart [--port 8090]   # stop, then start on the same flags; --model X replaces the saved one; none running: start
 ```
@@ -171,7 +172,8 @@ Requests run one at a time on the engine. A request whose client has gone
 costs no more compute: it leaves the queue if it is waiting, or stops before
 its next question. `GET /v1/models` and `GET /health` answer while a request
 runs. `engine.DecideContext(ctx, state, questions)` is the Go call that stops
-with `ctx`.
+with `ctx`. `GET /health` names the server's release, `{"status":"ok","version":"v0.1.20"}`;
+a server from v0.1.19 or older answers without it.
 
 ## As a library
 

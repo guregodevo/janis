@@ -7,7 +7,8 @@
 //	janis start [--port N] [--model NAME] [--host ADDR] [--log FILE]   serve --detach
 //	janis stop [--port N]            stop it gracefully (SIGKILL after 10 s)
 //	janis restart [--port N] [flags] stop, then start on the same flags, or the ones given; none running: start
-//	janis status [--port N]          pid, model, uptime, and whether /health answers
+//	janis status [--port N]          pid, version, model, uptime, and whether /health answers
+//	janis version                    the release this binary is
 //
 // serve answers GET /v1/models and POST /v1/chat/completions (streamed or
 // not, with tools) on 127.0.0.1:8090 by default. A client on another
@@ -44,6 +45,8 @@ func main() {
 		restartCmd(os.Args[2:])
 	case "status":
 		statusCmd(os.Args[2:])
+	case "version", "--version", "-v":
+		fmt.Println("janis " + version)
 	default:
 		usage()
 		os.Exit(2)
@@ -57,7 +60,8 @@ func usage() {
        janis start   [--port 8090] [--host 127.0.0.1] [--model NAME] [--log FILE]
        janis stop    [--port 8090]
        janis restart [--port 8090] [--host ADDR] [--model NAME] [--log FILE]
-       janis status  [--port 8090]`)
+       janis status  [--port 8090]
+       janis version`)
 }
 
 func list() {
