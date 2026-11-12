@@ -210,8 +210,23 @@ func hfAuth(req *http.Request) {
 	req.Header.Set("User-Agent", "janis")
 }
 
+// progressOut is where download draws its line; a test reads it.
+var progressOut io.Writer = os.Stdout
+
+// progress redraws a file's line: its share of size, or the bytes so far
+// when the size is unknown.
+func progress(name string, done, size int64) {
+	if size > 0 {
+		fmt.Fprintf(progressOut, "\r  %-48s %5.1f%% of %s", name, 100*float64(done)/float64(size), hostfit.HumanSize(size))
+		return
+	}
+	fmt.Fprintf(progressOut, "\r  %-48s %s", name, hostfit.HumanSize(done))
+}
+
 // download fetches one file to dst through a temporary name, printing
-// progress on one line.
+// progress on one line. The line is drawn a last time at the end: a file
+// done within one redraw interval had none, and the read that returns EOF
+// carries no bytes, so the last redraw stopped short of 100%.
 func download(client *http.Client, url, dst string, size int64) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
@@ -243,12 +258,8 @@ func download(client *http.Client, url, dst string, size int64) error {
 				return werr
 			}
 			done += int64(n)
-			if time.Since(last) > 200*time.Millisecond || rerr == io.EOF {
-				if size > 0 {
-					fmt.Printf("\r  %-48s %5.1f%% of %s", name, 100*float64(done)/float64(size), hostfit.HumanSize(size))
-				} else {
-					fmt.Printf("\r  %-48s %s", name, hostfit.HumanSize(done))
-				}
+			if time.Since(last) > 200*time.Millisecond {
+				progress(name, done, size)
 				last = time.Now()
 			}
 		}
@@ -260,7 +271,8 @@ func download(client *http.Client, url, dst string, size int64) error {
 			return rerr
 		}
 	}
-	fmt.Println()
+	progress(name, done, size)
+	fmt.Fprintln(progressOut)
 	if err := out.Close(); err != nil {
 		return err
 	}
