@@ -328,8 +328,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "messages is empty")
 		return
 	}
+	// A streamed answer opens its stream now, before the queue for the
+	// engine: the wait behind another request sends keep-alives too.
+	var st *sseStream
+	if req.Stream {
+		st = startSSE(w)
+		defer st.stopKeepalive()
+	}
 	err := s.onEngineCtx(r.Context(), func() {
 		if err := s.ensure(req.Model); err != nil {
+			if st != nil {
+				st.send(map[string]any{"error": errorBody(http.StatusNotFound, err.Error())})
+				return
+			}
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
@@ -390,55 +401,88 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		s.streamChat(w, ctx, req, msgs, opts, id, created, inTokens)
+		s.streamChat(st, ctx, req, msgs, opts, id, created, inTokens)
 	})
 	if err != nil {
+		if st != nil {
+			st.send(map[string]any{"error": cancelledError()})
+			return
+		}
 		writeCancelled(w)
 	}
+}
+
+// sseStream is a streamed answer on the wire. Its headers go out when the
+// request arrives, then a comment line every keepaliveEvery until the answer
+// ends: the prefill of a long prompt, a tool call held back until it is
+// complete, and the wait for the engine behind another request send no
+// delta. A client's idle watchdog gave up on a 27B's edit call after a minute
+// (Memdoor, 2026-10-26); a request queued behind another on a CPU's 8B sent
+// not even its headers for over 10 minutes, and Memdoor asked again (pr-triage
+// on janis#25, 2026-11-12). A comment is bytes on the stream and no event to
+// any SSE client.
+type sseStream struct {
+	w       http.ResponseWriter
+	flusher http.Flusher
+	mu      sync.Mutex
+	quiet   chan struct{} // closed: no more comments
+	ended   chan struct{} // closed once the comment writer has returned
+	stop    sync.Once
+}
+
+func startSSE(w http.ResponseWriter) *sseStream {
+	st := &sseStream{w: w, quiet: make(chan struct{}), ended: make(chan struct{})}
+	st.flusher, _ = w.(http.Flusher)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	st.write(nil)
+	go func() {
+		defer close(st.ended)
+		t := time.NewTicker(keepaliveEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-st.quiet:
+				return
+			case <-t.C:
+				st.write([]byte(": keepalive\n\n"))
+			}
+		}
+	}()
+	return st
+}
+
+// write puts b on the stream and flushes it, one writer at a time.
+func (st *sseStream) write(b []byte) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(b) > 0 {
+		_, _ = st.w.Write(b)
+	}
+	if st.flusher != nil {
+		st.flusher.Flush()
+	}
+}
+
+// send writes one event.
+func (st *sseStream) send(v any) {
+	b, _ := json.Marshal(v)
+	st.write(append(append([]byte("data: "), b...), "\n\n"...))
+}
+
+// stopKeepalive ends the comments and returns once their writer has: the
+// handler calls it before it returns, so nothing writes after.
+func (st *sseStream) stopKeepalive() {
+	st.stop.Do(func() { close(st.quiet) })
+	<-st.ended
 }
 
 // streamChat writes server-sent events: the role, text deltas as they come
 // (held back by the length of "<tool_call>" so an opening tag is never
 // half-sent), then the tool calls, the finish and, when asked, the usage.
-func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req chatRequest, msgs []llm.Message, opts llm.Options, id string, created int64, inTokens int) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	flusher, _ := w.(http.Flusher)
-	var wmu sync.Mutex
-	send := func(v any) {
-		b, _ := json.Marshal(v)
-		wmu.Lock()
-		_, _ = w.Write([]byte("data: "))
-		_, _ = w.Write(b)
-		_, _ = w.Write([]byte("\n\n"))
-		if flusher != nil {
-			flusher.Flush()
-		}
-		wmu.Unlock()
-	}
-	// A comment line every few seconds while the model is silent: the prefill
-	// of a long prompt and the whole of a tool call (held back until it is
-	// complete) send no delta, and a client's idle watchdog gave up on a
-	// 27B's edit call after a minute (Memdoor, 2026-10-26). A comment is
-	// bytes on the stream and no event to any SSE client.
-	quiet := make(chan struct{})
-	go func() {
-		t := time.NewTicker(keepaliveEvery)
-		defer t.Stop()
-		for {
-			select {
-			case <-quiet:
-				return
-			case <-t.C:
-				wmu.Lock()
-				_, _ = w.Write([]byte(": keepalive\n\n"))
-				if flusher != nil {
-					flusher.Flush()
-				}
-				wmu.Unlock()
-			}
-		}
-	}()
+func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest, msgs []llm.Message, opts llm.Options, id string, created int64, inTokens int) {
+	send := st.send
 	chunk := func(delta map[string]any, finish any) map[string]any {
 		return map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": s.name,
 			"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": finish}}}
@@ -472,7 +516,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req chat
 		}
 	}
 	reply := s.current.ChatStream(msgs, opts, onDelta)
-	close(quiet)
+	st.stopKeepalive()
 	// A generation the stopping server cut short is not finished: no finish
 	// chunk and no [DONE], an error event a client raises instead.
 	if ctx.Err() != nil {
@@ -499,17 +543,14 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req chat
 		u.TotalTokens = u.PromptTokens + u.CompletionTokens
 		send(map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": s.name, "choices": []any{}, "usage": u})
 	}
-	_, _ = w.Write([]byte("data: [DONE]\n\n"))
-	if flusher != nil {
-		flusher.Flush()
-	}
+	st.write([]byte("data: [DONE]\n\n"))
 }
 
 // ---- the Hermes protocol ----
 
 // keepaliveEvery is how often a streamed answer carries a comment line while
 // the model sends no delta.
-const keepaliveEvery = 5 * time.Second
+var keepaliveEvery = 5 * time.Second // a var: a test shortens it
 
 const (
 	openTag  = "<tool_call>"
