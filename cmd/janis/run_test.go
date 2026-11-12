@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -70,7 +71,7 @@ func TestStopOnAnEmptyPortSaysSo(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	l, _ := net.Listen("tcp", "127.0.0.1:0")
 	port := l.Addr().(*net.TCPAddr).Port
-	if _, err := liveState(port); err == nil || !strings.Contains(err.Error(), "not by a janis this version started") {
+	if _, err := liveState(port); err == nil || !strings.Contains(err.Error(), "served by a program that is not janis") {
 		t.Fatalf("a port something else serves: %v", err)
 	}
 	l.Close()
@@ -162,5 +163,69 @@ func TestShutdownLetsRequestsFinishThenCancelsTheRest(t *testing.T) {
 	}
 	if _, err := http.Get(base + "/short"); err == nil {
 		t.Fatal("a new request was taken after shutdown")
+	}
+}
+
+// TestMain runs the test binary as a stand-in `janis serve` when
+// JANIS_TEST_OLD_SERVE is set: a server an older janis started, with no
+// state file.
+func TestMain(m *testing.M) {
+	if os.Getenv("JANIS_TEST_OLD_SERVE") == "1" {
+		time.Sleep(time.Minute)
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
+func TestAServeCommandLineIsRead(t *testing.T) {
+	st, ok := parseServeArgs([]string{"--host", "0.0.0.0", "--port", "8091", "--model", "mlx-community/Qwen3.5-9B-MLX-4bit"})
+	if !ok || st.Host != "0.0.0.0" || st.Port != 8091 || st.Model != "Qwen3.5-9B-MLX-4bit" {
+		t.Fatalf("%+v %v", st, ok)
+	}
+	if st, ok := parseServeArgs(nil); !ok || st.Port != 8090 || st.Host != "127.0.0.1" {
+		t.Fatalf("the defaults: %+v %v", st, ok)
+	}
+	if _, ok := parseServeArgs([]string{"--detach", "--port", "8090"}); ok {
+		t.Fatal("serve --detach returns once its server answers: not the server")
+	}
+	if _, ok := parseServeArgs([]string{"--what"}); ok {
+		t.Fatal("a flag it cannot read")
+	}
+}
+
+// A `janis serve` an older janis started has no state file: status finds
+// it on its port, restart reads its flags, stop ends it.
+func TestAnOlderJanisOnThePortIsFoundAndStopped(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	old := exec.Command(os.Args[0])
+	old.Args = []string{"janis", "serve", "--host", "0.0.0.0", "--port", fmt.Sprint(port), "--model", "Qwen3.5-9B-MLX-4bit"}
+	old.Env = append(os.Environ(), "JANIS_TEST_OLD_SERVE=1")
+	if err := old.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	go func() { _ = old.Wait(); close(exited) }()
+	t.Cleanup(func() { _ = old.Process.Kill() })
+
+	st, err := liveState(port)
+	if err != nil || st.PID != old.Process.Pid || st.Model != "Qwen3.5-9B-MLX-4bit" || st.Host != "0.0.0.0" || !st.Started.IsZero() {
+		t.Fatalf("found: %+v %v", st, err)
+	}
+	f := newServeFlags("restart")
+	_ = f.fs.Parse(nil)
+	if h, m, _ := restartFlags(st, f); h != "0.0.0.0" || m != "Qwen3.5-9B-MLX-4bit" {
+		t.Fatalf("restart takes its flags: %s %s", h, m)
+	}
+	if _, ok := serveProcess(port + 1); ok {
+		t.Fatal("another port")
+	}
+	stopServer(st)
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the older janis still runs")
 	}
 }
