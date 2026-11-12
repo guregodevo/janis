@@ -26,7 +26,7 @@ done
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-go build -trimpath -ldflags "-s -w" -o "$work/janis" ./cmd/janis
+go build -trimpath -ldflags "-s -w -X main.version=${VERSION:-dev}" -o "$work/janis" ./cmd/janis
 cp "$mlx_lib/libmlx.dylib" "$mlx_lib/mlx.metallib" "$mlxc_lib/libmlxc.dylib" "$work/"
 chmod u+w "$work"/*.dylib
 

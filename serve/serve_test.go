@@ -511,6 +511,29 @@ func TestAStreamCutShortByShutdownEndsWithAnError(t *testing.T) {
 	}
 }
 
+// GET /health names the build's version when it has one.
+func TestHealthSaysTheVersion(t *testing.T) {
+	for _, v := range []string{"v0.1.20", ""} {
+		s := NewWithLoader(func(dir string) (Generator, error) { return &fakeEngine{}, nil })
+		s.Version = v
+		srv := httptest.NewServer(s.Handler())
+		resp, err := http.Get(srv.URL + "/health")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var h map[string]string
+		_ = json.NewDecoder(resp.Body).Decode(&h)
+		resp.Body.Close()
+		srv.Close()
+		if h["status"] != "ok" || h["version"] != v {
+			t.Fatalf("version %q: %v", v, h)
+		}
+		if _, has := h["version"]; v == "" && has {
+			t.Fatalf("no version, no field: %v", h)
+		}
+	}
+}
+
 // A streamed request waiting for the engine behind another one is answered
 // at once with its headers, then keep-alive comments: a client's watchdog
 // does not take the queue for a dead server (Memdoor waits 10 minutes for a

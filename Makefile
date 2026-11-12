@@ -42,6 +42,9 @@ test: tokenizer-lib
 # can build the other's asset (both link native libraries), so the release
 # workflow runs this once per runner. Linux: a cmake toolchain for ggml.
 # macOS: brew install mlx mlx-c.
+# VERSION is stamped into the binary (janis version, GET /health). The
+# release workflow passes the tag; elsewhere git describe names the build.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GOOS   := $(shell go env GOOS)
 GOARCH := $(shell go env GOARCH)
 DIST   := dist
@@ -55,10 +58,10 @@ endif
 dist: tokenizer-lib
 	@mkdir -p $(DIST)
 ifeq ($(GOOS),darwin)
-	@bash scripts/bundle-mlx.sh $(DIST)/$(ASSET)
+	@VERSION=$(VERSION) bash scripts/bundle-mlx.sh $(DIST)/$(ASSET)
 else
 	@bash scripts/fetch-ggml.sh --static
-	@go build -tags ggml -trimpath -ldflags "-s -w" -o $(DIST)/$(ASSET) ./cmd/janis
+	@go build -tags ggml -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(DIST)/$(ASSET) ./cmd/janis
 	@ldd $(DIST)/$(ASSET) || true
 endif
 	@cd $(DIST) && $(SHA256) $(ASSET) > $(ASSET).sha256

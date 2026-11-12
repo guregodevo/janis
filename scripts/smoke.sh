@@ -10,7 +10,9 @@ port=${2:-8090}
 cd "$(dirname "$janis")"
 log=$PWD/janis.log
 
+"$janis" version
 "$janis" serve --detach --model Qwen3-0.6B-4bit --port "$port" --log "$log"
+curl -s --max-time 5 "http://127.0.0.1:$port/health"; echo
 out=$(curl -s --max-time 300 "http://127.0.0.1:$port/v1/chat/completions" -H 'Content-Type: application/json' \
 	-d '{"model":"Qwen3-0.6B-4bit","messages":[{"role":"user","content":"What is 2+3? Answer with the number."}],"max_tokens":8,"temperature":0}' || true)
 echo "$out"

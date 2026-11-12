@@ -142,6 +142,7 @@ func serveForeground(f serveFlags) {
 		l.Close()
 		fail(err)
 	}
+	srv.Version = version
 	st := runState{PID: os.Getpid(), Host: *f.host, Port: *f.port, Model: f.modelName(), Log: os.Getenv(logEnv), Started: time.Now().UTC()}
 	if err := st.write(); err != nil {
 		fmt.Fprintf(os.Stderr, "janis serve: no state file, janis stop will not find this server: %v\n", err)
@@ -378,8 +379,9 @@ func restartFlags(st runState, f serveFlags) (host, model, logPath string) {
 	return host, model, logPath
 }
 
-// statusCmd is `janis status`: the pid, the model, the uptime, and whether
-// GET /health answers within healthWait. Exits 1 unless it does.
+// statusCmd is `janis status`: the pid, the version the server reports, the
+// model, the uptime, and whether GET /health answers within healthWait.
+// Exits 1 unless it does.
 func statusCmd(args []string) {
 	port := portFlag("status", args)
 	st, err := liveState(port)
@@ -395,22 +397,33 @@ func statusCmd(args []string) {
 	if !st.Started.IsZero() {
 		up = uptime(time.Since(st.Started))
 	}
-	fmt.Printf("janis on %s/v1\n  pid     %d\n  model   %s\n  up      %s\n", base, st.PID, model, up)
+	t0 := time.Now()
+	resp, err := (&http.Client{Timeout: healthWait}).Get(base + "/health")
+	took := time.Since(t0)
+	var health struct {
+		Version string `json:"version"`
+	}
+	if err == nil {
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&health)
+		resp.Body.Close()
+	}
+	ver := health.Version
+	if ver == "" {
+		ver = "unknown: the server does not say (janis v0.1.19 or older)"
+	}
+	fmt.Printf("janis on %s/v1\n  pid     %d\n  version %s\n  model   %s\n  up      %s\n", base, st.PID, ver, model, up)
 	if st.Log != "" {
 		fmt.Printf("  log     %s\n", st.Log)
 	}
-	t0 := time.Now()
-	resp, err := (&http.Client{Timeout: healthWait}).Get(base + "/health")
 	if err != nil {
 		fmt.Printf("  health  no answer in %s\n", healthWait)
 		os.Exit(1)
 	}
-	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		fmt.Printf("  health  %s\n", resp.Status)
 		os.Exit(1)
 	}
-	fmt.Printf("  health  ok (%d ms)\n", time.Since(t0).Milliseconds())
+	fmt.Printf("  health  ok (%d ms)\n", took.Milliseconds())
 }
 
 // dialHost is the address to reach a server bound to host from this machine.
