@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strings"
@@ -245,6 +246,13 @@ func newDecision(q Question, probs []float64) Decision {
 // order on the dedicated decide session, so all but the first reuse the
 // state's KV prefix on pure-attention models.
 func (e *Engine) Decide(state string, qs []Question) ([]Decision, error) {
+	return e.DecideContext(context.Background(), state, qs)
+}
+
+// DecideContext is Decide that stops when ctx is done: before the compute
+// lock is taken and between questions, with ctx.Err(). A question already
+// in prefill runs to its end. A client that has gone costs no more prefill.
+func (e *Engine) DecideContext(ctx context.Context, state string, qs []Question) ([]Decision, error) {
 	if len(qs) == 0 {
 		return nil, fmt.Errorf("no questions")
 	}
@@ -253,11 +261,17 @@ func (e *Engine) Decide(state string, qs []Question) ([]Decision, error) {
 			return nil, err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	labels := e.labelTokens()
 	out := make([]Decision, 0, len(qs))
 	mlxComputeMu.Lock()
 	defer mlxComputeMu.Unlock()
 	for _, q := range qs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		ids := e.tok.Encode(chat.ApplyTemplate(e.mtype, decideMessages(state, q)))
 		var logits []float32
 		withGenerateNothingChunking(e.decideSession, func() {

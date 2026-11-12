@@ -45,7 +45,8 @@ func detachServe(host string, port int, model, logPath string) {
 	if logPath == "" {
 		logPath = filepath.Join(os.TempDir(), fmt.Sprintf("janis-%d.log", port))
 	}
-	log, err := os.Create(logPath)
+	// Appended: a restart keeps the output of the server it replaced.
+	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		fail(err)
 	}
@@ -56,6 +57,7 @@ func detachServe(host string, port int, model, logPath string) {
 	args := []string{"serve", "--host", host, "--port", fmt.Sprint(port), "--model", model}
 	cmd := exec.Command(self, args...)
 	cmd.Stdout, cmd.Stderr = log, log
+	cmd.Env = append(os.Environ(), logEnv+"="+logPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		fail(err)
@@ -68,10 +70,7 @@ func detachServe(host string, port int, model, logPath string) {
 		os.Exit(1)
 	}
 
-	if host == "0.0.0.0" || host == "::" || host == "" {
-		host = "127.0.0.1"
-	}
-	base := "http://" + net.JoinHostPort(host, fmt.Sprint(port)) + "/v1"
+	base := "http://" + net.JoinHostPort(dialHost(host), fmt.Sprint(port)) + "/v1"
 	probe := &http.Client{Timeout: 2 * time.Second}
 	ready := time.Now().Add(10 * time.Minute)
 	for {
