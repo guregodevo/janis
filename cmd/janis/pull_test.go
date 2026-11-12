@@ -139,3 +139,41 @@ func TestMissingBytesCountsAPartialFileAsFree(t *testing.T) {
 		t.Fatalf("missingBytes = %d, want 70", got)
 	}
 }
+
+// Each file ends on one line at 100%: a small file done within one redraw
+// interval printed an empty line, and the read that returns EOF carries no
+// bytes, so the last redraw stopped short (99.9% of 5.0 GB, 2026-11-12).
+func TestEachFileEndsOnOneLineAt100Percent(t *testing.T) {
+	body := strings.Repeat("x", 3<<20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "small.json") {
+			w.Write([]byte("{}"))
+			return
+		}
+		w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	var out strings.Builder
+	saved := progressOut
+	progressOut = &out
+	t.Cleanup(func() { progressOut = saved })
+	dir := t.TempDir()
+	for _, f := range []struct {
+		name string
+		size int64
+	}{{"small.json", 2}, {"model.safetensors", int64(len(body))}} {
+		out.Reset()
+		if err := download(srv.Client(), srv.URL+"/"+f.name, filepath.Join(dir, f.name), f.size); err != nil {
+			t.Fatal(err)
+		}
+		got := out.String()
+		if !strings.HasSuffix(got, "\n") || strings.Count(got, "\n") != 1 {
+			t.Fatalf("%s: one line: %q", f.name, got)
+		}
+		draws := strings.Split(strings.TrimSuffix(got, "\n"), "\r")
+		last := draws[len(draws)-1]
+		if !strings.Contains(last, f.name) || !strings.Contains(last, "100.0%") {
+			t.Fatalf("%s: the last draw: %q", f.name, last)
+		}
+	}
+}
