@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -507,5 +508,56 @@ func TestAStreamCutShortByShutdownEndsWithAnError(t *testing.T) {
 		if e == "[DONE]" || strings.Contains(e, `"finish_reason":"stop"`) {
 			t.Fatalf("a cut-short stream said it finished: %v", events)
 		}
+	}
+}
+
+// A streamed request waiting for the engine behind another one is answered
+// at once with its headers, then keep-alive comments: a client's watchdog
+// does not take the queue for a dead server (Memdoor waits 10 minutes for a
+// keyless runtime's headers; pr-triage's second call on a CPU's 8B waited
+// longer, 2026-11-12). The answer follows once the engine is free.
+func TestAStreamedRequestHearsKeepAlivesWhileQueued(t *testing.T) {
+	saved := keepaliveEvery
+	keepaliveEvery = 50 * time.Millisecond
+	t.Cleanup(func() { keepaliveEvery = saved })
+	installFake(t, "Qwen3-8B-4bit", 40960)
+	url, release, _ := busyServer(t, &fakeEngine{reply: "hello"})
+
+	c := &http.Client{Timeout: 5 * time.Second}
+	resp, err := c.Post(url+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("no headers while queued: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("%d %s", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	r := bufio.NewReader(resp.Body)
+	line, err := r.ReadString('\n')
+	if err != nil || line != ": keepalive\n" {
+		t.Fatalf("while queued: %q %v", line, err)
+	}
+	release()
+	rest, _ := io.ReadAll(r)
+	if !strings.Contains(string(rest), `"content":"hel`) || !strings.HasSuffix(strings.TrimSpace(string(rest)), "data: [DONE]") {
+		t.Fatalf("the answer after the queue: %q", rest)
+	}
+}
+
+// A streamed request for a model not installed is told so in an error event:
+// its headers left before the engine was reached.
+func TestAStreamedRequestForAnUnknownModelGetsAnErrorEvent(t *testing.T) {
+	installFake(t, "Qwen3-8B-4bit", 40960)
+	srv := newTestServer(t, &fakeEngine{reply: "x"})
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"nope","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(b), `data: {"error":`) || !strings.Contains(string(b), "not installed") || strings.Contains(string(b), "[DONE]") {
+		t.Fatalf("%q", b)
 	}
 }
