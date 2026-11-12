@@ -292,12 +292,20 @@ func liveState(port int) (runState, error) {
 
 // notStarted says no janis serves port, and whether another program does.
 func notStarted(port int) error {
-	c, err := net.DialTimeout("tcp", net.JoinHostPort(defaultHost, fmt.Sprint(port)), time.Second)
-	if err != nil {
+	if !portServed(port) {
 		return fmt.Errorf("no janis server on port %d", port)
 	}
-	c.Close()
 	return fmt.Errorf("port %d is served by a program that is not janis", port)
+}
+
+// portServed reports whether something answers on port on this machine.
+func portServed(port int) bool {
+	c, err := net.DialTimeout("tcp", net.JoinHostPort(defaultHost, fmt.Sprint(port)), time.Second)
+	if err != nil {
+		return false
+	}
+	c.Close()
+	return true
 }
 
 func stopServer(st runState) {
@@ -323,17 +331,23 @@ func stopServer(st runState) {
 
 // restartCmd is `janis restart`: stop, then start on the saved flags, or
 // on those of a `janis serve` found on the port with no state file (an older
-// janis); a flag on the command line replaces them.
+// janis); a flag on the command line replaces them. With no janis on the
+// port it starts one, as `janis start` does (systemctl's restart).
 func restartCmd(args []string) {
 	f := newServeFlags("restart")
 	_ = f.fs.Parse(args)
 	st, err := readState(*f.port)
 	if errors.Is(err, os.ErrNotExist) {
 		old, ok := serveProcess(*f.port)
-		if !ok {
-			fail(fmt.Errorf("%w: janis start starts one", notStarted(*f.port)))
+		switch {
+		case ok:
+			st = old
+		case portServed(*f.port):
+			fail(notStarted(*f.port))
+		default:
+			st = runState{Host: *f.host, Port: *f.port}
 		}
-		st, err = old, nil
+		err = nil
 	}
 	if err != nil {
 		fail(err)
