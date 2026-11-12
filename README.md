@@ -85,13 +85,15 @@ janis restart [--port 8090]   # stop, then start on the same flags; --model X re
 Every server, foreground or background, writes its pid and flags to
 `~/.janis/run/PORT.json` and removes it when it stops. `stop` and `restart`
 act on the server that file names. A port served by an older janis has no
-file: `stop` says so and exits 1.
+file: `stop` says so and exits 1. `restart` starts the server in the background,
+one first run with `janis serve` included.
 
 A server stops gracefully on `janis stop`, SIGTERM, Ctrl-C or its terminal
 closing. It takes no new connection, and requests in flight get 5 s to
 finish. Those still running are then cancelled: a generation ends at its
 next token, a decision before its next question, a request waiting for the
-engine leaves the queue with a 503. The model is unloaded last.
+engine leaves the queue. Each is answered 503; a stream cut short ends with
+an error event and no `[DONE]`. The model is unloaded last.
 
 ## Models
 

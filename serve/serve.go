@@ -360,6 +360,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		created := time.Now().Unix()
 		if !req.Stream {
 			reply := s.current.ChatStream(msgs, opts, nil)
+			if ctx.Err() != nil {
+				writeCancelled(w)
+				return
+			}
 			text, calls := parseCalls(reply)
 			finish := "stop"
 			if len(calls) > 0 {
@@ -461,6 +465,12 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req chat
 	}
 	reply := s.current.ChatStream(msgs, opts, onDelta)
 	close(quiet)
+	// A generation the stopping server cut short is not finished: no finish
+	// chunk and no [DONE], an error event a client raises instead.
+	if ctx.Err() != nil {
+		send(map[string]any{"error": cancelledError()})
+		return
+	}
 	_, calls := parseCalls(reply)
 	finish := "stop"
 	switch {
@@ -812,9 +822,17 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 // client that has gone never reads it; one the stopping server cancelled
 // does, instead of an empty 200.
 func writeCancelled(w http.ResponseWriter) {
-	writeError(w, http.StatusServiceUnavailable, "cancelled: janis is stopping or the client left")
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": cancelledError()})
+}
+
+func cancelledError() map[string]any {
+	return errorBody(http.StatusServiceUnavailable, "cancelled: janis is stopping or the client left")
 }
 
 func writeError(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]any{"error": map[string]any{"message": msg, "type": "invalid_request_error", "code": code}})
+	writeJSON(w, code, map[string]any{"error": errorBody(code, msg)})
+}
+
+func errorBody(code int, msg string) map[string]any {
+	return map[string]any{"message": msg, "type": "invalid_request_error", "code": code}
 }

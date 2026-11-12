@@ -111,12 +111,15 @@ func TestShutdownLetsRequestsFinishThenCancelsTheRest(t *testing.T) {
 	srv := serve.NewWithLoader(func(string) (serve.Generator, error) { return idleEngine{}, nil })
 	inFlight, cancelInFlight := context.WithCancel(context.Background())
 	var cancelled atomic.Bool
+	started := make(chan struct{}, 3)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/short", func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
 		time.Sleep(100 * time.Millisecond)
 		w.Write([]byte("done"))
 	})
 	mux.HandleFunc("/long", func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
 		select {
 		case <-r.Context().Done():
 			cancelled.Store(true)
@@ -141,7 +144,8 @@ func TestShutdownLetsRequestsFinishThenCancelsTheRest(t *testing.T) {
 		short <- string(b[:n])
 	}()
 	go http.Get(base + "/long")
-	time.Sleep(50 * time.Millisecond)
+	<-started
+	<-started // both requests are in flight before the shutdown begins
 
 	t0 := time.Now()
 	shutdown(hs, srv, cancelInFlight)
