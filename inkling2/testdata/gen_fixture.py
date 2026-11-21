@@ -143,9 +143,108 @@ def vision(here: Path) -> None:
     print("vision", rows.shape, expected["logits"].shape)
 
 
+def alt_layout(here: Path) -> None:
+    """tiny-alt: the f32 model in the layout MLX-VLM reads (the netprojects
+    conversions): the tensors renamed, the experts requantized affine at 2
+    and 3 bits with gate and up apart, sink_proj and weight_proj as floats.
+    The expected logits are the reference's with the requantized experts
+    put back as floats."""
+    import re
+
+    from mlx_lm.layers.moe import SwitchLinear
+
+    model = build(mx.float32)
+    out = {}
+    renames = [
+        (r"^model\.language_model\.", "language_model.model."),
+        (r"^lm_head\.", "language_model.lm_head."),
+        (r"\.q_l2_clip\.scale$", ".q_scale"),
+        (r"\.rel_l2_clip\.scale$", ".rel_scale"),
+        (r"\.rel_logits_proj\.proj$", ".rel_proj"),
+        (r"\.conv1d\.weight$", ".conv.weight"),
+        (r"\.post_attention_convolution\.", ".attn_sconv."),
+        (r"\.post_mlp_convolution\.", ".mlp_sconv."),
+        (r"\.mlp\.gate\.weight$", ".mlp.gate_weight"),
+        (r"\.mlp\.gate\.e_score_correction_bias$", ".mlp.e_score_correction_bias"),
+        (r"\.q_message_gate\.", ".controllers.attn."),
+        (r"\.(k|v|mlp)_message_gate\.", r".controllers.\1."),
+        (r"(\.controllers\.\w+)\.down_proj\.weight$", r"\1.down_weight"),
+        (r"(\.controllers\.\w+)\.forget_gate_proj\.weight$", r"\1.forget_weight"),
+        (r"(\.controllers\.\w+)\.message_gate_proj\.weight$", r"\1.gain_weight"),
+        (r"\.message_input\.query$", ".message_queries"),
+    ]
+    weights = dict(tree_flatten(model.parameters()))
+    floats = ("sink_proj", "weight_proj")
+    for k, v in weights.items():
+        if ".mlp.experts." in k:
+            continue
+        name = k
+        for pattern, to in renames:
+            name = re.sub(pattern, to, name)
+        m = re.match(r"(.+\.(?:%s))\.(weight|scales|biases)$" % "|".join(floats), k)
+        if m:
+            if m.group(2) == "weight":
+                p = m.group(1)
+                dense = mx.dequantize(v, weights[p + ".scales"], weights[p + ".biases"], 64, 4)
+                out[name] = dense
+            continue
+        out[name] = v
+
+    layers = model.model.language_model.layers
+    for i, layer in enumerate(layers):
+        bits = 3 if i in (0, len(layers) - 1) else 2
+        base = f"language_model.model.layers.{i}.mlp.switch_mlp."
+        experts = layer.mlp.experts
+        put_back = {}
+        for name in ("gate_up_proj", "down_proj"):
+            q = getattr(experts, name)
+            scale = q.get("global_scale")
+            dense = mx.stack(
+                [
+                    mx.dequantize(
+                        q.weight[e], q.scales[e], None, q.group_size, q.bits,
+                        mode=q.mode, global_scale=None if scale is None else scale[e],
+                    )
+                    for e in range(q.weight.shape[0])
+                ]
+            ).astype(mx.float32)
+            if name == "gate_up_proj":
+                n, two, d = dense.shape
+                pairs = dense.reshape(n, two // 2, 2, d)
+                parts = {"gate_proj": pairs[:, :, 0], "up_proj": pairs[:, :, 1]}
+            else:
+                parts = {"down_proj": dense}
+            again = {}
+            for part, w in parts.items():
+                qw, qs, qb = mx.quantize(w, 64, bits)
+                out[base + part + ".weight"], out[base + part + ".scales"], out[base + part + ".biases"] = qw, qs, qb
+                again[part] = mx.dequantize(qw, qs, qb, 64, bits)
+            if name == "gate_up_proj":
+                n, half, d = again["gate_proj"].shape
+                w = mx.stack([again["gate_proj"], again["up_proj"]], axis=2).reshape(n, 2 * half, d)
+            else:
+                w = again["down_proj"]
+            lin = SwitchLinear(w.shape[2], w.shape[1], w.shape[0], bias=False)
+            lin.weight = w
+            put_back[name] = lin
+        experts.gate_up_proj, experts.down_proj = put_back["gate_up_proj"], put_back["down_proj"]
+
+    dest = here / "tiny-alt"
+    dest.mkdir(exist_ok=True)
+    config = {**CONFIG, "quantization": {"group_size": 64, "bits": 2, "mode": "affine"}}
+    (dest / "config.json").write_text(json.dumps(config, indent=1) + "\n")
+    mx.eval(out)
+    mx.save_safetensors(str(dest / "model.safetensors"), out)
+    tokens = mx.array([TOKENS])
+    expected = {"tokens": tokens[0].astype(mx.int32), "logits": model(tokens)[0]}
+    mx.save_safetensors(str(dest / "expected.safetensors"), expected)
+    print("alt", len(out), "tensors", expected["logits"].shape)
+
+
 def main() -> None:
     here = Path(__file__).parent
     vision(here)
+    alt_layout(here)
     for name, dtype in (("f32", mx.float32), ("bf16", mx.bfloat16)):
         model = build(dtype)
         out = here / f"tiny-{name}"

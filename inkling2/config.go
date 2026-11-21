@@ -50,6 +50,10 @@ type Config struct {
 	CoreStart, CoreEnd, Passes, GateRank int
 
 	GroupSize, Bits int // affine quantization of the projections
+	// AltLayout is set by LoadModel for a checkpoint in the MLX-VLM layout
+	// (the netprojects conversions): the same tensors under other names,
+	// each expert's gate and up projections apart, experts affine.
+	AltLayout bool
 
 	// StreamExperts leaves the experts on disk and reads, each step, the
 	// ones its tokens were routed to. Set by the caller before LoadModel,

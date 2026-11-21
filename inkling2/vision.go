@@ -82,14 +82,15 @@ func LoadVisionConfig(modelDir string) (cfg VisionConfig, ok bool, err error) {
 	return cfg, true, nil
 }
 
-// linear is an unquantized linear layer: the tower's weights are kept as
-// floats in the published checkpoints.
+// linear is one of the tower's linear layers: floats in the mlx-lm
+// conversions, quantized in the MLX-VLM ones.
 type linear struct {
-	WT, Bias engine.Tensor // [in, out], [out] or nil
+	W    projection
+	Bias engine.Tensor // [out] or nil
 }
 
 func (l linear) forward(c *ctx, x engine.Tensor) engine.Tensor {
-	y := c.MatMul(x, l.WT)
+	y := l.W.Forward(c, x)
 	if l.Bias != nil {
 		y = c.Add(y, l.Bias)
 	}
@@ -109,7 +110,7 @@ type visionLayer struct {
 // stands for one merged block.
 type Vision struct {
 	Cfg            VisionConfig
-	PatchT         engine.Tensor // [patch pixels, hidden]
+	Patch          projection    // patch pixels -> hidden
 	Positions      engine.Tensor // [grid*grid, hidden]
 	Class          engine.Tensor // [1, hidden]: class + its position
 	PreLN          [2]engine.Tensor
@@ -125,7 +126,7 @@ func (m *Model) LoadVision(st *safetensors.File, cfg VisionConfig) (*Vision, err
 	c := m.c
 	ld := loader{c: c, st: st, cfg: m.Cfg}
 	lin := func(name string, bias bool) linear {
-		l := linear{WT: ld.dense(name + ".weight")}
+		l := linear{W: ld.linear(name)}
 		if bias {
 			l.Bias = ld.tensor(name + ".bias")
 		}
@@ -135,7 +136,7 @@ func (m *Model) LoadVision(st *safetensors.File, cfg VisionConfig) (*Vision, err
 		return [2]engine.Tensor{ld.tensor(name + ".weight"), ld.tensor(name + ".bias")}
 	}
 	v := &Vision{Cfg: cfg, c: c}
-	v.PatchT = ld.dense(p + "embeddings.patch_embedding.weight")
+	v.Patch = ld.linear(p + "embeddings.patch_embedding")
 	v.Positions = ld.tensor(p + "embeddings.position_embedding.weight")
 	class, classPos := ld.tensor(p+"embeddings.class_embedding"), ld.tensor(p+"embeddings.cls_position_embedding")
 	v.PreLN = ln(p + "pre_layernorm")
@@ -201,7 +202,7 @@ func (v *Vision) Encode(pixels []float32, height, width int) (engine.Tensor, err
 			}
 		}
 	}
-	h := c.MatMul(c.model(c.FromFloats(patches, n, p*p*3)), v.PatchT) // [n, hidden]
+	h := v.Patch.Forward(c, c.model(c.FromFloats(patches, n, p*p*3))) // [n, hidden]
 
 	// The learned positions are a Grid x Grid table, read bilinearly at
 	// each patch's place in this image's grid.

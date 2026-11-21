@@ -83,3 +83,23 @@ func TestAModelNamedWithoutItsSizeIsRated(t *testing.T) {
 		t.Errorf("an embedding model is rated %v", got)
 	}
 }
+
+// A model of another organization goes by org/name, in the list and in the
+// cache; one of the default organization keeps its bare name.
+func TestAModelOfAnotherOrganizationGoesByOrgAndName(t *testing.T) {
+	if got := Repo("Qwen3-4B-4bit"); got != "mlx-community/Qwen3-4B-4bit" {
+		t.Errorf("Repo of a bare name = %q", got)
+	}
+	if got := RepoDir("netprojects/Inkling-2-Mini-MLX-2.5bit"); got != "models--netprojects--Inkling-2-Mini-MLX-2.5bit" {
+		t.Errorf("RepoDir = %q", got)
+	}
+	if got := nameFromPath("/c/models--netprojects--Inkling-2-Mini-MLX-2.5bit/snapshots/abc"); got != "netprojects/Inkling-2-Mini-MLX-2.5bit" {
+		t.Errorf("name from a path of another organization = %q", got)
+	}
+	if got := nameFromPath("/c/models--mlx-community--Qwen3-4B-4bit/snapshots/abc"); got != "Qwen3-4B-4bit" {
+		t.Errorf("name from a path of the default organization = %q", got)
+	}
+	if got := ParamsB("netprojects/Inkling-2-Mini-MLX-2.5bit"); got != 26.4 {
+		t.Errorf("ParamsB with an organization = %v, want 26.4", got)
+	}
+}

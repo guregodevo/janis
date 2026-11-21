@@ -332,3 +332,29 @@ func TestAHotExpertIsReadOnce(t *testing.T) {
 		b.Close()
 	}
 }
+
+// THE MLX-VLM LAYOUT GIVES THE SAME MODEL.
+//
+// tiny-alt is the f32 model as the netprojects conversions store it: the
+// tensors renamed, gate and up projections apart, experts affine at 2 and
+// 3 bits, sink_proj and weight_proj as floats. The expected logits are the
+// reference's with those requantized experts put back as floats. Read with
+// the experts on the device, then from disk.
+func TestTheOtherLayoutGivesTheReferenceLogits(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		b, m, want := tinyWith(t, "alt", stream)
+		if !m.Cfg.AltLayout {
+			t.Fatal("the layout was not recognized")
+		}
+		if l := m.Layers[0].MLP; l.GateUp != nil || l.Gate == nil || l.Gate.Mode != "affine" || l.Gate.Bits != 3 || m.Layers[1].MLP.Down.Bits != 2 {
+			t.Fatalf("layer 0 experts: fused %v, gate %+v", l.GateUp != nil, l.Gate)
+		}
+		ids := wantTokens(t, want)
+		full := wantFloats(t, want, "logits")
+		got := b.Floats(m.logits(m.hidden(b.FromInt32(ids, len(ids)), len(ids), 0, m.newCaches(), nil)))
+		_, scale := maxDiff(full, full)
+		if d, _ := maxDiff(got, full); d > 5e-4*scale {
+			t.Errorf("experts on disk %v: logits off by %.3g (largest value %.3g)", stream, d, scale)
+		}
+	}
+}

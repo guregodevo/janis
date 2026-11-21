@@ -137,6 +137,9 @@ var namedParamsB = map[string]float64{
 // ParamsB extracts a model's parameter count in billions from its name, or 0
 // when the name carries none.
 func ParamsB(name string) float64 {
+	if i := strings.LastIndexByte(name, '/'); i >= 0 {
+		name = name[i+1:] // the organization is no part of the size
+	}
 	m := paramsRe.FindStringSubmatch(name)
 	if m == nil {
 		lower := strings.ToLower(name)
@@ -162,7 +165,11 @@ type InstalledModel struct {
 // de-duplicated by name (first snapshot wins). The single inventory source the
 // CLI (`llm list`) and the TUI (/model) both read, so neither re-globs by hand.
 func ListInstalled() ([]InstalledModel, error) {
-	matches, _ := filepath.Glob(filepath.Join(CacheDir(), "models--mlx-community--*/snapshots/*"))
+	var matches []string
+	for _, org := range append([]string{DefaultOrg}, OtherOrgs...) {
+		m, _ := filepath.Glob(filepath.Join(CacheDir(), "models--"+org+"--*/snapshots/*"))
+		matches = append(matches, m...)
+	}
 	out := make([]InstalledModel, 0, len(matches))
 	seen := map[string]bool{}
 	for _, dir := range matches {
@@ -197,13 +204,42 @@ func IsEmbeddingModel(name string) bool {
 	return false
 }
 
-// nameFromPath extracts the bare model name from a HuggingFace cache path by
-// walking up to the models--mlx-community--<NAME> dir.
+// DefaultOrg is the HuggingFace organization janis's models come from: a
+// model of it goes by its bare name. OtherOrgs are the ones janis also
+// reads conversions of, whose models go by org/name.
+const DefaultOrg = "mlx-community"
+
+// OtherOrgs: netprojects publishes Inkling 2 Mini at 2.5 and 3 bits, in
+// the MLX-VLM layout.
+var OtherOrgs = []string{"netprojects"}
+
+// Repo is the HuggingFace repository of a model name: org/name as given,
+// a bare name under DefaultOrg.
+func Repo(name string) string {
+	if strings.Contains(name, "/") {
+		return name
+	}
+	return DefaultOrg + "/" + name
+}
+
+// RepoDir is a repository's directory name in the HuggingFace cache.
+func RepoDir(name string) string {
+	return "models--" + strings.Replace(Repo(name), "/", "--", 1)
+}
+
+// nameFromPath extracts the model name from a HuggingFace cache path by
+// walking up to the models--<org>--<NAME> dir: the bare name for
+// DefaultOrg, org/name for another.
 func nameFromPath(p string) string {
 	for {
 		base := filepath.Base(p)
-		if strings.HasPrefix(base, "models--mlx-community--") {
-			return strings.TrimPrefix(base, "models--mlx-community--")
+		if strings.HasPrefix(base, "models--"+DefaultOrg+"--") {
+			return strings.TrimPrefix(base, "models--"+DefaultOrg+"--")
+		}
+		for _, org := range OtherOrgs {
+			if strings.HasPrefix(base, "models--"+org+"--") {
+				return org + "/" + strings.TrimPrefix(base, "models--"+org+"--")
+			}
 		}
 		next := filepath.Dir(p)
 		if next == p {

@@ -516,6 +516,14 @@ func (e *Engine) CheckImages(msgs []Message) error {
 			if e.vision == nil {
 				return fmt.Errorf("%s takes no images", e.mtype)
 			}
+			// A tower that does not load is said here, not found out as a
+			// reply that has seen no picture.
+			mlxComputeMu.Lock()
+			err := e.loadTower()
+			mlxComputeMu.Unlock()
+			if err != nil {
+				return fmt.Errorf("the vision tower does not load: %w", err)
+			}
 			if _, _, _, err := inkling2.PrepareImage(img, e.vision.cfg.Block()); err != nil {
 				return fmt.Errorf("image %d of a %s message: %w", i+1, m.Role, err)
 			}
@@ -543,16 +551,9 @@ func (e *Engine) see(sess *qwen.Session, ids []int32, images [][]byte) []int32 {
 		e.ink2.SetImages(nil, nil)
 		return ids
 	}
-	if v.tower == nil {
-		tower, err := e.ink2.LoadVision(v.st, v.cfg)
-		if err != nil {
-			e.ink2.SetImages(nil, nil)
-			return ids
-		}
-		if sw, ok := e.bk.(engine.Sweeper); ok {
-			sw.PinAll() // the tower's weights, like the model's at the load
-		}
-		v.tower = tower
+	if err := e.loadTower(); err != nil {
+		e.ink2.SetImages(nil, nil)
+		return ids
 	}
 	out := make([]int32, 0, len(ids))
 	var rows engine.Tensor
@@ -591,4 +592,21 @@ func (e *Engine) see(sess *qwen.Session, ids []int32, images [][]byte) []int32 {
 	}
 	e.ink2.SetImages(rows, at)
 	return out
+}
+
+// loadTower loads the vision tower once. Called with the compute lock held.
+func (e *Engine) loadTower() error {
+	v := e.vision
+	if v.tower != nil {
+		return nil
+	}
+	tower, err := e.ink2.LoadVision(v.st, v.cfg)
+	if err != nil {
+		return err
+	}
+	if sw, ok := e.bk.(engine.Sweeper); ok {
+		sw.PinAll() // the tower's weights, like the model's at the load
+	}
+	v.tower = tower
+	return nil
 }

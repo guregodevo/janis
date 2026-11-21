@@ -4,7 +4,6 @@ import (
 	"math"
 
 	"github.com/guregodevo/janis/engine"
-	"github.com/guregodevo/janis/qwen"
 	"github.com/guregodevo/janis/safetensors"
 )
 
@@ -19,7 +18,7 @@ import (
 // computes the filter's weights from its input, and scales its queries
 // with the log of the position.
 type Attention struct {
-	Q, K, V, R, O, Gate, Sink *qwen.QuantLinear
+	Q, K, V, R, O, Gate, Sink projection
 	QScale, RelScale          engine.Tensor // float32 [heads, head dim], [heads, d_rel]
 	RelProj                   engine.Tensor // [d_rel, RelExtent]
 
@@ -28,7 +27,7 @@ type Attention struct {
 	// Full layers: the static part of the filter, float32
 	// [kv heads, head dim, kernel], and the projection of the dynamic part.
 	KStatic, VStatic engine.Tensor
-	KDyn, VDyn       *qwen.QuantLinear
+	KDyn, VDyn       projection
 
 	Heads, KVHeads, HeadDim int
 	Window                  int // 0 on a full layer
@@ -77,7 +76,7 @@ func loadAttention(c *ctx, st *safetensors.File, prefix string, cfg Config, slid
 // dynamicConv is the full layers' short convolution: the filter of each
 // position is a static weight plus one its own input chooses, per head.
 // x is [1, L, C], in the layer input the projection x was made from.
-func (a *Attention) dynamicConv(c *ctx, x, in, static engine.Tensor, dyn *qwen.QuantLinear, tail engine.Tensor) (engine.Tensor, engine.Tensor) {
+func (a *Attention) dynamicConv(c *ctx, x, in, static engine.Tensor, dyn projection, tail engine.Tensor) (engine.Tensor, engine.Tensor) {
 	L, K, H, D := x.Shape()[1], a.Kernel, a.KVHeads, a.HeadDim
 	weights := c.Reshape(c.f32(dyn.Forward(c, in)), 1, L, H, 1, K)
 	weights = c.Add(weights, static) // [1, L, H, D, K]
