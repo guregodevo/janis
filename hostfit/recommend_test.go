@@ -66,3 +66,20 @@ func TestCandidatesStartAtTheRAMTier(t *testing.T) {
 		t.Errorf("Candidates(16 GiB) = %v", got)
 	}
 }
+
+// A chat model whose name carries no parameter count is rated from the
+// table, not left unrated: Inkling-2-Mini-4bit is 16.1 GB of weights.
+func TestAModelNamedWithoutItsSizeIsRated(t *testing.T) {
+	if got := ParamsB("Inkling-2-Mini-4bit"); got != 26.4 {
+		t.Errorf("ParamsB(Inkling-2-Mini-4bit) = %v, want 26.4", got)
+	}
+	if got := (Host{RAMGiB: 16}).Rate("Inkling-2-Mini-4bit"); got != FitTooBig {
+		t.Errorf("on 16 GiB it is rated %v, want too big", got)
+	}
+	if got := (Host{RAMGiB: 32}).Rate("Inkling-2-Mini-4bit"); got != FitGood {
+		t.Errorf("on 32 GiB it is rated %v, want good", got)
+	}
+	if got := ParamsB("bge-m3-mlx-fp16"); got != 0 {
+		t.Errorf("an embedding model is rated %v", got)
+	}
+}
