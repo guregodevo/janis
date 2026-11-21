@@ -280,3 +280,55 @@ func TestExpertsReadFromDiskGiveTheSameLogits(t *testing.T) {
 		t.Errorf("layer 0 read %d expert rows for %d steps, want %d", got, steps, steps*int64(m.Cfg.TopK))
 	}
 }
+
+// A HOT EXPERT IS READ FROM DISK ONCE.
+//
+// With room in the cache the session generates the same tokens and reads
+// each expert it uses once; with a budget of a few experts the cache stays
+// within it, less the step in hand.
+func TestAHotExpertIsReadOnce(t *testing.T) {
+	dir := filepath.Join("testdata", "tiny-f32")
+	want, err := safetensors.Open(filepath.Join(dir, "expected.safetensors"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := wantTokens(t, want)[:8]
+	_, _, raw, err := want.Get("greedy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantGen := make([]int32, len(raw)/4)
+	for i := range wantGen {
+		wantGen[i] = int32(binary.LittleEndian.Uint32(raw[i*4:]))
+	}
+	for _, budget := range []int64{1 << 30, 40 << 10} {
+		cfg, err := LoadConfig(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.StreamExperts, cfg.ExpertCacheBytes = true, budget
+		st, err := safetensors.OpenModel(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b := mlxc.New()
+		m, err := LoadModel(b, st, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.PinAll()
+		gen := m.NewSession().Generate(b, ids, len(wantGen), qwen.SampleParams{})
+		if fmt.Sprint(gen) != fmt.Sprint(wantGen) {
+			t.Errorf("budget %d: generated %v, the reference %v", budget, gen, wantGen)
+		}
+		hits, misses, held := m.ExpertCache()
+		// 8 layers, 2 projections, 4 experts: 64 rows in all.
+		if budget == 1<<30 && (misses > 64 || hits == 0) {
+			t.Errorf("with room for all, %d reads and %d hits; want at most 64 reads", misses, hits)
+		}
+		if one := int64(m.Layers[0].MLP.GateUp.wBytes + m.Layers[0].MLP.GateUp.sBytes); held > budget+int64(m.Cfg.TopK)*one {
+			t.Errorf("budget %d: the cache holds %d bytes", budget, held)
+		}
+		b.Close()
+	}
+}
