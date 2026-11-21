@@ -17,6 +17,7 @@ const (
 	BF16
 	I32
 	U32
+	U8
 )
 
 // Tensor is an opaque, lazily-evaluated handle into a backend.
@@ -101,6 +102,36 @@ type RowScatterer interface {
 	// ScatterRows returns dst with dst[indices[i]] = updates[i] along axis 0.
 	// updates is [len(indices), ...] with trailing dims equal to dst's.
 	ScatterRows(dst Tensor, indices []int32, updates Tensor) Tensor
+}
+
+// LoopOps is implemented by backends that carry the operations the looped
+// Inkling 2 decoder needs beyond Backend: the L2 clip of its queries and
+// keys, the lookup of its relative-position bias, and experts stored in
+// MLX's nvfp4 and mxfp8 formats. MLX has them; a model that needs them
+// refuses to load on a backend that does not.
+type LoopOps interface {
+	// Sqrt is the elementwise square root.
+	Sqrt(x Tensor) Tensor
+
+	// Div is the elementwise quotient a / b (with broadcasting).
+	Div(a, b Tensor) Tensor
+
+	// Minimum is the elementwise minimum (with broadcasting).
+	Minimum(a, b Tensor) Tensor
+
+	// TopK returns the indices of the k largest values along the last axis,
+	// in no particular order.
+	TopK(x Tensor, k int) Tensor
+
+	// TakeAlong gathers from a along axis by indices, which has a's rank and
+	// broadcasts against it on the other axes.
+	TakeAlong(a, indices Tensor, axis int) Tensor
+
+	// GatherModeMatmul is GatherQuantMatmul for experts quantized in a mode
+	// with no zero points ("nvfp4", "mxfp4", "mxfp8"): w and scales are
+	// stacked [E, out, in] over experts, x is [..., 1, 1, in] and the result
+	// is rhsIndices.shape + [1, out].
+	GatherModeMatmul(x, w, scales, rhsIndices Tensor, groupSize, bits int, mode string) Tensor
 }
 
 // Backend records a tensor graph and evaluates it. Implementations wrap a

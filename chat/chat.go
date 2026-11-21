@@ -28,6 +28,8 @@ func ApplyTemplate(modelType string, msgs []Message) string {
 		return gemma(msgs)
 	case "llama":
 		return llama3(msgs)
+	case "inkling2_loop":
+		return inkling(msgs, thinkingEnabled())
 	case "qwen3", "qwen3_moe", "qwen3_5":
 		// Qwen3/3.5 (dense, MoE, hybrid) are reasoning families: prime the
 		// assistant turn with an empty think block to skip the <think>…</think>
@@ -54,6 +56,10 @@ func ControlMarkers(modelType string) []string {
 		return []string{"<eos>", "<start_of_turn>"}
 	case "llama":
 		return []string{"<|end_of_text|>", "<|start_header_id|>"}
+	case "inkling2_loop":
+		// The model opens its own messages (<|message_model|>); the other
+		// roles' are never its to write.
+		return []string{"<|endoftext|>", "<|message_user|>", "<|message_system|>", "<|message_tool|>"}
 	default:
 		return []string{"<|endoftext|>", "<|im_start|>"}
 	}
@@ -67,6 +73,8 @@ func StopMarker(modelType string) string {
 		return "<end_of_turn>"
 	case "llama":
 		return "<|eot_id|>"
+	case "inkling2_loop":
+		return "<|content_model_end_sampling|>"
 	default:
 		return "<|im_end|>"
 	}
@@ -96,6 +104,53 @@ func chatml(msgs []Message, noThink bool) string {
 		// An empty, already-closed think block tells Qwen3 reasoning is done, so
 		// it generates the answer directly.
 		b.WriteString("<think>\n\n</think>\n\n")
+	}
+	return b.String()
+}
+
+// Inkling 2's markers. A turn is one or more messages, each a role, a
+// content type and <|end_message|>; the model ends its turn with
+// <|content_model_end_sampling|>.
+const (
+	InklingThinking   = "<|content_thinking|>"
+	InklingEndMessage = "<|end_message|>"
+)
+
+// inkling renders Inkling 2's chat template (chat_template.jinja of the
+// published checkpoints) for text messages. The template opens no assistant
+// turn: the model writes its own <|message_model|> header. Before the first
+// message that is not a system one it states the thinking effort, 0 (no
+// thinking block) unless thinking is enabled, then the template's default.
+func inkling(msgs []Message, think bool) string {
+	roles := map[string]string{
+		"system": "<|message_system|>", "user": "<|message_user|>",
+		"assistant": "<|message_model|>", "tool": "<|message_tool|>",
+	}
+	effort := "<|message_system|><|content_text|>Thinking effort level: 0" + InklingEndMessage
+	if think {
+		effort = "<|message_system|><|content_text|>Thinking effort level: 0.9" + InklingEndMessage
+	}
+	var b strings.Builder
+	stated := false
+	for _, m := range msgs {
+		if !stated && m.Role != "system" {
+			b.WriteString(effort)
+			stated = true
+		}
+		role, ok := roles[m.Role]
+		if !ok {
+			role = roles["user"]
+		}
+		b.WriteString(role)
+		b.WriteString("<|content_text|>")
+		b.WriteString(m.Content)
+		b.WriteString(InklingEndMessage)
+		if m.Role == "assistant" {
+			b.WriteString("<|content_model_end_sampling|>")
+		}
+	}
+	if !stated {
+		b.WriteString(effort)
 	}
 	return b.String()
 }
