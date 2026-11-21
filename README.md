@@ -79,6 +79,7 @@ release asset for the machine it runs on ([Build](#build)).
 janis start [--port 8090] [--host 127.0.0.1] [--model NAME] [--log FILE]
 janis status [--port 8090]    # pid, version, model, uptime, GET /health within 2 s; exit 1 if it does not answer
 janis version                 # the release this binary is
+janis upgrade [VERSION]       # replace this binary with the latest release, or the one named; --check only says
 janis stop [--port 8090]      # graceful; SIGKILL after 10 s
 janis restart [--port 8090]   # stop, then start on the same flags; --model X replaces the saved one; none running: start
 ```

@@ -45,6 +45,10 @@ func main() {
 		restartCmd(os.Args[2:])
 	case "status":
 		statusCmd(os.Args[2:])
+	case "upgrade":
+		if err := upgrade(os.Args[2:]); err != nil {
+			fail(err)
+		}
 	case "version", "--version", "-v":
 		fmt.Println("janis " + version)
 	default:
@@ -61,6 +65,7 @@ func usage() {
        janis stop    [--port 8090]
        janis restart [--port 8090] [--host ADDR] [--model NAME] [--log FILE]
        janis status  [--port 8090]
+       janis upgrade [--check] [--force] [VERSION]
        janis version`)
 }
 
