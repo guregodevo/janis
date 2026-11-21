@@ -254,3 +254,34 @@ func (s *File) Close() error {
 	}
 	return firstErr
 }
+
+// Info returns a tensor's dtype and shape from the header, reading no data.
+func (s *File) Info(name string) (dtype string, shape []int, err error) {
+	e, ok := s.index[name]
+	if !ok {
+		return "", nil, fmt.Errorf("tensor %q not found", name)
+	}
+	return e.Dtype, append([]int(nil), e.Shape...), nil
+}
+
+// ReadStackedRow reads row of a stacked tensor [nrows, ...] into dst, which
+// must be exactly one row long: StackedRow for a caller that keeps its own
+// buffer. Safe to call from several goroutines.
+func (s *File) ReadStackedRow(name string, row int, dst []byte) error {
+	e, ok := s.index[name]
+	if !ok {
+		return fmt.Errorf("tensor %q not found", name)
+	}
+	if len(e.Shape) < 2 || row < 0 || row >= e.Shape[0] {
+		return fmt.Errorf("row %d is not in %q (shape %v)", row, name, e.Shape)
+	}
+	rowBytes := (e.DataOffsets[1] - e.DataOffsets[0]) / int64(e.Shape[0])
+	if int64(len(dst)) != rowBytes {
+		return fmt.Errorf("a row of %q is %d bytes, the buffer is %d", name, rowBytes, len(dst))
+	}
+	sh := s.shards[e.shard]
+	if _, err := sh.f.ReadAt(dst, sh.dataStart+e.DataOffsets[0]+int64(row)*rowBytes); err != nil {
+		return fmt.Errorf("read row %d of %q: %w", row, name, err)
+	}
+	return nil
+}

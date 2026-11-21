@@ -165,10 +165,17 @@ func (m *Model) newCaches() []qwen.LayerCache {
 // NewSession returns a session on the shared generate loop, with one cache
 // per layer visit.
 func (m *Model) NewSession() *qwen.Session {
+	// With the experts on disk a chunk of prompt reads the union of its
+	// tokens' experts for every visit; one token at a time reads 8.
+	chunk := 0
+	if m.Cfg.StreamExperts {
+		chunk = 1
+	}
 	return &qwen.Session{
-		NLayers:  m.Cfg.Visits(),
-		Vocab:    m.Cfg.UnpaddedVocab,
-		Forward:  m.forwardCachedT,
-		NewCache: func(int) qwen.LayerCache { return &VisitCache{} },
+		PrefillChunk: chunk,
+		NLayers:      m.Cfg.Visits(),
+		Vocab:        m.Cfg.UnpaddedVocab,
+		Forward:      m.forwardCachedT,
+		NewCache:     func(int) qwen.LayerCache { return &VisitCache{} },
 	}
 }

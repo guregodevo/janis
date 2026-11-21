@@ -15,6 +15,7 @@ import (
 	"github.com/guregodevo/janis/engine"
 	"github.com/guregodevo/janis/gemma"
 	"github.com/guregodevo/janis/grammar"
+	"github.com/guregodevo/janis/hostfit"
 	"github.com/guregodevo/janis/inkling2"
 	"github.com/guregodevo/janis/qwen"
 	"github.com/guregodevo/janis/qwen35"
@@ -159,6 +160,7 @@ func Open(modelDir string) (*Engine, error) {
 		sm = m
 		e.q35 = m
 	case inkling2.TypeLoop:
+		ink.StreamExperts = streamExperts(inkling2.ExpertBytes(st))
 		m, err := inkling2.LoadModel(b, st, ink)
 		if err != nil {
 			return nil, err
@@ -416,4 +418,24 @@ func (e *Engine) Close() {
 	if e.bk != nil {
 		e.bk.Close()
 	}
+}
+
+// streamExperts decides whether a model's experts stay on disk: when they
+// would take more than 60% of the host's memory, which leaves too little
+// for the rest of the model, its caches and the system (the 15.8 GB of
+// Inkling 2 Mini on a 16 GB Mac swapped 10 GB and answered nothing in nine
+// minutes). JANIS_MOE_RESIDENT=1 keeps them on the device, JANIS_MOE_STREAM=1
+// on disk, whatever the host.
+func streamExperts(expertBytes int64) bool {
+	switch {
+	case os.Getenv("JANIS_MOE_RESIDENT") == "1":
+		return false
+	case os.Getenv("JANIS_MOE_STREAM") == "1":
+		return true
+	}
+	host, err := hostfit.Detect()
+	if err != nil {
+		return false
+	}
+	return expertBytes > int64(host.RAMGiB)<<30*6/10
 }

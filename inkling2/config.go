@@ -50,7 +50,12 @@ type Config struct {
 	CoreStart, CoreEnd, Passes, GateRank int
 
 	GroupSize, Bits int // affine quantization of the projections
-	EosTokens       []int32
+
+	// StreamExperts leaves the experts on disk and reads, each step, the
+	// ones its tokens were routed to. Set by the caller before LoadModel,
+	// for a host with less memory than the model.
+	StreamExperts bool
+	EosTokens     []int32
 }
 
 type rawText struct {

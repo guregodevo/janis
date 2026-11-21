@@ -18,12 +18,17 @@ import (
 // tiny loads one of the models testdata/gen_fixture.py made with the
 // reference implementation, and what the reference computed on it.
 func tiny(t *testing.T, name string) (*mlxc.Backend, *Model, *safetensors.File) {
+	return tinyWith(t, name, false)
+}
+
+func tinyWith(t *testing.T, name string, stream bool) (*mlxc.Backend, *Model, *safetensors.File) {
 	t.Helper()
 	dir := filepath.Join("testdata", "tiny-"+name)
 	cfg, err := LoadConfig(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.StreamExperts = stream
 	st, err := safetensors.OpenModel(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -225,5 +230,53 @@ func TestTheSessionReturnsToAMark(t *testing.T) {
 	_, scale := maxDiff(fresh, fresh)
 	if d, _ := maxDiff(got, fresh); d > 2e-4*scale {
 		t.Errorf("from the mark the logits are off by %.3g from a fresh read (largest value %.3g)", d, scale)
+	}
+}
+
+// EXPERTS READ FROM DISK GIVE WHAT EXPERTS ON THE DEVICE GIVE.
+//
+// With the experts left in the file, each step reads the rows of the
+// experts its tokens were routed to. One pass over the 20 tokens gives the
+// reference's logits, and the session, which then reads the prompt a token
+// at a time, generates the reference's tokens. No expert stack is loaded.
+func TestExpertsReadFromDiskGiveTheSameLogits(t *testing.T) {
+	b, m, want := tinyWith(t, "f32", true)
+	for i, l := range m.Layers {
+		if l.MLP.GateUp.W != nil || l.MLP.Down.W != nil {
+			t.Fatalf("layer %d holds its experts on the device", i)
+		}
+	}
+	ids := wantTokens(t, want)
+	full := wantFloats(t, want, "logits")
+	got := b.Floats(m.logits(m.hidden(b.FromInt32(ids, len(ids)), len(ids), 0, m.newCaches(), nil)))
+	_, scale := maxDiff(full, full)
+	if d, _ := maxDiff(got, full); d > 2e-4*scale {
+		t.Errorf("logits off by %.3g (largest value %.3g)", d, scale)
+	}
+	if l := m.Layers[0].MLP.GateUp; l.reads == 0 || l.reads > int64(m.Cfg.Experts) {
+		t.Errorf("layer 0 read %d expert rows for one pass, want 1 to %d", l.reads, m.Cfg.Experts)
+	}
+
+	_, _, raw, err := want.Get("greedy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantGen := make([]int32, len(raw)/4)
+	for i := range wantGen {
+		wantGen[i] = int32(binary.LittleEndian.Uint32(raw[i*4:]))
+	}
+	s := m.NewSession()
+	if s.PrefillChunk != 1 {
+		t.Errorf("the session reads the prompt %d tokens at a time, want 1", s.PrefillChunk)
+	}
+	before := m.Layers[0].MLP.GateUp.reads
+	gen := s.Generate(b, ids[:8], len(wantGen), qwen.SampleParams{})
+	if fmt.Sprint(gen) != fmt.Sprint(wantGen) {
+		t.Errorf("generated %v, the reference %v", gen, wantGen)
+	}
+	// 8 prompt tokens and 15 more steps, 2 experts each.
+	steps := int64(8 + len(wantGen) - 1)
+	if got := m.Layers[0].MLP.GateUp.reads - before; got != steps*int64(m.Cfg.TopK) {
+		t.Errorf("layer 0 read %d expert rows for %d steps, want %d", got, steps, steps*int64(m.Cfg.TopK))
 	}
 }
