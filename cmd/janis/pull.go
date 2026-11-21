@@ -47,7 +47,7 @@ func pull(args []string) error {
 			return nil
 		}
 	}
-	repo := "mlx-community/" + name
+	repo := hostfit.Repo(name)
 	meta, err := repoFiles(client, repo)
 	if err != nil {
 		return fmt.Errorf("%s: %w", repo, err)
@@ -121,7 +121,7 @@ func roomFor(need int64) bool {
 
 // snapshotDir is where a model's files go in the cache layout hostfit reads.
 func snapshotDir(name, sha string) string {
-	return filepath.Join(hostfit.CacheDir(), "models--mlx-community--"+name, "snapshots", sha)
+	return filepath.Join(hostfit.CacheDir(), hostfit.RepoDir(name), "snapshots", sha)
 }
 
 // missingBytes is the disk a pull of meta into dir still takes: the files it

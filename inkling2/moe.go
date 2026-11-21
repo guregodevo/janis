@@ -27,7 +27,10 @@ type expertStack struct {
 	W, Scales engine.Tensor
 	// Global is each expert's own scale over its nvfp4 block scales, already
 	// divided by nvfp4Unit: float32 [experts]. Nil when the stack has none.
-	Global          engine.Tensor
+	Global engine.Tensor
+	// Biases are the zero points of an affine stack (Mode "affine"), nil
+	// for the floating-point modes.
+	Biases          engine.Tensor
 	GroupSize, Bits int
 	Mode            string
 
@@ -37,7 +40,8 @@ type expertStack struct {
 	name             string
 	wShape, sShape   []int // of one expert
 	wBytes, sBytes   int
-	wBuf, sBuf       []byte // one expert's rows, reused
+	wBuf, sBuf, bBuf []byte       // one expert's rows, reused
+	sDType           engine.DType // of the scales (and the zero points)
 	readBytes, reads int64
 	readNanos        int64
 }
@@ -50,44 +54,66 @@ func (ld *loader) experts(prefix string, in int) *expertStack {
 	if ld.err != nil {
 		return nil
 	}
-	e := &expertStack{name: prefix}
-	wdt, ws, err := ld.st.Info(prefix + ".weight")
+	e := &expertStack{name: ld.name(prefix)}
+	wdt, ws, err := ld.st.Info(e.name + ".weight")
 	if err != nil {
 		ld.err = err
 		return nil
 	}
-	sdt, ss, err := ld.st.Info(prefix + ".scales")
+	sdt, ss, err := ld.st.Info(e.name + ".scales")
 	if err != nil {
 		ld.err = err
 		return nil
 	}
-	if wdt != "U32" || sdt != "U8" || len(ws) != 3 || len(ss) != 3 {
-		ld.err = fmt.Errorf("%s: weight %s %v and scales %s %v are not a stack of nvfp4 or mxfp8 experts", prefix, wdt, ws, sdt, ss)
-		return nil
-	}
-	if _, _, err := ld.st.Info(prefix + ".biases"); err == nil {
-		ld.err = fmt.Errorf("%s: experts quantized with zero points (affine) are not supported", prefix)
+	if wdt != "U32" || len(ws) != 3 || len(ss) != 3 {
+		ld.err = fmt.Errorf("%s: weight %s %v and scales %s %v are not a stack of quantized experts", e.name, wdt, ws, sdt, ss)
 		return nil
 	}
 	e.GroupSize = in / ss[2]
 	e.Bits = ws[2] * 32 / in
-	mode, ok := expertModes[[2]int{e.Bits, e.GroupSize}]
-	if !ok {
-		ld.err = fmt.Errorf("%s: %d-bit experts in groups of %d are in no format janis reads", prefix, e.Bits, e.GroupSize)
+	_, _, berr := ld.st.Info(e.name + ".biases")
+	switch {
+	case berr == nil && sdt != "U8":
+		e.Mode = "affine"
+	case berr != nil && sdt == "U8":
+		mode, ok := expertModes[[2]int{e.Bits, e.GroupSize}]
+		if !ok {
+			ld.err = fmt.Errorf("%s: %d-bit experts in groups of %d are in no format janis reads", e.name, e.Bits, e.GroupSize)
+			return nil
+		}
+		e.Mode = mode
+	default:
+		ld.err = fmt.Errorf("%s: scales of %s are neither an affine stack's nor a floating-point one's", e.name, sdt)
 		return nil
 	}
-	e.Mode = mode
+	var ok bool
+	if e.sDType, ok = map[string]engine.DType{"U8": engine.U8, "F32": engine.F32, "F16": engine.F16, "BF16": engine.BF16}[sdt]; !ok {
+		ld.err = fmt.Errorf("%s: scales of %s", e.name, sdt)
+		return nil
+	}
+	size := map[engine.DType]int{engine.U8: 1, engine.F32: 4, engine.F16: 2, engine.BF16: 2}[e.sDType]
 	e.wShape, e.sShape = ws[1:], ss[1:]
-	e.wBytes, e.sBytes = ws[1]*ws[2]*4, ss[1]*ss[2]
+	e.wBytes, e.sBytes = ws[1]*ws[2]*4, ss[1]*ss[2]*size
 	if ld.cfg.StreamExperts {
 		e.stream, e.cache, e.held = ld.st, ld.c.experts, map[int32]*cachedExpert{}
 	} else {
 		e.W, e.Scales = ld.tensor(prefix+".weight"), ld.tensor(prefix+".scales")
+		if e.Mode == "affine" {
+			e.Biases = ld.tensor(prefix + ".biases")
+		}
 	}
-	if _, _, err := ld.st.Info(prefix + ".global_scale"); err == nil {
+	if _, _, err := ld.st.Info(e.name + ".global_scale"); err == nil {
 		e.Global = ld.c.ScalarMul(ld.f32(prefix+".global_scale"), 1.0/nvfp4Unit)
 	}
 	return e
+}
+
+// matmul is x against the stack (w, scales, biases) by the stack's format.
+func (e *expertStack) matmul(c *ctx, x, w, scales, biases, idx engine.Tensor) engine.Tensor {
+	if e.Mode == "affine" {
+		return c.GatherQuantMatmul(x, w, scales, biases, idx, true, e.GroupSize, e.Bits)
+	}
+	return c.ops.GatherModeMatmul(x, w, scales, idx, e.GroupSize, e.Bits, e.Mode)
 }
 
 // expertCache keeps the experts read from disk on the device, the least
@@ -106,6 +132,7 @@ type cachedExpert struct {
 	stack     *expertStack
 	expert    int32
 	w, scales engine.Tensor // [1, out, in]
+	biases    engine.Tensor // affine stacks only
 	el        *list.Element
 }
 
@@ -128,28 +155,38 @@ func (e *expertStack) get(c *ctx, experts []int32) (map[int32]*cachedExpert, err
 	}
 	start := time.Now()
 	n := len(missing)
+	affine := e.Mode == "affine"
 	if cap(e.wBuf) < n*e.wBytes {
 		e.wBuf, e.sBuf = make([]byte, n*e.wBytes), make([]byte, n*e.sBytes)
+		if affine {
+			e.bBuf = make([]byte, n*e.sBytes)
+		}
 	}
-	errs := make([]error, 2*n)
+	errs := make([]error, 3*n)
 	sem := make(chan struct{}, expertReads)
 	var wg sync.WaitGroup
 	for i, x := range missing {
-		for j, read := range []func() error{
+		reads := []func() error{
 			func() error {
 				return e.stream.ReadStackedRow(e.name+".weight", int(x), e.wBuf[i*e.wBytes:(i+1)*e.wBytes])
 			},
 			func() error {
 				return e.stream.ReadStackedRow(e.name+".scales", int(x), e.sBuf[i*e.sBytes:(i+1)*e.sBytes])
 			},
-		} {
+		}
+		if affine {
+			reads = append(reads, func() error {
+				return e.stream.ReadStackedRow(e.name+".biases", int(x), e.bBuf[i*e.sBytes:(i+1)*e.sBytes])
+			})
+		}
+		for j, read := range reads {
 			wg.Add(1)
 			sem <- struct{}{}
 			go func(at int, read func() error) {
 				defer wg.Done()
 				errs[at] = read()
 				<-sem
-			}(2*i+j, read)
+			}(3*i+j, read)
 		}
 	}
 	wg.Wait()
@@ -166,10 +203,13 @@ func (e *expertStack) get(c *ctx, experts []int32) (map[int32]*cachedExpert, err
 		// FromRaw copies, so the buffers serve the next step.
 		ce := &cachedExpert{stack: e, expert: x,
 			w:      c.FromRaw(engine.U32, e.wBuf[i*e.wBytes:(i+1)*e.wBytes], append([]int{1}, e.wShape...)...),
-			scales: c.FromRaw(engine.U8, e.sBuf[i*e.sBytes:(i+1)*e.sBytes], append([]int{1}, e.sShape...)...),
+			scales: c.FromRaw(e.sDType, e.sBuf[i*e.sBytes:(i+1)*e.sBytes], append([]int{1}, e.sShape...)...),
+		}
+		if affine {
+			ce.biases = c.FromRaw(e.sDType, e.bBuf[i*e.sBytes:(i+1)*e.sBytes], append([]int{1}, e.sShape...)...)
 		}
 		if sw != nil { // a step's sweep must not free it
-			sw.Pin(ce.w, ce.scales)
+			sw.Pin(ce.w, ce.scales, ce.biases)
 		}
 		ce.el = e.cache.lru.PushFront(ce)
 		e.held[x] = ce
@@ -190,7 +230,7 @@ func (e *expertStack) get(c *ctx, experts []int32) (map[int32]*cachedExpert, err
 		delete(old.stack.held, old.expert)
 		e.cache.bytes -= int64(old.stack.wBytes + old.stack.sBytes)
 		if sw != nil {
-			sw.Unpin(old.w, old.scales)
+			sw.Unpin(old.w, old.scales, old.biases)
 		}
 	}
 	return out, nil
@@ -204,7 +244,7 @@ const expertReads = 8
 func (e *expertStack) forward(c *ctx, x engine.Tensor, r routed) engine.Tensor {
 	var y engine.Tensor
 	if e.stream == nil {
-		y = c.ops.GatherModeMatmul(x, e.W, e.Scales, r.idx, e.GroupSize, e.Bits, e.Mode)
+		y = e.matmul(c, x, e.W, e.Scales, e.Biases, r.idx)
 	} else {
 		held, err := e.get(c, r.experts)
 		if err != nil {
@@ -226,7 +266,7 @@ func (e *expertStack) forward(c *ctx, x engine.Tensor, r routed) engine.Tensor {
 				if s[2] > 1 {
 					xi = c.Slice(xi, 2, j, j+1)
 				}
-				yi := c.ops.GatherModeMatmul(c.Reshape(xi, 1, 1, 1, 1, in), ce.w, ce.scales, first, e.GroupSize, e.Bits, e.Mode)
+				yi := e.matmul(c, c.Reshape(xi, 1, 1, 1, 1, in), ce.w, ce.scales, ce.biases, first)
 				if row == nil {
 					row = yi
 				} else {
@@ -262,7 +302,7 @@ type routed struct {
 // are on disk: the rows to read must be known before the next operation.
 func (m *MoE) route(c *ctx, idx engine.Tensor) routed {
 	r := routed{idx: idx}
-	if m.GateUp.stream == nil {
+	if m.Down.stream == nil {
 		return r
 	}
 	r.ids = c.Ints(idx)
@@ -280,10 +320,12 @@ func (m *MoE) route(c *ctx, idx engine.Tensor) routed {
 // TopK best run, and their outputs are summed by score.
 type MoE struct {
 	RouterT, RouterBias engine.Tensor // float32 [hidden, experts], [experts]
-	GateUp, Down        *expertStack
-	TopK, Intermediate  int
-	GateCap, UpCap      float32
-	RouteScale          float32
+	// GateUp holds both projections, their output rows alternating gate,
+	// up; a checkpoint that keeps them apart has Gate and Up instead.
+	GateUp, Gate, Up, Down *expertStack
+	TopK, Intermediate     int
+	GateCap, UpCap         float32
+	RouteScale             float32
 }
 
 func loadMoE(c *ctx, st *safetensors.File, prefix string, cfg Config) (*MoE, error) {
@@ -296,7 +338,12 @@ func loadMoE(c *ctx, st *safetensors.File, prefix string, cfg Config) (*MoE, err
 		m.RouterT = c.Transpose(w, 1, 0)
 	}
 	m.RouterBias = ld.f32(prefix + ".gate.e_score_correction_bias")
-	m.GateUp = ld.experts(prefix+".experts.gate_up_proj", cfg.Hidden)
+	if cfg.AltLayout {
+		m.Gate = ld.experts(prefix+".experts.gate_proj", cfg.Hidden)
+		m.Up = ld.experts(prefix+".experts.up_proj", cfg.Hidden)
+	} else {
+		m.GateUp = ld.experts(prefix+".experts.gate_up_proj", cfg.Hidden)
+	}
 	m.Down = ld.experts(prefix+".experts.down_proj", cfg.Intermediate)
 	return m, ld.err
 }
@@ -313,11 +360,16 @@ func (m *MoE) Forward(c *ctx, x engine.Tensor) engine.Tensor {
 	weights = c.ops.Div(weights, c.ScalarAdd(c.sumLast(weights), 1e-20))
 	weights = c.ScalarMul(weights, m.RouteScale)
 
-	// gate_up's output rows alternate gate, up.
 	r := m.route(c, idx)
-	gu := c.Reshape(m.GateUp.forward(c, c.Reshape(x, 1, L, 1, 1, hidden), r), 1, L, k, I, 2)
-	gate := c.f32(c.Reshape(c.Slice(gu, 4, 0, 1), 1, L, k, 1, I))
-	up := c.f32(c.Reshape(c.Slice(gu, 4, 1, 2), 1, L, k, 1, I))
+	xe := c.Reshape(x, 1, L, 1, 1, hidden)
+	var gate, up engine.Tensor
+	if m.GateUp != nil {
+		gu := c.Reshape(m.GateUp.forward(c, xe, r), 1, L, k, I, 2)
+		gate = c.f32(c.Reshape(c.Slice(gu, 4, 0, 1), 1, L, k, 1, I))
+		up = c.f32(c.Reshape(c.Slice(gu, 4, 1, 2), 1, L, k, 1, I))
+	} else {
+		gate, up = c.f32(m.Gate.forward(c, xe, r)), c.f32(m.Up.forward(c, xe, r))
+	}
 	// SwiGLU with both branches softly capped: tanh(x/cap)*cap.
 	act := c.Mul(c.ScalarMul(c.Tanh(c.ScalarMul(gate, 1/m.GateCap)), m.GateCap), c.Sigmoid(gate))
 	act = c.Mul(act, c.ScalarMul(c.Tanh(c.ScalarMul(up, 1/m.UpCap)), m.UpCap))
@@ -331,18 +383,29 @@ func (m *MoE) Forward(c *ctx, x engine.Tensor) engine.Tensor {
 func ExpertBytes(st *safetensors.File) int64 {
 	var total int64
 	for _, name := range st.Names() {
-		if !strings.Contains(name, ".mlp.experts.") {
+		if !strings.Contains(name, ".mlp.experts.") && !strings.Contains(name, ".mlp.switch_mlp.") {
 			continue
 		}
 		dt, shape, err := st.Info(name)
 		if err != nil {
 			continue
 		}
-		n := int64(map[string]int{"U32": 4, "U8": 1, "F32": 4}[dt])
+		n := int64(map[string]int{"U32": 4, "U8": 1, "F32": 4, "F16": 2, "BF16": 2}[dt])
 		for _, d := range shape {
 			n *= int64(d)
 		}
 		total += n
 	}
 	return total
+}
+
+// stacks are the block's expert stacks.
+func (m *MoE) stacks() []*expertStack {
+	var out []*expertStack
+	for _, e := range []*expertStack{m.GateUp, m.Gate, m.Up, m.Down} {
+		if e != nil {
+			out = append(out, e)
+		}
+	}
+	return out
 }

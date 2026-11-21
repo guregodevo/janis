@@ -2,6 +2,7 @@ package inkling2
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/guregodevo/janis/engine"
 	"github.com/guregodevo/janis/qwen"
@@ -17,11 +18,62 @@ type loader struct {
 	err error
 }
 
+// altNames are the tensor names of the MLX-VLM layout (the netprojects
+// conversions), by the name of this package's own layout, the mlx-lm
+// one: the same tensors, renamed. Applied in order to a name's parts.
+var altNames = []struct{ from, to string }{
+	{"model.language_model.", "language_model.model."},
+	{".q_l2_clip.scale", ".q_scale"},
+	{".rel_l2_clip.scale", ".rel_scale"},
+	{".rel_logits_proj.proj", ".rel_proj"},
+	{".conv1d.weight", ".conv.weight"},
+	{".post_attention_convolution.", ".attn_sconv."},
+	{".post_mlp_convolution.", ".mlp_sconv."},
+	{".mlp.gate.weight", ".mlp.gate_weight"},
+	{".mlp.gate.e_score_correction_bias", ".mlp.e_score_correction_bias"},
+	{".q_message_gate.", ".controllers.attn."},
+	{".k_message_gate.", ".controllers.k."},
+	{".v_message_gate.", ".controllers.v."},
+	{".mlp_message_gate.", ".controllers.mlp."},
+	{".down_proj.weight", ".down_weight"},
+	{".forget_gate_proj.weight", ".forget_weight"},
+	{".message_gate_proj.weight", ".gain_weight"},
+	{".message_input.query", ".message_queries"},
+	{".mlp.experts.", ".mlp.switch_mlp."},
+	{"model.vision_tower.", "vision_tower."},
+	{".embeddings.position_embedding.weight", ".embeddings.position_embedding"},
+	{".merger.linear_1", ".proj_in"},
+	{".merger.linear_2", ".proj_out"},
+}
+
+// name is the checkpoint's name for a tensor of this package's layout.
+func (ld *loader) name(name string) string {
+	if !ld.cfg.AltLayout {
+		return name
+	}
+	if strings.HasPrefix(name, "lm_head") {
+		return "language_model." + name
+	}
+	gate := strings.Contains(name, "_message_gate.")
+	for _, r := range altNames {
+		if r.from == ".down_proj.weight" && !gate {
+			continue // an expert's down projection keeps its name
+		}
+		name = strings.Replace(name, r.from, r.to, 1)
+	}
+	return name
+}
+
+func (ld *loader) has(name string) bool {
+	_, _, err := ld.st.Info(ld.name(name))
+	return err == nil
+}
+
 func (ld *loader) tensor(name string) engine.Tensor {
 	if ld.err != nil {
 		return nil
 	}
-	t, err := qwen.LoadTensor(ld.c, ld.st, name)
+	t, err := qwen.LoadTensor(ld.c, ld.st, ld.name(name))
 	if err != nil {
 		ld.err = err
 		return nil
@@ -37,11 +89,38 @@ func (ld *loader) f32(name string) engine.Tensor {
 	return ld.c.f32(t)
 }
 
-func (ld *loader) linear(prefix string) *qwen.QuantLinear {
+// projection is a linear layer with no bias, quantized or kept as floats:
+// the conversions differ in which they quantize.
+type projection interface {
+	Forward(b engine.Backend, x engine.Tensor) engine.Tensor
+}
+
+type denseProjection struct{ wT engine.Tensor }
+
+func (d denseProjection) Forward(b engine.Backend, x engine.Tensor) engine.Tensor {
+	return b.MatMul(x, d.wT)
+}
+
+// bits reads a quantized tensor's bit width off its shapes: the packed
+// weight holds bits/32 of a word per input, the scales one per group.
+func (ld *loader) bits(prefix string) int {
+	_, w, err := ld.st.Info(ld.name(prefix + ".weight"))
+	_, sc, err2 := ld.st.Info(ld.name(prefix + ".scales"))
+	if err != nil || err2 != nil || len(w) == 0 || len(sc) == 0 {
+		return ld.cfg.Bits
+	}
+	in := sc[len(sc)-1] * ld.cfg.GroupSize
+	return w[len(w)-1] * 32 / in
+}
+
+func (ld *loader) linear(prefix string) projection {
 	if ld.err != nil {
 		return nil
 	}
-	l, err := qwen.LoadQuantLinear(ld.c, ld.st, prefix, ld.cfg.GroupSize, ld.cfg.Bits, false)
+	if !ld.has(prefix + ".scales") {
+		return denseProjection{wT: ld.dense(prefix + ".weight")}
+	}
+	l, err := qwen.LoadQuantLinear(ld.c, ld.st, ld.name(prefix), ld.cfg.GroupSize, ld.bits(prefix), false)
 	if err != nil {
 		ld.err = err
 		return nil

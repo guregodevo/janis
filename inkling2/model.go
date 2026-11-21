@@ -24,7 +24,7 @@ type Model struct {
 	MessageQueryT []engine.Tensor
 	FinalQueryT   engine.Tensor
 	Norm          *qwen.RMSNorm
-	Head          *qwen.QuantLinear
+	Head          projection
 
 	// images are the rows that stand in for the image tokens of the prompt
 	// being read, and imageAt the positions of those tokens, in order.
@@ -90,7 +90,11 @@ func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, erro
 	if !ok {
 		return nil, fmt.Errorf("%s needs operations this backend does not have; it runs on MLX (Apple Silicon)", cfg.ModelType)
 	}
-	dt, _, _, err := st.Get(prefix + "embed_norm.weight")
+	if _, _, err := st.Info("language_model.model.embed_norm.weight"); err == nil {
+		cfg.AltLayout = true
+	}
+	names := loader{st: st, cfg: cfg}
+	dt, _, err := st.Info(names.name(prefix + "embed_norm.weight"))
 	if err != nil {
 		return nil, err
 	}
@@ -120,10 +124,10 @@ func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, erro
 	}
 
 	m := &Model{Cfg: cfg, c: c}
-	if m.Embed, err = qwen.LoadQuantEmbedding(b, st, prefix+"embed_tokens", cfg.GroupSize, cfg.Bits); err != nil {
+	ld := loader{c: c, st: st, cfg: cfg}
+	if m.Embed, err = qwen.LoadQuantEmbedding(b, st, ld.name(prefix+"embed_tokens"), cfg.GroupSize, ld.bits(prefix+"embed_tokens")); err != nil {
 		return nil, err
 	}
-	ld := loader{c: c, st: st, cfg: cfg}
 	m.EmbedNorm = ld.norm(prefix + "embed_norm")
 	m.Norm = ld.norm(prefix + "norm")
 	m.FinalQueryT = ld.queries(prefix + "final_input.query")
@@ -247,7 +251,7 @@ func (m *Model) NewSession() *qwen.Session {
 func (m *Model) ExpertIO() (bytes int64, dur time.Duration) {
 	var nanos int64
 	for _, l := range m.Layers {
-		for _, e := range []*expertStack{l.MLP.GateUp, l.MLP.Down} {
+		for _, e := range l.MLP.stacks() {
 			bytes += e.readBytes
 			nanos += e.readNanos
 		}
