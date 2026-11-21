@@ -91,3 +91,41 @@ func TestInklingPromptIsWhatItsTemplateRenders(t *testing.T) {
 		}
 	}
 }
+
+// INKLING 2'S REPLY IS READ MESSAGE BY MESSAGE.
+//
+// The thinking goes apart, a call becomes the <tool_call> block the server
+// parses, the text stays. Token ids stand for their text here.
+func TestInklingReplyIsReadMessageByMessage(t *testing.T) {
+	m := InklingMarks{Model: 1, Thinking: 2, Text: 3, Call: 4, End: 5}
+	words := map[int32]string{
+		10: "The user asks.", 11: "Paris", 12: "read_file",
+		13: `{"name":"read_file","args":{"path":"go.mod"}}`, 14: "On it.", 15: `{"name":"read_`,
+	}
+	decode := func(ids []int32) string {
+		var b strings.Builder
+		for _, id := range ids {
+			b.WriteString(words[id])
+		}
+		return b.String()
+	}
+	call := "<tool_call>\n" + `{"name":"read_file","arguments":{"path":"go.mod"}}` + "\n</tool_call>"
+	for _, tc := range []struct {
+		name            string
+		ids             []int32
+		reply, thinking string
+	}{
+		{"thinking then text", []int32{1, 2, 10, 5, 1, 3, 11, 5}, "Paris", "The user asks."},
+		{"a thought still open", []int32{1, 2, 10}, "", "The user asks."},
+		{"text still open", []int32{1, 3, 11}, "Paris", ""},
+		{"a call", []int32{1, 12, 4, 13, 5}, call, ""},
+		{"text then a call", []int32{1, 3, 14, 5, 1, 12, 4, 13, 5}, "On it.\n" + call, ""},
+		{"a call still open says nothing", []int32{1, 3, 14, 5, 1, 12, 4, 15}, "On it.", ""},
+		{"nothing", nil, "", ""},
+	} {
+		reply, thinking := InklingReply(tc.ids, m, decode)
+		if reply != tc.reply || thinking != tc.thinking {
+			t.Errorf("%s: reply %q thinking %q, want %q and %q", tc.name, reply, thinking, tc.reply, tc.thinking)
+		}
+	}
+}

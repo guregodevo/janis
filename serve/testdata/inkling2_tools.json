@@ -1,0 +1,309 @@
+{
+ "tools_first_turn": {
+  "request": {
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file <from disk> & return it.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "now",
+      "description": "The time.",
+      "parameters": {
+       "type": "object",
+       "properties": {}
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Read go.mod"
+    }
+   ]
+  },
+  "want": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Read a file <from disk> & return it.\",\"name\":\"read_file\",\"parameters\":{\"properties\":{\"limit\":{\"type\":\"integer\"},\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"The time.\",\"name\":\"now\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Read go.mod<|end_message|>"
+ },
+ "tools_with_system": {
+  "request": {
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file <from disk> & return it.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "now",
+      "description": "The time.",
+      "parameters": {
+       "type": "object",
+       "properties": {}
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "Read go.mod"
+    }
+   ]
+  },
+  "want": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Read a file <from disk> & return it.\",\"name\":\"read_file\",\"parameters\":{\"properties\":{\"limit\":{\"type\":\"integer\"},\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"The time.\",\"name\":\"now\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Read go.mod<|end_message|>"
+ },
+ "call_and_result": {
+  "request": {
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file <from disk> & return it.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "now",
+      "description": "The time.",
+      "parameters": {
+       "type": "object",
+       "properties": {}
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "Read go.mod"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read_file",
+        "arguments": "{\"path\": \"go.mod\", \"limit\": 5}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "module x\n\ngo 1.24"
+    },
+    {
+     "role": "user",
+     "content": "And the time?"
+    }
+   ]
+  },
+  "want": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Read a file <from disk> & return it.\",\"name\":\"read_file\",\"parameters\":{\"properties\":{\"limit\":{\"type\":\"integer\"},\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"The time.\",\"name\":\"now\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Read go.mod<|end_message|><|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"limit\":5,\"path\":\"go.mod\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>read_file<|content_text|>module x\n\ngo 1.24<|end_message|><|message_user|><|content_text|>And the time?<|end_message|>"
+ },
+ "text_and_two_calls": {
+  "request": {
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file <from disk> & return it.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "now",
+      "description": "The time.",
+      "parameters": {
+       "type": "object",
+       "properties": {}
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Both"
+    },
+    {
+     "role": "assistant",
+     "content": "On it.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read_file",
+        "arguments": "{\"path\": \"a b.txt\", \"opts\": {\"z\": 1, \"a\": [1, 2]}}"
+       }
+      },
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "now",
+        "arguments": "{}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "A"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "content": "12:00"
+    }
+   ]
+  },
+  "want": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Read a file <from disk> & return it.\",\"name\":\"read_file\",\"parameters\":{\"properties\":{\"limit\":{\"type\":\"integer\"},\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"The time.\",\"name\":\"now\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Both<|end_message|><|message_model|><|content_text|>On it.<|end_message|><|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"opts\":{\"z\":1,\"a\":[1,2]},\"path\":\"a b.txt\"}}<|end_message|><|message_model|>now<|content_invoke_tool_json|>{\"name\":\"now\",\"args\":{}}<|end_message|><|content_model_end_sampling|><|message_tool|>read_file<|content_text|>A<|end_message|><|message_tool|>now<|content_text|>12:00<|end_message|>"
+ },
+ "code_in_arguments": {
+  "request": {
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file <from disk> & return it.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "now",
+      "description": "The time.",
+      "parameters": {
+       "type": "object",
+       "properties": {}
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write it"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read_file",
+        "arguments": "{\"path\": \"a.go\", \"content\": \"if a < b && c > d {\\n\\tprintln(\\\"x\\\\\\\\u003c\\\")\\n}\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "ok"
+    }
+   ]
+  },
+  "want": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Read a file <from disk> & return it.\",\"name\":\"read_file\",\"parameters\":{\"properties\":{\"limit\":{\"type\":\"integer\"},\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"The time.\",\"name\":\"now\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Write it<|end_message|><|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\",\"args\":{\"content\":\"if a < b && c > d {\\n\\tprintln(\\\"x\\\\\\\\u003c\\\")\\n}\",\"path\":\"a.go\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>read_file<|content_text|>ok<|end_message|>"
+ }
+}
