@@ -23,6 +23,8 @@ func stDType(s string) (engine.DType, error) {
 		return engine.I32, nil
 	case "U32":
 		return engine.U32, nil
+	case "U8":
+		return engine.U8, nil
 	default:
 		return 0, fmt.Errorf("unsupported safetensors dtype %q", s)
 	}

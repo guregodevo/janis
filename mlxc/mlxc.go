@@ -139,6 +139,8 @@ func mlxDType(dt engine.DType) C.mlx_dtype {
 		return C.MLX_INT32
 	case engine.U32:
 		return C.MLX_UINT32
+	case engine.U8:
+		return C.MLX_UINT8
 	default:
 		panic("mlxc: unsupported dtype")
 	}
@@ -347,14 +349,14 @@ func (b *Backend) Add(x, y engine.Tensor) engine.Tensor {
 	tx, ty := x.(*tensor), y.(*tensor)
 	out := C.mlx_array_new()
 	C.mlx_add(&out, tx.arr, ty.arr, b.stream)
-	return b.newT(out, cloneShape(tx.shape))
+	return b.newT(out, broadcastShapes(tx.shape, ty.shape))
 }
 
 func (b *Backend) Mul(x, y engine.Tensor) engine.Tensor {
 	tx, ty := x.(*tensor), y.(*tensor)
 	out := C.mlx_array_new()
 	C.mlx_multiply(&out, tx.arr, ty.arr, b.stream)
-	return b.newT(out, cloneShape(tx.shape))
+	return b.newT(out, broadcastShapes(tx.shape, ty.shape))
 }
 
 func (b *Backend) SiLU(x engine.Tensor) engine.Tensor {
@@ -720,8 +722,13 @@ func (b *Backend) Floats(t engine.Tensor) []float32 {
 	gpuMu.Lock()
 	defer gpuMu.Unlock()
 	tt := t.(*tensor)
+	cast := C.mlx_array_new()
+	C.mlx_astype(&cast, tt.arr, C.MLX_FLOAT32, b.stream)
+	defer C.mlx_array_free(cast)
+	// The buffer is read linearly, and a float32 slice along an inner axis
+	// is a strided view of its source (the cast above is then no copy).
 	f32 := C.mlx_array_new()
-	C.mlx_astype(&f32, tt.arr, C.MLX_FLOAT32, b.stream)
+	C.mlx_contiguous(&f32, cast, false, b.stream)
 	defer C.mlx_array_free(f32)
 	vec := C.mlx_vector_array_new()
 	defer C.mlx_vector_array_free(vec)
@@ -747,6 +754,8 @@ func (b *Backend) DTypeOf(t engine.Tensor) engine.DType {
 		return engine.I32
 	case C.MLX_UINT32:
 		return engine.U32
+	case C.MLX_UINT8:
+		return engine.U8
 	default:
 		panic("mlxc.DTypeOf: unsupported dtype")
 	}

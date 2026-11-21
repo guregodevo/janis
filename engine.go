@@ -15,6 +15,7 @@ import (
 	"github.com/guregodevo/janis/engine"
 	"github.com/guregodevo/janis/gemma"
 	"github.com/guregodevo/janis/grammar"
+	"github.com/guregodevo/janis/inkling2"
 	"github.com/guregodevo/janis/qwen"
 	"github.com/guregodevo/janis/qwen35"
 	"github.com/guregodevo/janis/safetensors"
@@ -104,6 +105,10 @@ type Engine struct {
 	tokTableOnce sync.Once
 	// q35 is the loaded Qwen3.5 text stack (nil for other families).
 	q35 *qwen35.Model
+	// hideOpen..hideClose bound the generated messages left out of a reply
+	// (see visible); hides is false for families with none.
+	hideOpen, hideClose int32
+	hides               bool
 
 	decideState
 }
@@ -111,8 +116,17 @@ type Engine struct {
 // Open loads the model from a local snapshot directory (config.json,
 // model.safetensors, tokenizer.json).
 func Open(modelDir string) (*Engine, error) {
-	cfg, err := qwen.LoadConfig(modelDir)
-	if err != nil {
+	// Inkling 2's config nests under text_config in a layout of its own; the
+	// shared loader refuses it, so it is read first.
+	var cfg qwen.Config
+	var ink inkling2.Config
+	var err error
+	if inkling2.Handles(inkling2.ModelType(modelDir)) {
+		if ink, err = inkling2.LoadConfig(modelDir); err != nil {
+			return nil, err
+		}
+		cfg = qwen.Config{ModelType: ink.ModelType, Vocab: ink.UnpaddedVocab, EosTokens: ink.EosTokens}
+	} else if cfg, err = qwen.LoadConfig(modelDir); err != nil {
 		return nil, err
 	}
 	e := &Engine{bk: newBackend(), mtype: cfg.ModelType, stops: map[int32]bool{}, vocab: cfg.Vocab, modelDir: modelDir}
@@ -144,6 +158,12 @@ func Open(modelDir string) (*Engine, error) {
 		}
 		sm = m
 		e.q35 = m
+	case inkling2.TypeLoop:
+		m, err := inkling2.LoadModel(b, st, ink)
+		if err != nil {
+			return nil, err
+		}
+		sm = m
 	default:
 		return nil, fmt.Errorf("unsupported model_type %q", cfg.ModelType)
 	}
@@ -163,10 +183,39 @@ func Open(modelDir string) (*Engine, error) {
 	for _, id := range cfg.EosTokens {
 		e.stops[id] = true
 	}
+	if inkling2.Handles(cfg.ModelType) {
+		open, end := e.tok.Encode(chat.InklingThinking), e.tok.Encode(chat.InklingEndMessage)
+		if len(open) == 1 && len(end) == 1 {
+			e.hideOpen, e.hideClose, e.hides = open[0], end[0], true
+		}
+	}
 	return e, nil
 }
 
-// ModelType reports the loaded architecture (qwen2/qwen3/qwen3_5/llama/gemma2).
+// visible is the part of the generated tokens that is the reply: all of
+// them, less the messages a family marks as not for the reader (Inkling 2's
+// thinking messages, whose markers decode to nothing and would leave the
+// thoughts in the answer). A message still open is left out to its end.
+func (e *Engine) visible(ids []int32) []int32 {
+	if !e.hides {
+		return ids
+	}
+	out := make([]int32, 0, len(ids))
+	hidden := false
+	for _, id := range ids {
+		switch {
+		case id == e.hideOpen:
+			hidden = true
+		case hidden && id == e.hideClose:
+			hidden = false
+		case !hidden:
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// ModelType reports the loaded architecture (qwen2/qwen3/qwen3_5/llama/gemma2/inkling2_loop).
 func (e *Engine) ModelType() string { return e.mtype }
 
 // ModelDir is the snapshot directory this engine's model loaded from — the
@@ -256,7 +305,7 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 		var emitted string
 		p.OnToken = func(tok int32) {
 			gen = append(gen, tok)
-			full := e.tok.Decode(gen)
+			full := e.tok.Decode(e.visible(gen))
 			if len(full) > len(emitted) {
 				onDelta(full[len(emitted):])
 				emitted = full
@@ -314,7 +363,7 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 		out = sess.Generate(e.bk, ids, maxTok, p)
 	}
 	mlxComputeMu.Unlock()
-	return e.tok.Decode(out)
+	return e.tok.Decode(e.visible(out))
 }
 
 // NumTokens returns the token count of text (for usage stats).

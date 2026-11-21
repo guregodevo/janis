@@ -113,6 +113,7 @@ fits.
 | Qwen2.5, Qwen3 and Llama, dense; Qwen3 MoE (Qwen3-Coder-30B-A3B) | `qwen` |
 | Qwen3.5 hybrid, Gated DeltaNet and attention (0.8B, 9B, Qwen3.8-27B) | `qwen35` |
 | Gemma 2 | `gemma` |
+| Inkling 2 Mini, text only (`Inkling-2-Mini-4bit`): looped decoder, MLX only | `inkling2` |
 | Whisper (speech to text), BGE (embeddings), a reranker | `whisper`, `bge`, `reranker`, from Go only |
 
 ## Serve
@@ -200,7 +201,7 @@ a seed, a cancel hook and the tool-call grammar.
 | `serve`, `cmd/janis` | the OpenAI endpoints over the engine (`janis serve`, `start`, `stop`, `restart`, `status`, `list`, `pull`) |
 | `janis` (the root package) | load a model, chat, stream, decide, swap the loaded model live |
 | `engine` | the tensor interface every backend implements |
-| `qwen`, `qwen35`, `gemma` | model families |
+| `qwen`, `qwen35`, `gemma`, `inkling2` | model families |
 | `whisper`, `bge`, `reranker` | speech to text, embeddings, reranking |
 | `grammar` | constrained decoding for tool calls |
 | `hostfit` | which model fits this host's RAM, and how well it will run |

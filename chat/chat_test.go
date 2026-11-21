@@ -1,6 +1,8 @@
 package chat
 
 import (
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -53,5 +55,39 @@ func TestChatmlHistoryAssistantTurnsMatchPriming(t *testing.T) {
 	turn2[1].Content = "<think>\nx\n</think>\n\nhello"
 	if got := ApplyTemplate("qwen3", turn2); strings.Count(got, "<think>") != 2 {
 		t.Errorf("existing think block double-primed: %q", got)
+	}
+}
+
+// INKLING 2'S PROMPT IS WHAT ITS OWN TEMPLATE RENDERS.
+//
+// testdata/inkling2_template.json holds, for a few conversations, the output
+// of the chat_template.jinja published with the checkpoints: with
+// reasoning_effort "none" (thinking off, janis's default) and with the
+// template's default effort (thinking on).
+func TestInklingPromptIsWhatItsTemplateRenders(t *testing.T) {
+	raw, err := os.ReadFile("testdata/inkling2_template.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases map[string]struct {
+		Messages []Message `json:"messages"`
+		None     string    `json:"none"`
+		Default  string    `json:"default"`
+	}
+	if err := json.Unmarshal(raw, &cases); err != nil {
+		t.Fatal(err)
+	}
+	if len(cases) == 0 {
+		t.Fatal("no cases")
+	}
+	for name, c := range cases {
+		t.Setenv("MLX_ENABLE_THINKING", "")
+		if got := ApplyTemplate("inkling2_loop", c.Messages); got != c.None {
+			t.Errorf("%s, thinking off:\n got %q\nwant %q", name, got, c.None)
+		}
+		t.Setenv("MLX_ENABLE_THINKING", "1")
+		if got := ApplyTemplate("inkling2_loop", c.Messages); got != c.Default {
+			t.Errorf("%s, thinking on:\n got %q\nwant %q", name, got, c.Default)
+		}
 	}
 }
