@@ -18,6 +18,9 @@ func thinkingEnabled() bool { return os.Getenv("MLX_ENABLE_THINKING") == "1" }
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// Images are the message's pictures, as the files' bytes (PNG, JPEG or
+	// GIF), for a family that sees (Inkling 2). They come before the text.
+	Images [][]byte `json:"-"`
 }
 
 // ApplyTemplate renders messages into the prompt for the given model_type, with

@@ -103,8 +103,49 @@ def build(dtype) -> inkling2.Model:
     return model
 
 
+VISION = {
+    "hidden_size": 32,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "native_patch_size": 2,
+    "adapter_merge_size": 2,
+    "posemb_grid_size": 4,
+    "projection_hidden_dim": 48,
+}
+
+
+def vision(here: Path) -> None:
+    """tiny-vision: the f32 model with a vision tower, an image of 8 by 12
+    pixels (2 by 3 image tokens), its rows and the logits of a prompt that
+    holds it."""
+    global CONFIG
+    text_only, CONFIG = CONFIG, {**CONFIG, "vision_config": VISION}
+    model = build(mx.float32)
+    config, CONFIG = CONFIG, text_only
+    out = here / "tiny-vision"
+    out.mkdir(exist_ok=True)
+    config = {**config, "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}}
+    (out / "config.json").write_text(json.dumps(config, indent=1) + "\n")
+    mx.save_safetensors(str(out / "model.safetensors"), dict(tree_flatten(model.parameters())))
+
+    mx.random.seed(1)
+    image = mx.random.uniform(-1, 1, shape=(3, 8, 12))
+    rows = model.encode_image(image)
+    token = config["image_token_id"]
+    tokens = mx.array([[5, 17] + [token] * rows.shape[0] + [3, 99, 42]])
+    expected = {
+        "pixels": image,
+        "image_rows": rows.astype(mx.float32),
+        "tokens": tokens[0].astype(mx.int32),
+        "logits": model(tokens, pixel_values=[image])[0],
+    }
+    mx.save_safetensors(str(out / "expected.safetensors"), expected)
+    print("vision", rows.shape, expected["logits"].shape)
+
+
 def main() -> None:
     here = Path(__file__).parent
+    vision(here)
     for name, dtype in (("f32", mx.float32), ("bf16", mx.bfloat16)):
         model = build(dtype)
         out = here / f"tiny-{name}"

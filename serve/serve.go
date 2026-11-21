@@ -14,6 +14,7 @@ package serve
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -348,6 +349,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		msgs := renderChat(req)
+		if err := s.checkImages(req, msgs); err != nil {
+			if st != nil {
+				st.send(map[string]any{"error": errorBody(http.StatusBadRequest, err.Error())})
+				return
+			}
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		id := "chatcmpl-" + fmt.Sprint(time.Now().UnixNano())
 		created := time.Now().Unix()
 		opts := llm.Options{Temp: float32(defaultTemp), TopP: float32(defaultTopP), MaxTokens: defaultMaxTokens}
@@ -624,7 +633,8 @@ func renderChat(req chatRequest) []llm.Message {
 			}
 			out = append(out, llm.Message{Role: "user", Content: body})
 		default:
-			out = append(out, llm.Message{Role: "user", Content: contentText(m.Content)})
+			images, _ := contentImages(m.Content)
+			out = append(out, llm.Message{Role: "user", Content: contentText(m.Content), Images: images})
 		}
 	}
 	return out
@@ -671,6 +681,70 @@ func contentText(raw json.RawMessage) string {
 		return b.String()
 	}
 	return string(raw)
+}
+
+// contentImages is the pictures of an OpenAI content field: the image_url
+// parts that carry their bytes (a data: URL, base64). janis fetches
+// nothing: a part with an address to fetch is an error.
+func contentImages(raw json.RawMessage) ([][]byte, error) {
+	var parts []struct {
+		Type     string          `json:"type"`
+		ImageURL json.RawMessage `json:"image_url"`
+	}
+	if json.Unmarshal(raw, &parts) != nil {
+		return nil, nil // a plain string
+	}
+	var out [][]byte
+	for _, p := range parts {
+		if p.Type != "image_url" && p.Type != "input_image" {
+			continue
+		}
+		var url string
+		var obj struct {
+			URL string `json:"url"`
+		}
+		if json.Unmarshal(p.ImageURL, &url) != nil {
+			_ = json.Unmarshal(p.ImageURL, &obj)
+			url = obj.URL
+		}
+		comma := strings.IndexByte(url, ',')
+		if !strings.HasPrefix(url, "data:") || comma < 0 || !strings.Contains(url[:comma], ";base64") {
+			return nil, fmt.Errorf("an image must be a base64 data: URL; janis fetches no address")
+		}
+		data, err := base64.StdEncoding.DecodeString(url[comma+1:])
+		if err != nil {
+			return nil, fmt.Errorf("an image's base64 does not decode: %v", err)
+		}
+		out = append(out, data)
+	}
+	return out, nil
+}
+
+// imageChecker is a model that can say whether it reads a request's
+// pictures; llm.Engine is one.
+type imageChecker interface {
+	CheckImages(msgs []llm.Message) error
+}
+
+// checkImages refuses a request whose pictures the loaded model cannot
+// read, before any token is generated.
+func (s *Server) checkImages(req chatRequest, msgs []llm.Message) error {
+	any := false
+	for _, m := range req.Messages {
+		images, err := contentImages(m.Content)
+		if err != nil {
+			return err
+		}
+		any = any || len(images) > 0
+	}
+	if !any {
+		return nil
+	}
+	c, ok := s.current.(imageChecker)
+	if !ok {
+		return fmt.Errorf("%s takes no images", s.name)
+	}
+	return c.CheckImages(msgs)
 }
 
 // parseCalls splits a reply into its text and its tool calls; a think block
