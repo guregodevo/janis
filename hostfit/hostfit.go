@@ -127,11 +127,24 @@ func (h Host) Rate(modelName string) Fit {
 // the active-expert count).
 var paramsRe = regexp.MustCompile(`(\d+(?:\.\d+)?)[Bb](?:[^a-zA-Z]|$)`)
 
+// namedParamsB are the parameter counts, in billions, of chat models whose
+// names carry none, by lower-case prefix. Inkling 2 Mini has 26.4B (3.4B
+// active a token): 16.1 GB at 4-bit, the size of Qwen3.8-27B.
+var namedParamsB = map[string]float64{
+	"inkling-2-mini": 26.4,
+}
+
 // ParamsB extracts a model's parameter count in billions from its name, or 0
 // when the name carries none.
 func ParamsB(name string) float64 {
 	m := paramsRe.FindStringSubmatch(name)
 	if m == nil {
+		lower := strings.ToLower(name)
+		for prefix, b := range namedParamsB {
+			if strings.HasPrefix(lower, prefix) {
+				return b
+			}
+		}
 		return 0
 	}
 	v, _ := strconv.ParseFloat(m[1], 64)
