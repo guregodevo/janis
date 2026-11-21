@@ -114,6 +114,8 @@ type Engine struct {
 	tokTableOnce sync.Once
 	// q35 is the loaded Qwen3.5 text stack (nil for other families).
 	q35 *qwen35.Model
+	// ink2 is the loaded Inkling 2 text stack (nil for other families).
+	ink2 *inkling2.Model
 	// ink holds Inkling 2's marker ids: its reply is a run of messages read
 	// by chat.InklingReply, not one text. Nil for the other families.
 	ink *chat.InklingMarks
@@ -168,11 +170,13 @@ func Open(modelDir string) (*Engine, error) {
 		e.q35 = m
 	case inkling2.TypeLoop:
 		ink.StreamExperts = streamExperts(inkling2.ExpertBytes(st))
+		ink.ExpertCacheBytes = expertCacheBytes()
 		m, err := inkling2.LoadModel(b, st, ink)
 		if err != nil {
 			return nil, err
 		}
 		sm = m
+		e.ink2 = m
 	default:
 		return nil, fmt.Errorf("unsupported model_type %q", cfg.ModelType)
 	}
@@ -229,6 +233,10 @@ func (e *Engine) ModelDir() string { return e.modelDir }
 // total bytes fetched and wall time blocked awaiting them. ok is false for
 // dense models, which have no streamed experts.
 func (e *Engine) ExpertIOStats() (bytes int64, dur time.Duration, ok bool) {
+	if e.ink2 != nil && e.ink2.Cfg.StreamExperts {
+		bytes, dur = e.ink2.ExpertIO()
+		return bytes, dur, true
+	}
 	if e.experts == nil {
 		return 0, 0, false
 	}
@@ -450,4 +458,22 @@ func streamExperts(expertBytes int64) bool {
 		return false
 	}
 	return expertBytes > int64(host.RAMGiB)<<30*6/10
+}
+
+// expertCacheBytes bounds the streamed experts kept on the device
+// (JANIS_MOE_CACHE_MB, as for the Qwen3 MoE store): three eighths of the
+// host's memory by default. The cache and the file cache share that
+// memory, and a miss is cheap only from the file cache. Measured on
+// Inkling-2-Mini-4bit, a 16 GB Mac, one 71-step request: 30 s with no
+// cache, 20 s at 1.5 GB, 26 s at 4 GB, 19 s at 6 GB, 17 s at 8 GB with
+// 1 GB more swap.
+func expertCacheBytes() int64 {
+	if mb, _ := strconv.Atoi(os.Getenv("JANIS_MOE_CACHE_MB")); mb > 0 {
+		return int64(mb) << 20
+	}
+	host, err := hostfit.Detect()
+	if err != nil {
+		return 2500 << 20
+	}
+	return int64(host.RAMGiB) << 30 * 3 / 8
 }

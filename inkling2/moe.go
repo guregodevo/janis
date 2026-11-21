@@ -1,9 +1,11 @@
 package inkling2
 
 import (
+	"container/list"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/guregodevo/janis/engine"
 	"github.com/guregodevo/janis/safetensors"
@@ -29,12 +31,15 @@ type expertStack struct {
 	GroupSize, Bits int
 	Mode            string
 
+	cache            *expertCache // of the experts read from disk
+	held             map[int32]*cachedExpert
 	stream           *safetensors.File
 	name             string
 	wShape, sShape   []int // of one expert
 	wBytes, sBytes   int
-	wBuf, sBuf       []byte // the rows of one step, reused
+	wBuf, sBuf       []byte // one expert's rows, reused
 	readBytes, reads int64
+	readNanos        int64
 }
 
 // expertModes are the formats by (bits, group size), as the reference tells
@@ -75,7 +80,7 @@ func (ld *loader) experts(prefix string, in int) *expertStack {
 	e.wShape, e.sShape = ws[1:], ss[1:]
 	e.wBytes, e.sBytes = ws[1]*ws[2]*4, ss[1]*ss[2]
 	if ld.cfg.StreamExperts {
-		e.stream = ld.st
+		e.stream, e.cache, e.held = ld.st, ld.c.experts, map[int32]*cachedExpert{}
 	} else {
 		e.W, e.Scales = ld.tensor(prefix+".weight"), ld.tensor(prefix+".scales")
 	}
@@ -85,27 +90,57 @@ func (ld *loader) experts(prefix string, in int) *expertStack {
 	return e
 }
 
-// expertReads bounds the rows read from disk at once.
-const expertReads = 8
+// expertCache keeps the experts read from disk on the device, the least
+// recently used going first once they pass its budget. Without it every
+// step read its experts again: 1.84 GB a token on the published model,
+// 44% of a request's time waiting for the reads and as much again
+// uploading them. It is one cache for the whole model: the budget is the
+// model's, and a layer whose routing varies more takes more of it.
+type expertCache struct {
+	budget, bytes int64
+	lru           *list.List // front: most recently used; of *cachedExpert
+	hits, misses  int64
+}
 
-// rows reads the experts' rows from disk into one stack on the device,
-// [len(experts), out, in], in the order given.
-func (e *expertStack) rows(c *ctx, experts []int32) (w, scales engine.Tensor, err error) {
-	n := len(experts)
+type cachedExpert struct {
+	stack     *expertStack
+	expert    int32
+	w, scales engine.Tensor // [1, out, in]
+	el        *list.Element
+}
+
+// get returns the experts' weights on the device, read from disk for the
+// ones the cache does not hold.
+func (e *expertStack) get(c *ctx, experts []int32) (map[int32]*cachedExpert, error) {
+	out := make(map[int32]*cachedExpert, len(experts))
+	var missing []int32
+	for _, x := range experts {
+		if ce, ok := e.held[x]; ok {
+			e.cache.lru.MoveToFront(ce.el)
+			e.cache.hits++
+			out[x] = ce
+		} else {
+			missing = append(missing, x)
+		}
+	}
+	if len(missing) == 0 {
+		return out, nil
+	}
+	start := time.Now()
+	n := len(missing)
 	if cap(e.wBuf) < n*e.wBytes {
 		e.wBuf, e.sBuf = make([]byte, n*e.wBytes), make([]byte, n*e.sBytes)
 	}
-	wBuf, sBuf := e.wBuf[:n*e.wBytes], e.sBuf[:n*e.sBytes]
 	errs := make([]error, 2*n)
 	sem := make(chan struct{}, expertReads)
 	var wg sync.WaitGroup
-	for i, x := range experts {
+	for i, x := range missing {
 		for j, read := range []func() error{
 			func() error {
-				return e.stream.ReadStackedRow(e.name+".weight", int(x), wBuf[i*e.wBytes:(i+1)*e.wBytes])
+				return e.stream.ReadStackedRow(e.name+".weight", int(x), e.wBuf[i*e.wBytes:(i+1)*e.wBytes])
 			},
 			func() error {
-				return e.stream.ReadStackedRow(e.name+".scales", int(x), sBuf[i*e.sBytes:(i+1)*e.sBytes])
+				return e.stream.ReadStackedRow(e.name+".scales", int(x), e.sBuf[i*e.sBytes:(i+1)*e.sBytes])
 			},
 		} {
 			wg.Add(1)
@@ -120,31 +155,92 @@ func (e *expertStack) rows(c *ctx, experts []int32) (w, scales engine.Tensor, er
 	wg.Wait()
 	for _, err := range errs {
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 	}
+	e.readNanos += time.Since(start).Nanoseconds()
 	e.reads += int64(n)
-	e.readBytes += int64(len(wBuf) + len(sBuf))
-	// FromRaw copies, so the buffers serve the next step.
-	w = c.FromRaw(engine.U32, wBuf, append([]int{n}, e.wShape...)...)
-	scales = c.FromRaw(engine.U8, sBuf, append([]int{n}, e.sShape...)...)
-	return w, scales, nil
+	e.readBytes += int64(n * (e.wBytes + e.sBytes))
+	sw, _ := c.Backend.(engine.Sweeper)
+	for i, x := range missing {
+		// FromRaw copies, so the buffers serve the next step.
+		ce := &cachedExpert{stack: e, expert: x,
+			w:      c.FromRaw(engine.U32, e.wBuf[i*e.wBytes:(i+1)*e.wBytes], append([]int{1}, e.wShape...)...),
+			scales: c.FromRaw(engine.U8, e.sBuf[i*e.sBytes:(i+1)*e.sBytes], append([]int{1}, e.sShape...)...),
+		}
+		if sw != nil { // a step's sweep must not free it
+			sw.Pin(ce.w, ce.scales)
+		}
+		ce.el = e.cache.lru.PushFront(ce)
+		e.held[x] = ce
+		e.cache.bytes += int64(e.wBytes + e.sBytes)
+		e.cache.misses++
+		out[x] = ce
+	}
+	// Evict past the budget, never what this step is about to use.
+	using := len(experts)
+	for e.cache.bytes > e.cache.budget && e.cache.lru.Len() > using {
+		old := e.cache.lru.Back().Value.(*cachedExpert)
+		if old.stack == e {
+			if _, mine := out[old.expert]; mine {
+				break
+			}
+		}
+		e.cache.lru.Remove(old.el)
+		delete(old.stack.held, old.expert)
+		e.cache.bytes -= int64(old.stack.wBytes + old.stack.sBytes)
+		if sw != nil {
+			sw.Unpin(old.w, old.scales)
+		}
+	}
+	return out, nil
 }
 
-// forward applies to each row of x [1, L, k, 1, in] the expert r
-// routes it to -> [1, L, k, 1, out], in the model dtype.
+// expertReads bounds the rows read from disk at once.
+const expertReads = 8
+
+// forward applies to each row of x [1, L, k, 1, in] the expert r routes it
+// to -> [1, L, k, 1, out], in the model dtype.
 func (e *expertStack) forward(c *ctx, x engine.Tensor, r routed) engine.Tensor {
-	w, scales, at := e.W, e.Scales, r.idx
-	if e.stream != nil {
-		var err error
-		if w, scales, err = e.rows(c, r.experts); err != nil {
+	var y engine.Tensor
+	if e.stream == nil {
+		y = c.ops.GatherModeMatmul(x, e.W, e.Scales, r.idx, e.GroupSize, e.Bits, e.Mode)
+	} else {
+		held, err := e.get(c, r.experts)
+		if err != nil {
 			// The file was read at the load; a row that cannot be read now
 			// is a disk failing under a running model.
 			panic(fmt.Sprintf("inkling2: %v", err))
 		}
-		at = r.local
+		// One product per routed row, each with its expert as a stack of
+		// one: nothing is copied to bring a step's experts together.
+		s := x.Shape()
+		L, k, in := s[1], r.idx.Shape()[2], s[4]
+		first := c.FromInt32([]int32{0}, 1, 1, 1)
+		var rows engine.Tensor
+		for l := 0; l < L; l++ {
+			var row engine.Tensor
+			for j := 0; j < k; j++ {
+				ce := held[r.ids[l*k+j]]
+				xi := c.Slice(x, 1, l, l+1)
+				if s[2] > 1 {
+					xi = c.Slice(xi, 2, j, j+1)
+				}
+				yi := c.ops.GatherModeMatmul(c.Reshape(xi, 1, 1, 1, 1, in), ce.w, ce.scales, first, e.GroupSize, e.Bits, e.Mode)
+				if row == nil {
+					row = yi
+				} else {
+					row = c.Concat(row, yi, 2)
+				}
+			}
+			if rows == nil {
+				rows = row
+			} else {
+				rows = c.Concat(rows, row, 1)
+			}
+		}
+		y = rows
 	}
-	y := c.ops.GatherModeMatmul(x, w, scales, at, e.GroupSize, e.Bits, e.Mode)
 	if e.Global == nil {
 		return y
 	}
@@ -155,12 +251,11 @@ func (e *expertStack) forward(c *ctx, x engine.Tensor, r routed) engine.Tensor {
 
 // routed is where a step's tokens were sent: idx [1, L, k] names an expert
 // of the layer for each of a token's k places. With the experts on disk,
-// experts lists the distinct ones, in the order of the stack read for the
-// step, and local is idx in that stack's numbering.
+// ids is idx read back and experts the distinct ones.
 type routed struct {
 	idx     engine.Tensor
+	ids     []int32
 	experts []int32
-	local   engine.Tensor
 }
 
 // route reads the router's choice back from the device when the experts
@@ -170,19 +265,14 @@ func (m *MoE) route(c *ctx, idx engine.Tensor) routed {
 	if m.GateUp.stream == nil {
 		return r
 	}
-	ids := c.Ints(idx)
-	at := map[int32]int32{}
-	local := make([]int32, len(ids))
-	for i, id := range ids {
-		slot, ok := at[id]
-		if !ok {
-			slot = int32(len(r.experts))
-			at[id] = slot
+	r.ids = c.Ints(idx)
+	seen := map[int32]bool{}
+	for _, id := range r.ids {
+		if !seen[id] {
+			seen[id] = true
 			r.experts = append(r.experts, id)
 		}
-		local[i] = slot
 	}
-	r.local = c.FromInt32(local, idx.Shape()...)
 	return r
 }
 

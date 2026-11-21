@@ -1,7 +1,9 @@
 package inkling2
 
 import (
+	"container/list"
 	"fmt"
+	"time"
 
 	"github.com/guregodevo/janis/engine"
 	"github.com/guregodevo/janis/qwen"
@@ -48,6 +50,9 @@ func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, erro
 		return nil, fmt.Errorf("embed_norm.weight is %s, not a float", dt)
 	}
 	c.one = b.FromFloats([]float32{1}, 1)
+	if cfg.StreamExperts {
+		c.experts = &expertCache{budget: cfg.ExpertCacheBytes, lru: list.New()}
+	}
 	for _, n := range []int{cfg.Hidden, cfg.HeadDim, cfg.SWAHeadDim} {
 		if c.ones[n] == nil {
 			ones := make([]float32, n)
@@ -178,4 +183,26 @@ func (m *Model) NewSession() *qwen.Session {
 		Forward:      m.forwardCachedT,
 		NewCache:     func(int) qwen.LayerCache { return &VisitCache{} },
 	}
+}
+
+// ExpertIO is what reading experts from disk has cost so far: bytes read
+// and the time spent waiting for them. Zero when the experts are resident.
+func (m *Model) ExpertIO() (bytes int64, dur time.Duration) {
+	var nanos int64
+	for _, l := range m.Layers {
+		for _, e := range []*expertStack{l.MLP.GateUp, l.MLP.Down} {
+			bytes += e.readBytes
+			nanos += e.readNanos
+		}
+	}
+	return bytes, time.Duration(nanos)
+}
+
+// ExpertCache is how the cache of streamed experts has served: the experts
+// found on the device, the ones read from disk, and the bytes it holds.
+func (m *Model) ExpertCache() (hits, misses, bytes int64) {
+	if m.c.experts == nil {
+		return 0, 0, 0
+	}
+	return m.c.experts.hits, m.c.experts.misses, m.c.experts.bytes
 }
