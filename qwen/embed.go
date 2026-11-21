@@ -87,3 +87,12 @@ func (e *QuantEmbedding) Forward(b engine.Backend, ids engine.Tensor) engine.Ten
 func (e *QuantEmbedding) AsLinear(b engine.Backend, x engine.Tensor) engine.Tensor {
 	return b.QuantMatmul(x, e.Weight, e.Scales, e.Biases, true, e.GroupSize, e.Bits)
 }
+
+// TensorFrom puts a tensor read from a safetensors file into the backend.
+func TensorFrom(b engine.Backend, e safetensors.Entry) (engine.Tensor, error) {
+	edt, err := stDType(e.Dtype)
+	if err != nil {
+		return nil, err
+	}
+	return b.FromRaw(edt, e.Raw, e.Shape...), nil
+}
