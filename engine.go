@@ -124,6 +124,7 @@ type Engine struct {
 	ink *chat.InklingMarks
 
 	decideState
+	editState
 }
 
 // Open loads the model from a local snapshot directory (config.json,
@@ -202,6 +203,10 @@ func Open(modelDir string) (*Engine, error) {
 		}
 	default:
 		return nil, fmt.Errorf("unsupported model_type %q", cfg.ModelType)
+	}
+	e.st = st
+	if pl, ok := sm.(paramLister); ok {
+		e.indexParams(pl.Params())
 	}
 	pinAll(e.bk) // protect the weights across requests (no-op on GC backends)
 	e.session = sm.NewSession()
@@ -435,7 +440,7 @@ func (e *Engine) SaveMainSession(path string) (int, error) {
 	mlxComputeMu.Lock()
 	defer mlxComputeMu.Unlock()
 	n := len(e.session.IDs)
-	if err := e.session.Save(e.bk, path, e.modelDir); err != nil {
+	if err := e.session.Save(e.bk, path, e.modelID()); err != nil {
 		return 0, err
 	}
 	if c := e.session.Caches[0].Len(); c < n {
@@ -451,7 +456,7 @@ func (e *Engine) SaveMainSession(path string) (int, error) {
 func (e *Engine) LoadMainSession(path string) (int, error) {
 	mlxComputeMu.Lock()
 	defer mlxComputeMu.Unlock()
-	return e.session.Restore(e.bk, path, e.modelDir)
+	return e.session.Restore(e.bk, path, e.modelID())
 }
 
 // Close releases the tokenizer and backend.
