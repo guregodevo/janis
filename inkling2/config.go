@@ -55,7 +55,10 @@ type Config struct {
 	// ones its tokens were routed to. Set by the caller before LoadModel,
 	// for a host with less memory than the model.
 	StreamExperts bool
-	EosTokens     []int32
+	// ExpertCacheBytes bounds the streamed experts kept on the device.
+	// Zero keeps a step's own and no more.
+	ExpertCacheBytes int64
+	EosTokens        []int32
 }
 
 type rawText struct {

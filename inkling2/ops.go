@@ -14,6 +14,8 @@ type ctx struct {
 	dtype engine.DType
 	one   engine.Tensor // [1] float32
 	ones  map[int]engine.Tensor
+
+	experts *expertCache // nil when the experts are resident
 }
 
 func (c *ctx) f32(x engine.Tensor) engine.Tensor   { return c.Cast(x, engine.F32) }
