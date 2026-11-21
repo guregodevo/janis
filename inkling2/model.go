@@ -26,6 +26,10 @@ type Model struct {
 	Norm          *qwen.RMSNorm
 	Head          projection
 
+	// draft is the draft head, nil without one: with it a session's caches
+	// end with a DraftCache and its decoding is speculative.
+	draft *Draft
+
 	// images are the rows that stand in for the image tokens of the prompt
 	// being read, and imageAt the positions of those tokens, in order.
 	images  engine.Tensor
@@ -164,6 +168,24 @@ func (m *Model) hidden(ids engine.Tensor, L, pos int, caches []qwen.LayerCache, 
 		trace(-1, h)
 	}
 
+	// The draft head reads the model's state entering some visits, and the
+	// final one.
+	var dc *DraftCache
+	var taps []engine.Tensor
+	if m.draft != nil && len(caches) == cfg.Visits()+1 {
+		dc, _ = caches[cfg.Visits()].(*DraftCache)
+	}
+	tap := func(visit int, h engine.Tensor) {
+		if dc == nil {
+			return
+		}
+		for _, t := range m.draft.Cfg.Targets {
+			if t == visit {
+				taps = append(taps, h)
+			}
+		}
+	}
+
 	visit := 0
 	var blocks []engine.Tensor
 	run := func(from, to int, bank []engine.Tensor, last engine.Tensor) {
@@ -172,6 +194,7 @@ func (m *Model) hidden(ids engine.Tensor, L, pos int, caches []qwen.LayerCache, 
 			if last != nil {
 				messages = c.depthAttention(bank, last, m.MessageQueryT[i-from])
 			}
+			tap(visit, h)
 			h, blocks = m.Layers[i].Forward(c, h, blocks, caches[visit].(*VisitCache), pos, messages, masks)
 			if trace != nil {
 				trace(visit, h)
@@ -200,7 +223,16 @@ func (m *Model) hidden(ids engine.Tensor, L, pos int, caches []qwen.LayerCache, 
 	run(cfg.CoreEnd, cfg.Layers, nil, nil)
 
 	out := c.pick(c.depthAttention(blocks, c.rms(c.f32(h), defaultEps), m.FinalQueryT), 0)
-	return c.model(m.Norm.Forward(c, out))
+	final := c.model(m.Norm.Forward(c, out))
+	tap(visit, final)
+	if dc != nil && len(taps) == len(m.draft.Cfg.Targets) {
+		states := taps[0]
+		for _, t := range taps[1:] {
+			states = c.Concat(states, t, 2)
+		}
+		dc.record(c, states)
+	}
+	return final
 }
 
 // logits is the head: the softly capped scores of the real vocabulary.
@@ -211,6 +243,11 @@ func (m *Model) logits(h engine.Tensor) engine.Tensor {
 		out = c.ScalarMul(c.Tanh(c.ScalarMul(out, 1/cap)), cap)
 	}
 	return c.Slice(out, 2, 0, m.Cfg.UnpaddedVocab)
+}
+
+// forwardAllT is forwardCachedT for every position: [1, seqLen, vocab].
+func (m *Model) forwardAllT(_ engine.Backend, ids engine.Tensor, seqLen, offset int, caches []qwen.LayerCache) engine.Tensor {
+	return m.logits(m.hidden(ids, seqLen, offset, caches, nil))
 }
 
 // forwardCachedT is the session's ForwardFunc: the logits [1, 1, vocab] of
@@ -237,13 +274,25 @@ func (m *Model) NewSession() *qwen.Session {
 	if m.Cfg.StreamExperts {
 		chunk = 1
 	}
-	return &qwen.Session{
+	s := &qwen.Session{
 		PrefillChunk: chunk,
 		NLayers:      m.Cfg.Visits(),
 		Vocab:        m.Cfg.UnpaddedVocab,
 		Forward:      m.forwardCachedT,
 		NewCache:     func(int) qwen.LayerCache { return &VisitCache{} },
 	}
+	if m.draft != nil {
+		visits := m.Cfg.Visits()
+		s.NLayers = visits + 1
+		s.NewCache = func(i int) qwen.LayerCache {
+			if i == visits {
+				return &DraftCache{}
+			}
+			return &VisitCache{}
+		}
+		s.Speculator, s.ForwardAll = m.draft, m.forwardAllT
+	}
+	return s
 }
 
 // ExpertIO is what reading experts from disk has cost so far: bytes read

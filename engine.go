@@ -178,6 +178,21 @@ func Open(modelDir string) (*Engine, error) {
 		if err != nil {
 			return nil, err
 		}
+		// The draft head is used when asked for: its checkpoint is 0.64 GB
+		// more in memory.
+		if os.Getenv("JANIS_DRAFT") == "1" {
+			dcfg, ok, err := inkling2.LoadDraftConfig(modelDir, ink)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return nil, fmt.Errorf("JANIS_DRAFT=1: %s has no %s or no mtp_config", modelDir, inkling2.DraftFile)
+			}
+			if err := m.LoadDraft(modelDir, dcfg); err != nil {
+				return nil, fmt.Errorf("the draft head: %w", err)
+			}
+			m.SetDraftCount(envInt("JANIS_DRAFT_TOKENS", 3))
+		}
 		sm = m
 		e.ink2 = m
 		if vcfg, ok, err := inkling2.LoadVisionConfig(modelDir); err != nil {
@@ -609,4 +624,10 @@ func (e *Engine) loadTower() error {
 	}
 	v.tower = tower
 	return nil
+}
+
+// DraftStats is how the main session's draft head has done: the tokens it
+// proposed and the ones the model kept. Zero without a draft head.
+func (e *Engine) DraftStats() (drafted, accepted int) {
+	return e.session.Drafted, e.session.Accepted
 }

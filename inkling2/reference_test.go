@@ -217,6 +217,9 @@ func TestTheSessionReturnsToAMark(t *testing.T) {
 	third := append(append([]int32{}, shared...), 77, 78)
 
 	s := m.NewSession()
+	// Read four tokens a pass: a cache can be cut back inside its last pass,
+	// and the prompts part before it.
+	s.PrefillChunk = 4
 	s.Prefill(b, first, nil)
 	s.Prefill(b, second, nil) // parts at 11: read again from 0, marked at 11
 	if got := s.Marks(); len(got) != 1 || got[0] != len(shared) {
@@ -355,6 +358,115 @@ func TestTheOtherLayoutGivesTheReferenceLogits(t *testing.T) {
 		_, scale := maxDiff(full, full)
 		if d, _ := maxDiff(got, full); d > 5e-4*scale {
 			t.Errorf("experts on disk %v: logits off by %.3g (largest value %.3g)", stream, d, scale)
+		}
+	}
+}
+
+// TOKENS READ IN ONE PASS CAN BE TAKEN BACK.
+//
+// Eight tokens are read at once, as a run of drafted tokens is, and the
+// caches cut back to the first three of them. Reading on from there gives
+// the logits of one pass over the true tokens: the keys, the sliding
+// window and the four convolution tails are those of token 9.
+func TestTokensReadInOnePassCanBeTakenBack(t *testing.T) {
+	b, m, want := tiny(t, "f32")
+	ids := wantTokens(t, want)
+	full := wantFloats(t, want, "logits")
+	vocab := m.Cfg.UnpaddedVocab
+	_, scale := maxDiff(full, full)
+
+	caches := m.newCaches()
+	m.hidden(b.FromInt32(ids[:6], 6), 6, 0, caches, nil)
+	wrong := append(append([]int32{}, ids[6:9]...), 1, 2, 3, 4, 5) // three true, five not
+	m.hidden(b.FromInt32(wrong, 8), 8, 6, caches, nil)
+	for _, c := range caches {
+		if !c.CanTruncate(9) {
+			t.Fatal("a cache cannot be cut back inside the last pass")
+		}
+		c.Truncate(b, 9)
+		if c.Len() != 9 {
+			t.Fatalf("a cache holds %d tokens after the cut, want 9", c.Len())
+		}
+	}
+	rest := ids[9:]
+	got := b.Floats(m.logits(m.hidden(b.FromInt32(rest, len(rest)), len(rest), 9, caches, nil)))
+	if d, _ := maxDiff(got, full[9*vocab:]); d > 2e-4*scale {
+		t.Errorf("after the cut the logits are off by %.3g (largest value %.3g)", d, scale)
+	}
+	if caches[0].CanTruncate(5) {
+		t.Error("a cache claims it can be cut back inside an older pass")
+	}
+}
+
+// oracle drafts from a list of what comes next, right or wrong.
+type oracle struct {
+	next  []int32 // the reference's tokens, in order
+	wrong func(i int) bool
+	at    int
+	runs  []int
+}
+
+func (o *oracle) Propose(_ engine.Backend, tok int32, _ []qwen.LayerCache) []int32 {
+	// tok is next[at-1], or the first token when at is 0.
+	for o.at < len(o.next) && o.next[o.at] != tok {
+		o.at++
+	}
+	o.at++
+	var out []int32
+	for i := o.at; i < len(o.next) && len(out) < 5; i++ {
+		t := o.next[i]
+		if o.wrong != nil && o.wrong(i) {
+			t = (t + 1) % 100
+		}
+		out = append(out, t)
+	}
+	o.runs = append(o.runs, len(out))
+	return out
+}
+
+// DRAFTED TOKENS, RIGHT OR WRONG, LEAVE THE REPLY AS IT WAS.
+//
+// The session reads a run of drafts in one pass and keeps those the model
+// would have sampled. With every draft right, some wrong, or all wrong,
+// it generates the reference's 16 tokens, and its caches end holding
+// exactly the tokens read.
+func TestDraftsLeaveTheReplyAsItWas(t *testing.T) {
+	for name, wrong := range map[string]func(int) bool{
+		"all right":         nil,
+		"every third wrong": func(i int) bool { return i%3 == 2 },
+		"all wrong":         func(int) bool { return true },
+	} {
+		b, m, want := tiny(t, "f32")
+		ids := wantTokens(t, want)[:8]
+		_, _, raw, err := want.Get("greedy")
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantGen := make([]int32, len(raw)/4)
+		for i := range wantGen {
+			wantGen[i] = int32(binary.LittleEndian.Uint32(raw[i*4:]))
+		}
+		s := m.NewSession()
+		o := &oracle{next: wantGen, wrong: wrong}
+		s.Speculator, s.ForwardAll = o, m.forwardAllT
+		gen := s.Generate(b, ids, len(wantGen), qwen.SampleParams{})
+		if fmt.Sprint(gen) != fmt.Sprint(wantGen) {
+			t.Errorf("%s: generated %v, the reference %v", name, gen, wantGen)
+		}
+		// The last token sampled is never read.
+		if got, read := s.Caches[0].Len(), len(ids)+len(wantGen)-1; got != read {
+			t.Errorf("%s: the caches hold %d tokens, %d were read", name, got, read)
+		}
+		if name == "all right" && len(o.runs) > 4 {
+			t.Errorf("with every draft right the model was asked %d times for 16 tokens", len(o.runs))
+		}
+		// A second turn on the same session reads on from these caches.
+		more := append(append(append([]int32{}, ids...), gen...), 7, 9)
+		got := s.Prefill(b, more, nil)
+		fresh := m.NewSession().Prefill(b, more, nil)
+		_, scale := maxDiff(fresh, fresh)
+		if d, _ := maxDiff(got, fresh); d > 2e-4*scale {
+			t.Errorf("%s: the next turn's logits are off by %.3g (largest value %.3g)", name, d, scale)
 		}
 	}
 }

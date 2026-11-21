@@ -94,7 +94,7 @@ func (a *Attention) dynamicConv(c *ctx, x, in, static engine.Tensor, dyn project
 	}
 	out = c.Add(c.Reshape(out, 1, L, H*D), c.f32(x))
 	out = c.ScalarMul(out, float32(1/math.Sqrt(float64(2*K+1))))
-	return c.model(out), c.tailOf(window, K)
+	return c.model(out), window
 }
 
 // Forward runs attention for L new tokens at positions pos.. on the query,
@@ -103,13 +103,16 @@ func (a *Attention) dynamicConv(c *ctx, x, in, static engine.Tensor, dyn project
 func (a *Attention) Forward(c *ctx, qIn, kIn, vIn engine.Tensor, cache *VisitCache, pos int, masks *maskMaker, eps float32) engine.Tensor {
 	L, H, G, D := qIn.Shape()[1], a.Heads, a.KVHeads, a.HeadDim
 	var keys, values engine.Tensor
+	var kWin, vWin engine.Tensor
 	if a.Window > 0 {
-		keys, cache.Conv[0] = c.shortConv(a.K.Forward(c, kIn), a.KConv, cache.Conv[0])
-		values, cache.Conv[1] = c.shortConv(a.V.Forward(c, vIn), a.VConv, cache.Conv[1])
+		keys, kWin = c.shortConv(a.K.Forward(c, kIn), a.KConv, cache.Conv[0])
+		values, vWin = c.shortConv(a.V.Forward(c, vIn), a.VConv, cache.Conv[1])
 	} else {
-		keys, cache.Conv[0] = a.dynamicConv(c, a.K.Forward(c, kIn), kIn, a.KStatic, a.KDyn, cache.Conv[0])
-		values, cache.Conv[1] = a.dynamicConv(c, a.V.Forward(c, vIn), vIn, a.VStatic, a.VDyn, cache.Conv[1])
+		keys, kWin = a.dynamicConv(c, a.K.Forward(c, kIn), kIn, a.KStatic, a.KDyn, cache.Conv[0])
+		values, vWin = a.dynamicConv(c, a.V.Forward(c, vIn), vIn, a.VStatic, a.VDyn, cache.Conv[1])
 	}
+	cache.slide(c, 0, kWin, a.Kernel)
+	cache.slide(c, 1, vWin, a.Kernel)
 	gate := a.Gate.Forward(c, qIn)
 	sinks := a.Sink.Forward(c, qIn) // [1, L, H]
 

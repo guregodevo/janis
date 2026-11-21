@@ -50,6 +50,17 @@ type Session struct {
 	// layer; hybrid architectures (qwen3_5) supply their own per-layer mix.
 	NewCache func(layer int) LayerCache
 
+	// Speculator, with ForwardAll, turns on speculative decoding: after
+	// each token the speculator drafts the next few, the model reads them
+	// in one pass, and the session keeps the drafts the model would have
+	// sampled itself and takes the rest back. The reply is the one plain
+	// decoding gives. ForwardAll is Forward for every position:
+	// [1, seqLen, vocab]. Both nil (the default) leave decoding as it was.
+	Speculator Speculator
+	ForwardAll ForwardFunc
+	// Drafted and Accepted count the tokens proposed and the ones kept.
+	Drafted, Accepted int
+
 	IDs    []int32 // tokens currently materialized in the caches
 	Caches []LayerCache
 
@@ -135,6 +146,14 @@ func (s *Session) mark(n int) {
 	}
 }
 
+// Speculator drafts tokens for a session to verify.
+type Speculator interface {
+	// Propose returns the tokens expected after tok, which the session has
+	// sampled and not yet read; none is a valid answer. caches are the
+	// session's, holding every token before tok.
+	Propose(b engine.Backend, tok int32, caches []LayerCache) []int32
+}
+
 func (s *Session) newCache(layer int) LayerCache {
 	if s.NewCache != nil {
 		return s.NewCache(layer)
@@ -185,6 +204,12 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 	P := lcp(s.IDs, newIDs)
 	if P > len(newIDs)-1 {
 		P = len(newIDs) - 1
+	}
+	// A reply cut at its token limit ends on a token recorded and never
+	// read: the caches are one short of the ids, and the prefix reused is
+	// what the caches hold. Reading on from the ids skipped that token.
+	if s.Caches != nil && P > prevLen {
+		P = prevLen
 	}
 	// want is where to mark during this prefill, 0 for nowhere: the point
 	// the prompts parted when no cache could return to it, so the next
@@ -367,6 +392,26 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 
 	var gen []int32
 	var logits engine.Tensor
+	// A verified run: rows are the logits after each drafted token still
+	// unread, drafts the tokens they were computed on, and valid the number
+	// of tokens the caches hold that the reply has confirmed.
+	var rows [][]float32
+	var drafts []int32
+	valid := offset
+	cut := func() {
+		// Take back what was read past the confirmed tokens.
+		if cachedLen(s.Caches) > valid {
+			prev := cacheTensors(s.Caches)
+			for _, c := range s.Caches {
+				c.Truncate(b, valid)
+			}
+			if sw != nil {
+				pinCaches(sw, s.Caches)
+				unpinGone(sw, prev, cacheTensors(s.Caches))
+			}
+		}
+		rows, drafts = nil, nil
+	}
 	for {
 		if p.Stop[tok] {
 			break
@@ -384,22 +429,55 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 		if p.Cancel != nil && p.Cancel() {
 			break
 		}
-		prev := cacheTensors(s.Caches)
-		logits = s.Forward(b, b.FromInt32([]int32{tok}, 1), 1, offset, s.Caches)
-		if sw != nil {
-			// Swept before the eval, as in prefill: MLX frees and reuses each
-			// intermediate once its last consumer has run.
-			sw.Pin(logits)
-			pinCaches(sw, s.Caches)
-			unpinGone(sw, prev, cacheTensors(s.Caches))
-			sw.Sweep()
+		var floats []float32
+		if len(rows) > 0 {
+			// tok was drafted and read already: its logits are here.
+			floats, rows = rows[0], rows[1:]
+			valid++
+			s.Accepted++
+		} else {
+			cut()
+			block := []int32{tok}
+			if s.Speculator != nil && s.ForwardAll != nil {
+				drafts = s.Speculator.Propose(b, tok, s.Caches)
+				s.Drafted += len(drafts)
+				block = append(block, drafts...)
+			}
+			prev := cacheTensors(s.Caches)
+			if len(block) == 1 {
+				logits = s.Forward(b, b.FromInt32(block, 1), 1, valid, s.Caches)
+			} else {
+				logits = s.ForwardAll(b, b.FromInt32(block, len(block)), len(block), valid, s.Caches)
+			}
+			if sw != nil {
+				// Swept before the eval, as in prefill: MLX frees and reuses each
+				// intermediate once its last consumer has run.
+				sw.Pin(logits)
+				pinCaches(sw, s.Caches)
+				unpinGone(sw, prev, cacheTensors(s.Caches))
+				sw.Sweep()
+			}
+			all := b.Floats(logits)
+			if sw != nil {
+				sw.Unpin(logits)
+			}
+			width := len(all) / len(block)
+			floats = all[:width]
+			for i := 1; i < len(block); i++ {
+				rows = append(rows, all[i*width:(i+1)*width])
+			}
+			valid++
 		}
-		tok = sampleToken(b.Floats(logits), p, rng, gen)
-		if sw != nil {
-			sw.Unpin(logits)
+		tok = sampleToken(floats, p, rng, gen)
+		// The rows left were computed on the drafts: they hold only while
+		// the model's own token is the drafted one.
+		if len(rows) > 0 {
+			if at := len(drafts) - len(rows); tok != drafts[at] {
+				cut()
+			}
 		}
-		offset++
 	}
+	cut()
 
 	s.IDs = append(append([]int32(nil), newIDs...), gen...)
 	return gen

@@ -255,6 +255,7 @@ func loadLayer(c *ctx, st *safetensors.File, i int, cfg Config) (*Layer, error) 
 // the new stream and block outputs.
 func (l *Layer) Forward(c *ctx, h engine.Tensor, blocks []engine.Tensor, cache *VisitCache, pos int, messages engine.Tensor, masks *maskMaker) (engine.Tensor, []engine.Tensor) {
 	eps := masks.cfg.Eps
+	cache.begin(h.Shape()[1])
 	hf := c.f32(h)
 	normed := c.rms(hf, defaultEps)
 
@@ -282,7 +283,8 @@ func (l *Layer) Forward(c *ctx, h engine.Tensor, blocks []engine.Tensor, cache *
 		k, v = q, q
 	}
 	a := l.Attn.Forward(c, q, k, v, cache, pos, masks, eps)
-	a, cache.Conv[2] = c.shortConv(a, l.AttnConv, cache.Conv[2])
+	a, win := c.shortConv(a, l.AttnConv, cache.Conv[2])
+	cache.slide(c, 2, win, masks.cfg.ConvKernel)
 
 	residual := c.f32(a)
 	if l.Boundary {
@@ -296,7 +298,8 @@ func (l *Layer) Forward(c *ctx, h engine.Tensor, blocks []engine.Tensor, cache *
 		x = l.MLPGate.Forward(c, x, c.pick(messages, 3))
 	}
 	x = l.MLP.Forward(c, c.model(l.PostNorm.Forward(c, x)))
-	x, cache.Conv[3] = c.shortConv(x, l.MLPConv, cache.Conv[3])
+	x, win = c.shortConv(x, l.MLPConv, cache.Conv[3])
+	cache.slide(c, 3, win, masks.cfg.ConvKernel)
 	cache.steps += h.Shape()[1]
 	return c.model(c.Add(residual, c.f32(x))), blocks
 }
