@@ -113,7 +113,7 @@ fits.
 | Qwen2.5, Qwen3 and Llama, dense; Qwen3 MoE (Qwen3-Coder-30B-A3B) | `qwen` |
 | Qwen3.5 hybrid, Gated DeltaNet and attention (0.8B, 9B, Qwen3.8-27B) | `qwen35` |
 | Gemma 2 | `gemma` |
-| Inkling 2 Mini, text only (`Inkling-2-Mini-4bit`): looped decoder, MLX only; on a host with less memory than the model the experts are read from disk | `inkling2` |
+| Inkling 2 Mini, text and images (`Inkling-2-Mini-4bit`): looped decoder, MLX only; on a host with less memory than the model the experts are read from disk | `inkling2` |
 | Whisper (speech to text), BGE (embeddings), a reranker | `whisper`, `bge`, `reranker`, from Go only |
 
 ## Serve

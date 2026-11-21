@@ -3,6 +3,7 @@ package inkling2
 import (
 	"container/list"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/guregodevo/janis/engine"
@@ -25,7 +26,62 @@ type Model struct {
 	Norm          *qwen.RMSNorm
 	Head          *qwen.QuantLinear
 
+	// images are the rows that stand in for the image tokens of the prompt
+	// being read, and imageAt the positions of those tokens, in order.
+	images  engine.Tensor
+	imageAt []int
+
 	c *ctx
+}
+
+// SetImages gives the rows [n, hidden] to read in place of the embeddings
+// of the tokens at positions (ascending, n of them) of the prompts read
+// from now on; nil rows clears them. The rows live until the next call.
+func (m *Model) SetImages(rows engine.Tensor, positions []int) {
+	sw, _ := m.c.Backend.(engine.Sweeper)
+	if sw != nil && m.images != nil {
+		sw.Unpin(m.images)
+	}
+	m.images, m.imageAt = rows, positions
+	if sw != nil && rows != nil {
+		sw.Pin(rows)
+	}
+}
+
+// splice replaces, in the embeddings h of the tokens at pos.., the rows of
+// the image tokens.
+func (m *Model) splice(h engine.Tensor, pos, L int) engine.Tensor {
+	c := m.c
+	first := sort.SearchInts(m.imageAt, pos)
+	if m.images == nil || first == len(m.imageAt) || m.imageAt[first] >= pos+L {
+		return h
+	}
+	var out engine.Tensor
+	add := func(piece engine.Tensor) {
+		if out == nil {
+			out = piece
+		} else {
+			out = c.Concat(out, piece, 1)
+		}
+	}
+	at := 0 // tokens of h already placed
+	for k := first; k < len(m.imageAt) && m.imageAt[k] < pos+L; {
+		run := k
+		for run+1 < len(m.imageAt) && m.imageAt[run+1] == m.imageAt[run]+1 && m.imageAt[run+1] < pos+L {
+			run++
+		}
+		i := m.imageAt[k] - pos
+		if i > at {
+			add(c.Slice(h, 1, at, i))
+		}
+		n := run - k + 1
+		add(c.model(c.Reshape(c.Slice(m.images, 0, k, k+n), 1, n, m.Cfg.Hidden)))
+		at, k = i+n, run+1
+	}
+	if at < L {
+		add(c.Slice(h, 1, at, L))
+	}
+	return out
 }
 
 // LoadModel loads the text stack. The backend must have engine.LoopOps.
@@ -99,6 +155,7 @@ func (m *Model) hidden(ids engine.Tensor, L, pos int, caches []qwen.LayerCache, 
 	c, cfg := m.c, m.Cfg
 	masks := &maskMaker{c: c, cfg: cfg}
 	h := m.EmbedNorm.Forward(c, c.Reshape(m.Embed.Forward(c, ids), 1, L, cfg.Hidden))
+	h = m.splice(h, pos, L)
 	if trace != nil {
 		trace(-1, h)
 	}

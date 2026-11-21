@@ -18,6 +18,7 @@ const (
 	InklingText       = "<|content_text|>"
 	InklingCall       = "<|content_invoke_tool_json|>"
 	InklingEndMessage = "<|end_message|>"
+	InklingImage      = "<|unused_200054|>"
 	inklingEndTurn    = "<|content_model_end_sampling|>"
 )
 
@@ -142,7 +143,14 @@ func inkling(msgs []Message, effort string) string {
 			if m.Role == "tool" {
 				role = "<|message_tool|>"
 			}
-			message(role, InklingText, m.Content)
+			// One token an image here; the engine repeats it once for each
+			// block of the picture.
+			for range m.Images {
+				message(role, "<|content_image|>", InklingImage)
+			}
+			if m.Content != "" || len(m.Images) == 0 {
+				message(role, InklingText, m.Content)
+			}
 		}
 	}
 	state()

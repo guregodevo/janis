@@ -4,6 +4,7 @@
 package llm
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"strconv"
@@ -116,6 +117,8 @@ type Engine struct {
 	q35 *qwen35.Model
 	// ink2 is the loaded Inkling 2 text stack (nil for other families).
 	ink2 *inkling2.Model
+	// vision is set for a model with a vision tower (nil otherwise).
+	vision *visionState
 	// ink holds Inkling 2's marker ids: its reply is a run of messages read
 	// by chat.InklingReply, not one text. Nil for the other families.
 	ink *chat.InklingMarks
@@ -177,6 +180,11 @@ func Open(modelDir string) (*Engine, error) {
 		}
 		sm = m
 		e.ink2 = m
+		if vcfg, ok, err := inkling2.LoadVisionConfig(modelDir); err != nil {
+			return nil, err
+		} else if ok {
+			e.vision = &visionState{cfg: vcfg, st: st, seen: map[*qwen.Session]string{}}
+		}
 	default:
 		return nil, fmt.Errorf("unsupported model_type %q", cfg.ModelType)
 	}
@@ -281,6 +289,10 @@ func (e *Engine) ChatUtil(msgs []Message, opts Options) string {
 
 func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *qwen.Session) string {
 	ids := e.tok.Encode(chat.ApplyTemplateEffort(e.mtype, msgs, opts.ReasoningEffort))
+	var images [][]byte
+	for _, m := range msgs {
+		images = append(images, m.Images...)
+	}
 
 	maxTok := opts.MaxTokens
 	if maxTok <= 0 {
@@ -370,6 +382,9 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 	}
 
 	mlxComputeMu.Lock()
+	if e.vision != nil {
+		ids = e.see(sess, ids, images)
+	}
 	// Generate-nothing calls (KV warmup, MaxTokens<=1) always prefill chunked:
 	// chunk=128 fetches each MoE layer's expert union once per chunk (~30%
 	// faster prefill, measured 2.5 vs 1.9 tok/s cold on Qwen3-30B-A3B), and
@@ -382,6 +397,10 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 		withGenerateNothingChunking(sess, func() { out = sess.Generate(e.bk, ids, maxTok, p) })
 	} else {
 		out = sess.Generate(e.bk, ids, maxTok, p)
+	}
+	if e.vision != nil {
+		// The next prompt read may be another session's, with no pictures.
+		e.ink2.SetImages(nil, nil)
 	}
 	mlxComputeMu.Unlock()
 	text, _ := e.reply(out)
@@ -476,4 +495,100 @@ func expertCacheBytes() int64 {
 		return 2500 << 20
 	}
 	return int64(host.RAMGiB) << 30 * 3 / 8
+}
+
+// visionState is a model's vision tower, loaded when the first image
+// comes, and what each session's prompt last held.
+type visionState struct {
+	cfg   inkling2.VisionConfig
+	st    *safetensors.File
+	tower *inkling2.Vision
+	// seen is, by session, the digests of the images of its last prompt.
+	// Two prompts with the same tokens and other pictures share no prefix.
+	seen map[*qwen.Session]string
+}
+
+// CheckImages says why the messages' images cannot be read by this model,
+// nil when they can (or there are none).
+func (e *Engine) CheckImages(msgs []Message) error {
+	for _, m := range msgs {
+		for i, img := range m.Images {
+			if e.vision == nil {
+				return fmt.Errorf("%s takes no images", e.mtype)
+			}
+			if _, _, _, err := inkling2.PrepareImage(img, e.vision.cfg.Block()); err != nil {
+				return fmt.Errorf("image %d of a %s message: %w", i+1, m.Role, err)
+			}
+		}
+	}
+	return nil
+}
+
+// see encodes the prompt's images and tells the model where they go: each
+// image token of ids becomes one token for every block of its picture, and
+// the model reads the picture's rows at those places. An image that cannot
+// be read loses its token. The session forgets its prefix when the
+// pictures before it changed. Called with the compute lock held.
+func (e *Engine) see(sess *qwen.Session, ids []int32, images [][]byte) []int32 {
+	v := e.vision
+	key := ""
+	for _, img := range images {
+		key += fmt.Sprintf("%x.", sha256.Sum256(img))
+	}
+	if prev := v.seen[sess]; !strings.HasPrefix(key, prev) {
+		sess.IDs = nil
+	}
+	v.seen[sess] = key
+	if len(images) == 0 {
+		e.ink2.SetImages(nil, nil)
+		return ids
+	}
+	if v.tower == nil {
+		tower, err := e.ink2.LoadVision(v.st, v.cfg)
+		if err != nil {
+			e.ink2.SetImages(nil, nil)
+			return ids
+		}
+		if sw, ok := e.bk.(engine.Sweeper); ok {
+			sw.PinAll() // the tower's weights, like the model's at the load
+		}
+		v.tower = tower
+	}
+	out := make([]int32, 0, len(ids))
+	var rows engine.Tensor
+	var at []int
+	next := 0
+	for _, id := range ids {
+		if id != v.cfg.ImageToken {
+			out = append(out, id)
+			continue
+		}
+		if next >= len(images) {
+			continue
+		}
+		img := images[next]
+		next++
+		pixels, h, w, err := inkling2.PrepareImage(img, v.cfg.Block())
+		if err != nil {
+			continue
+		}
+		r, err := v.tower.Encode(pixels, h, w)
+		if err != nil {
+			continue
+		}
+		for i := 0; i < r.Shape()[0]; i++ {
+			at = append(at, len(out))
+			out = append(out, id)
+		}
+		if rows == nil {
+			rows = r
+		} else {
+			rows = e.bk.Concat(rows, r, 0)
+		}
+	}
+	if rows != nil {
+		e.bk.Eval(rows)
+	}
+	e.ink2.SetImages(rows, at)
+	return out
 }
