@@ -70,6 +70,14 @@ type Options struct {
 	// cannot answer in prose or a ```json fence. Only meaningful with ToolCallGrammar
 	// and tools present; set it for a turn where a tool call is expected.
 	ForceToolCall bool
+	// OnReasoning, if set, hears the model's thinking as it comes, for a
+	// family that writes it apart from the reply (Inkling 2). The reply
+	// never carries it.
+	OnReasoning func(delta string)
+	// ReasoningEffort names how much to think, for a family that takes it
+	// (Inkling 2: none, minimal, low, medium, high, xhigh, max). "" is the
+	// family's default.
+	ReasoningEffort string
 	// OnToken, if set, observes every committed token (id and its decoded text,
 	// which is empty for special tokens). Diagnostic hook: callers use it to
 	// reconstruct WHAT a model emitted when the decoded reply is empty or
@@ -106,10 +114,9 @@ type Engine struct {
 	tokTableOnce sync.Once
 	// q35 is the loaded Qwen3.5 text stack (nil for other families).
 	q35 *qwen35.Model
-	// hideOpen..hideClose bound the generated messages left out of a reply
-	// (see visible); hides is false for families with none.
-	hideOpen, hideClose int32
-	hides               bool
+	// ink holds Inkling 2's marker ids: its reply is a run of messages read
+	// by chat.InklingReply, not one text. Nil for the other families.
+	ink *chat.InklingMarks
 
 	decideState
 }
@@ -186,35 +193,29 @@ func Open(modelDir string) (*Engine, error) {
 		e.stops[id] = true
 	}
 	if inkling2.Handles(cfg.ModelType) {
-		open, end := e.tok.Encode(chat.InklingThinking), e.tok.Encode(chat.InklingEndMessage)
-		if len(open) == 1 && len(end) == 1 {
-			e.hideOpen, e.hideClose, e.hides = open[0], end[0], true
+		var m chat.InklingMarks
+		for marker, id := range map[string]*int32{
+			chat.InklingModel: &m.Model, chat.InklingThinking: &m.Thinking, chat.InklingText: &m.Text,
+			chat.InklingCall: &m.Call, chat.InklingEndMessage: &m.End,
+		} {
+			ids := e.tok.Encode(marker)
+			if len(ids) != 1 {
+				return nil, fmt.Errorf("%s: the tokenizer has no single token for %s", modelDir, marker)
+			}
+			*id = ids[0]
 		}
+		e.ink = &m
 	}
 	return e, nil
 }
 
-// visible is the part of the generated tokens that is the reply: all of
-// them, less the messages a family marks as not for the reader (Inkling 2's
-// thinking messages, whose markers decode to nothing and would leave the
-// thoughts in the answer). A message still open is left out to its end.
-func (e *Engine) visible(ids []int32) []int32 {
-	if !e.hides {
-		return ids
+// reply is the generated tokens as text, and the thinking apart for a
+// family that writes it as a message of its own.
+func (e *Engine) reply(ids []int32) (text, reasoning string) {
+	if e.ink == nil {
+		return e.tok.Decode(ids), ""
 	}
-	out := make([]int32, 0, len(ids))
-	hidden := false
-	for _, id := range ids {
-		switch {
-		case id == e.hideOpen:
-			hidden = true
-		case hidden && id == e.hideClose:
-			hidden = false
-		case !hidden:
-			out = append(out, id)
-		}
-	}
-	return out
+	return chat.InklingReply(ids, *e.ink, e.tok.Decode)
 }
 
 // ModelType reports the loaded architecture (qwen2/qwen3/qwen3_5/llama/gemma2/inkling2_loop).
@@ -271,7 +272,7 @@ func (e *Engine) ChatUtil(msgs []Message, opts Options) string {
 }
 
 func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *qwen.Session) string {
-	ids := e.tok.Encode(chat.ApplyTemplate(e.mtype, msgs))
+	ids := e.tok.Encode(chat.ApplyTemplateEffort(e.mtype, msgs, opts.ReasoningEffort))
 
 	maxTok := opts.MaxTokens
 	if maxTok <= 0 {
@@ -290,6 +291,12 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 		RepeatPenalty: repeatPenalty,
 		RepeatLastN:   repeatLastN,
 	}
+	if e.ink != nil {
+		// Inkling 2 writes a call as a message of its own, which the reply
+		// reader turns into the <tool_call> block: the grammar of that block
+		// would forbid what the model was trained to write.
+		opts.ToolCallGrammar = false
+	}
 	if opts.ToolCallGrammar {
 		// A fresh grammar per generation (it carries per-turn state). It decodes
 		// candidate tokens via the O(1) token table (built once) and constrains the
@@ -302,15 +309,19 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 		}
 	}
 
-	if onDelta != nil {
+	if onDelta != nil || opts.OnReasoning != nil {
 		var gen []int32
-		var emitted string
+		var emitted, thought string
 		p.OnToken = func(tok int32) {
 			gen = append(gen, tok)
-			full := e.tok.Decode(e.visible(gen))
-			if len(full) > len(emitted) {
+			full, thinking := e.reply(gen)
+			if onDelta != nil && len(full) > len(emitted) {
 				onDelta(full[len(emitted):])
 				emitted = full
+			}
+			if opts.OnReasoning != nil && len(thinking) > len(thought) {
+				opts.OnReasoning(thinking[len(thought):])
+				thought = thinking
 			}
 		}
 	}
@@ -365,7 +376,8 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 		out = sess.Generate(e.bk, ids, maxTok, p)
 	}
 	mlxComputeMu.Unlock()
-	return e.tok.Decode(e.visible(out))
+	text, _ := e.reply(out)
+	return text
 }
 
 // NumTokens returns the token count of text (for usage stats).

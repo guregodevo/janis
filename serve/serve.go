@@ -273,6 +273,9 @@ type chatRequest struct {
 	MaxTokens           int             `json:"max_tokens"`
 	MaxCompletionTokens int             `json:"max_completion_tokens"`
 	Seed                *uint64         `json:"seed"`
+	// ReasoningEffort is how much the model may think (none, minimal, low,
+	// medium, high, xhigh, max), for a family that takes it.
+	ReasoningEffort string `json:"reasoning_effort"`
 }
 
 type streamOptions struct {
@@ -345,6 +348,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		msgs := renderChat(req)
+		id := "chatcmpl-" + fmt.Sprint(time.Now().UnixNano())
+		created := time.Now().Unix()
 		opts := llm.Options{Temp: float32(defaultTemp), TopP: float32(defaultTopP), MaxTokens: defaultMaxTokens}
 		if req.Temperature != nil {
 			opts.Temp = float32(*req.Temperature)
@@ -368,6 +373,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			opts.ToolCallGrammar = true
 			opts.ForceToolCall = string(req.ToolChoice) == `"required"`
 		}
+		opts.ReasoningEffort = req.ReasoningEffort
+		// A family that thinks in a message of its own (Inkling 2) hands the
+		// thinking over apart from the reply: it goes out as
+		// reasoning_content, as it comes when the answer is streamed.
+		var reasoning strings.Builder
+		opts.OnReasoning = func(d string) {
+			reasoning.WriteString(d)
+			if req.Stream && st != nil {
+				st.send(map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": s.name,
+					"choices": []map[string]any{{"index": 0, "delta": map[string]any{"reasoning_content": d}, "finish_reason": nil}}})
+			}
+		}
 		if traceTokens {
 			opts.OnToken = func(id int32, text string) { s.logf("token %d %q", id, text) }
 		}
@@ -375,8 +392,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		for _, m := range msgs {
 			inTokens += s.current.NumTokens(m.Content)
 		}
-		id := "chatcmpl-" + fmt.Sprint(time.Now().UnixNano())
-		created := time.Now().Unix()
 		if !req.Stream {
 			reply := s.current.ChatStream(msgs, opts, nil)
 			if ctx.Err() != nil {
@@ -391,6 +406,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			u := usage{PromptTokens: inTokens, CompletionTokens: s.current.NumTokens(reply)}
 			u.TotalTokens = u.PromptTokens + u.CompletionTokens
 			msg := map[string]any{"role": "assistant", "content": text}
+			if reasoning.Len() > 0 {
+				msg["reasoning_content"] = reasoning.String()
+			}
 			if len(calls) > 0 {
 				msg["tool_calls"] = calls
 			}
