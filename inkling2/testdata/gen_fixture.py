@@ -241,10 +241,76 @@ def alt_layout(here: Path) -> None:
     print("alt", len(out), "tensors", expected["logits"].shape)
 
 
+DRAFT = {
+    "hidden_size": 64,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "intermediate_size": 96,
+    "sliding_window_size": 4,
+    "local_layer_ids": [0],
+    "block_size": 4,
+    "markov_rank": 8,
+    "markov_head_type": "rnn_hidden",
+    "target_layer_ids": [2, 7, 14],
+    "rope_theta": 10000.0,
+    "rms_norm_eps": 1e-6,
+}
+
+
+def draft(here: Path) -> None:
+    """tiny-draft/mtp.safetensors: a draft head of random weights for the
+    f32 model, in the names and shapes of the published one. Its proposals
+    mean nothing; the test is that they change nothing."""
+    mx.random.seed(2)
+    d = DRAFT
+    H, r, V = d["hidden_size"], d["markov_rank"], TEXT["vocab_size"]
+    q, kv = d["num_attention_heads"] * d["head_dim"], d["num_key_value_heads"] * d["head_dim"]
+    w = lambda *shape: mx.random.normal(shape) * shape[-1] ** -0.5
+    norm = lambda n: 1 + 0.1 * mx.random.normal((n,))
+    out = {
+        "norm.weight": norm(H),
+        "mask_embed": w(H),
+        "fuse_weight": mx.random.normal((d["num_hidden_layers"] + 1, len(d["target_layer_ids"]))),
+        "markov_head.markov_w1.weight": w(V, r),
+        "markov_head.rnn_proj.weight": w(3 * r, 2 * r + 2 * H),
+        "markov_head.rnn_proj.bias": w(3 * r),
+        "markov_head.hidden_out.weight": w(H, r),
+        "markov_head.hidden_out.bias": w(H),
+        "markov_head.dflare_norm.weight": norm(H),
+    }
+    for i in range(d["num_hidden_layers"]):
+        p = f"layers.{i}."
+        out |= {
+            p + "input_layernorm.weight": norm(H),
+            p + "post_attention_layernorm.weight": norm(H),
+            p + "dflare_norm.weight": norm(H),
+            p + "self_attn.q_proj.weight": w(q, H),
+            p + "self_attn.k_proj.weight": w(kv, H),
+            p + "self_attn.v_proj.weight": w(kv, H),
+            p + "self_attn.k_proj_ctx.weight": w(kv, H),
+            p + "self_attn.v_proj_ctx.weight": w(kv, H),
+            p + "self_attn.o_proj.weight": w(H, q),
+            p + "self_attn.q_norm.weight": norm(d["head_dim"]),
+            p + "self_attn.k_norm.weight": norm(d["head_dim"]),
+            p + "self_attn.k_norm_ctx.weight": norm(d["head_dim"]),
+            p + "mlp.gate_proj.weight": w(d["intermediate_size"], H),
+            p + "mlp.up_proj.weight": w(d["intermediate_size"], H),
+            p + "mlp.down_proj.weight": w(H, d["intermediate_size"]),
+        }
+    dest = here / "tiny-draft"
+    dest.mkdir(exist_ok=True)
+    (dest / "mtp_config.json").write_text(json.dumps(DRAFT, indent=1) + "\n")
+    mx.save_safetensors(str(dest / "mtp.safetensors"), out)
+    print("draft", len(out), "tensors")
+
+
 def main() -> None:
     here = Path(__file__).parent
     vision(here)
     alt_layout(here)
+    draft(here)
     for name, dtype in (("f32", mx.float32), ("bf16", mx.bfloat16)):
         model = build(dtype)
         out = here / f"tiny-{name}"

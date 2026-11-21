@@ -74,13 +74,14 @@ func (c *ctx) depthAttention(blocks []engine.Tensor, current, queryT engine.Tens
 // shortConv is the static short convolution: a causal depthwise filter over
 // the last kernel inputs, added to the input. x is [1, L, C] in the model
 // dtype, w [C, K, 1], tail the last K-1 inputs of the steps before (nil at
-// the start). It returns the output and the new tail.
+// the start). It returns the output and the whole input it read, tail
+// first.
 func (c *ctx) shortConv(x, w, tail engine.Tensor) (engine.Tensor, engine.Tensor) {
 	k := w.Shape()[1]
 	window := c.convWindow(x, tail, k)
 	out := c.f32(c.Conv1dDepthwise(c.model(window), w))
 	out = c.ScalarMul(c.Add(out, c.f32(x)), float32(1/math.Sqrt(float64(k+1))))
-	return c.model(out), c.tailOf(window, k)
+	return c.model(out), window
 }
 
 func (c *ctx) convWindow(x, tail engine.Tensor, k int) engine.Tensor {
@@ -89,9 +90,4 @@ func (c *ctx) convWindow(x, tail engine.Tensor, k int) engine.Tensor {
 		tail = c.FromFloats(make([]float32, (k-1)*ch), 1, k-1, ch)
 	}
 	return c.Concat(tail, c.f32(x), 1)
-}
-
-func (c *ctx) tailOf(window engine.Tensor, k int) engine.Tensor {
-	n := window.Shape()[1]
-	return c.Slice(window, 1, n-(k-1), n)
 }
