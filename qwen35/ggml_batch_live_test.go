@@ -254,3 +254,99 @@ func TestRecordedBatchedDecodeSpeedOnGGML(t *testing.T) {
 		d.Settle()
 	}
 }
+
+// GREEDY REPLIES DECODED TOGETHER ARE THE REPLIES DECODED ALONE.
+//
+// Three prompts decode 32 tokens greedily, each on its own session one
+// token at a time, and together through a BatchDecoder; at step 12 the
+// second leaves the batch (its caches taken back, Settle first), and the
+// other two go on as a batch of two. Both read the caches padded and
+// masked the same way (JANIS_GGML_PADDECODE), so the tokens must agree.
+// JANIS_GGML_REPLAY is the caller's: run it with 0 and 1.
+func TestGreedyRepliesDecodedTogetherAreTheRepliesAloneOnGGML(t *testing.T) {
+	t.Setenv("JANIS_GGML_PADDECODE", "1")
+	b, m := ggmlModel(t)
+	prompts := [][]int32{{785, 6722, 315, 9625, 374}, {9707, 11, 1879}, {40, 1079, 264, 2632, 315, 279, 1879, 13}}
+	const steps, leaveAt = 32, 12
+	argmax := func(v []float32) int32 {
+		best := 0
+		for i := range v {
+			if v[i] > v[best] {
+				best = i
+			}
+		}
+		return int32(best)
+	}
+	alone := make([][]int32, len(prompts))
+	aloneLogits := make([][][]float32, len(prompts))
+	for j, p := range prompts {
+		s := m.NewSession()
+		logits := s.Prefill(b, p, nil)
+		tok, off := argmax(logits), len(p)
+		for n := 0; n < steps; n++ {
+			alone[j] = append(alone[j], tok)
+			l := b.Floats(m.forwardCachedT(b, b.FromInt32([]int32{tok}, 1), 1, off, s.Caches))
+			aloneLogits[j] = append(aloneLogits[j], l)
+			tok = argmax(l)
+			off++
+		}
+	}
+	caches := make([][]qwen.LayerCache, len(prompts))
+	offsets := make([]int, len(prompts))
+	toks := make([]int32, len(prompts))
+	for j, p := range prompts {
+		s := m.NewSession()
+		toks[j], caches[j], offsets[j] = argmax(s.Prefill(b, p, nil)), s.Caches, len(p)
+	}
+	rows := []int{0, 1, 2}
+	together := make([][]int32, len(prompts))
+	d := m.NewBatchDecoder()
+	for n := 0; n < steps; n++ {
+		if n == leaveAt {
+			d.Settle()
+			for _, c := range caches[1] { // conversation 1 leaves: its caches back as its own
+				switch c := c.(type) {
+				case *LinearCache:
+					c.own()
+				case *qwen.KVCache:
+					c.Own()
+				}
+			}
+			rows = []int{0, 2}
+		}
+		ids := make([]int32, len(rows))
+		offs := make([]int, len(rows))
+		cs := make([][]qwen.LayerCache, len(rows))
+		for i, j := range rows {
+			together[j] = append(together[j], toks[j])
+			ids[i], offs[i], cs[i] = toks[j], offsets[j], caches[j]
+		}
+		got := d.Step(b, ids, offs, cs)
+		V := len(got) / len(rows)
+		for i, j := range rows {
+			row := got[i*V : (i+1)*V]
+			if toks[j] == alone[j][n] {
+				maxDiff := 0.0
+				for k := range row {
+					maxDiff = math.Max(maxDiff, math.Abs(float64(row[k]-aloneLogits[j][n][k])))
+				}
+				if maxDiff > 0 {
+					t.Logf("step %d, conversation %d (row %d of %d): max |diff| %.4f", n, j, i, len(rows), maxDiff)
+				}
+			}
+			toks[j] = argmax(row)
+			offsets[j]++
+		}
+	}
+	for j := range prompts {
+		n := len(together[j])
+		same := 0
+		for same < n && together[j][same] == alone[j][same] {
+			same++
+		}
+		t.Logf("conversation %d: %d of %d tokens the same", j, same, n)
+		if same != n {
+			t.Errorf("conversation %d parts at token %d: together %v, alone %v", j, same, together[j][same:min(n, same+4)], alone[j][same:min(n, same+4)])
+		}
+	}
+}

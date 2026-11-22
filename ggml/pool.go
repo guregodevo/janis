@@ -218,9 +218,18 @@ func (p *kvPool) Row(j, n int) (engine.Tensor, engine.Tensor) {
 	row := func(t *tensor, D int) engine.Tensor {
 		shape := []int{1, p.hk, n, D}
 		return b.op(engine.F16, shape, []*tensor{t}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-			all := cachePrefix(ctx, t.grp, []int{p.rows, p.hk, n, D})
-			r := C.ggml_view_4d(ctx, all, all.ne[0], all.ne[1], all.ne[2], 1, all.nb[1], all.nb[2], all.nb[3], C.size_t(j)*C.size_t(all.nb[3]))
-			return C.ggml_cont(ctx, r)
+			// The row is viewed on the buffer's own layout: a view takes its
+			// innermost stride to be the element size, which a value cache
+			// kept transposed (tokens innermost) only has before it is
+			// permuted back.
+			base := t.grp.base
+			off := C.size_t(j) * C.size_t(base.nb[3])
+			if t.grp.vt {
+				v := C.ggml_view_4d(ctx, base, C.int64_t(n), C.int64_t(D), C.int64_t(p.hk), 1, base.nb[1], base.nb[2], base.nb[3], off)
+				return C.ggml_cont(ctx, C.ggml_permute(ctx, v, 1, 0, 2, 3))
+			}
+			v := C.ggml_view_4d(ctx, base, C.int64_t(D), C.int64_t(n), C.int64_t(p.hk), 1, base.nb[1], base.nb[2], base.nb[3], off)
+			return C.ggml_cont(ctx, v)
 		})
 	}
 	if n == 0 {
