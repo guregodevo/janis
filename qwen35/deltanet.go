@@ -175,13 +175,43 @@ func LoadGatedDeltaNet(b engine.Backend, st *safetensors.File, prefix string, cf
 // a stateless single pass), returning [1, S, hidden].
 func (d *GatedDeltaNet) Forward(b engine.Backend, x engine.Tensor, cache *LinearCache) engine.Tensor {
 	S := x.Shape()[1]
+	qkv, z, aProj, bProj := d.project(b, x, S)
+	ys := d.scan(b, qkv, aProj, bProj, cache, S)
+	return d.output(b, x, ys, z, S)
+}
+
+// ForwardBatch runs B conversations' next tokens, x [1, B, hidden], one row
+// each: the projections once over the B rows, the conv and the recurrence
+// per conversation on its own state -> [1, B, hidden].
+func (d *GatedDeltaNet) ForwardBatch(b engine.Backend, x engine.Tensor, caches []*LinearCache) engine.Tensor {
+	B := x.Shape()[1]
+	qkv, z, aProj, bProj := d.project(b, x, B)
+	var ys engine.Tensor
+	for j := 0; j < B; j++ {
+		y := d.scan(b, b.Slice(qkv, 1, j, j+1), b.Slice(aProj, 1, j, j+1), b.Slice(bProj, 1, j, j+1), caches[j], 1)
+		if ys == nil {
+			ys = y
+		} else {
+			ys = b.Concat(ys, y, 1)
+		}
+	}
+	return d.output(b, x, ys, z, B)
+}
+
+// project is the layer's input projections for S rows.
+func (d *GatedDeltaNet) project(b engine.Backend, x engine.Tensor, S int) (qkv, z, aProj, bProj engine.Tensor) {
+	qkv = d.InQKV.Forward(b, x) // [1, S, convDim]
+	z = b.Reshape(d.InZ.Forward(b, x), 1, S, d.VHeads, d.VDim)
+	aProj = d.InA.Forward(b, x) // [1, S, Hv]
+	bProj = d.InB.Forward(b, x) // [1, S, Hv]
+	return qkv, z, aProj, bProj
+}
+
+// scan is one conversation's conv and recurrence over S new rows, on its
+// cache's tail and state -> ys [1, S, Hv, Dv].
+func (d *GatedDeltaNet) scan(b engine.Backend, qkv, aProj, bProj engine.Tensor, cache *LinearCache, S int) engine.Tensor {
 	convDim := 2*d.KHeads*d.KDim + d.VHeads*d.VDim
 	keyDim := d.KHeads * d.KDim
-
-	qkv := d.InQKV.Forward(b, x) // [1, S, convDim]
-	z := b.Reshape(d.InZ.Forward(b, x), 1, S, d.VHeads, d.VDim)
-	aProj := d.InA.Forward(b, x) // [1, S, Hv]
-	bProj := d.InB.Forward(b, x) // [1, S, Hv]
 
 	// Causal depthwise conv over [conv tail ++ qkv]; keep the new tail. The
 	// zero pad is f32 and Concat promotes — cheaper than guessing the
@@ -230,8 +260,12 @@ func (d *GatedDeltaNet) Forward(b engine.Backend, x engine.Tensor, cache *Linear
 		cache.State = state
 		cache.steps += S
 	}
+	return ys
+}
 
-	// Gated RMSNorm (norm over Dv, then silu(z) gate in f32), then out_proj.
+// output is the gated RMSNorm (norm over Dv, then silu(z) gate in f32) and
+// out_proj, for S rows: ys [1, S, Hv, Dv] -> [1, S, hidden].
+func (d *GatedDeltaNet) output(b engine.Backend, x, ys, z engine.Tensor, S int) engine.Tensor {
 	yn := b.RMSNorm(ys, d.NormW, d.Eps)
 	out := b.Mul(b.SiLU(b.Cast(z, engine.F32)), yn) // [1, S, Hv, Dv]
 	// Back to the activation dtype, as the reference does (precise_swiglu's

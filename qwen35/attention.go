@@ -58,18 +58,46 @@ func LoadAttention(b engine.Backend, st *safetensors.File, prefix string, cfg qw
 // at the given RoPE offset -> [1, L, hidden].
 func (a *Attention) Forward(b engine.Backend, x engine.Tensor, cache *qwen.KVCache, offset int) engine.Tensor {
 	L := x.Shape()[1]
+	q, gate, k, v := a.project(b, x, L)
+	out := a.attend(b, q, k, v, cache, offset, L)
+	return a.output(b, out, gate, L)
+}
 
+// ForwardBatch runs B conversations' next tokens, x [1, B, hidden], one row
+// each: the projections once over the B rows, RoPE, the cache and attention
+// per conversation at its own offset -> [1, B, hidden].
+func (a *Attention) ForwardBatch(b engine.Backend, x engine.Tensor, caches []*qwen.KVCache, offsets []int) engine.Tensor {
+	B := x.Shape()[1]
+	q, gate, k, v := a.project(b, x, B)
+	var out engine.Tensor
+	for j := 0; j < B; j++ {
+		o := a.attend(b, b.Slice(q, 1, j, j+1), b.Slice(k, 1, j, j+1), b.Slice(v, 1, j, j+1), caches[j], offsets[j], 1)
+		if out == nil {
+			out = o
+		} else {
+			out = b.Concat(out, o, 1)
+		}
+	}
+	return a.output(b, out, gate, B)
+}
+
+// project is q, its gate, k and v for L rows, each [1, L, heads, hd].
+func (a *Attention) project(b engine.Backend, x engine.Tensor, L int) (q, gate, k, v engine.Tensor) {
 	// q_proj packs [query, gate] per head: [1, L, H, 2*hd] -> two [1, L, H, hd].
 	qg := b.Reshape(a.QProj.Forward(b, x), 1, L, a.NHeads, 2*a.HeadDim)
-	q := b.Slice(qg, 3, 0, a.HeadDim)
-	gate := b.Slice(qg, 3, a.HeadDim, 2*a.HeadDim)
+	q = a.QNorm.Forward(b, b.Slice(qg, 3, 0, a.HeadDim))
+	gate = b.Slice(qg, 3, a.HeadDim, 2*a.HeadDim)
+	k = a.KNorm.Forward(b, b.Reshape(a.KProj.Forward(b, x), 1, L, a.NKVHeads, a.HeadDim))
+	v = b.Reshape(a.VProj.Forward(b, x), 1, L, a.NKVHeads, a.HeadDim)
+	return q, gate, k, v
+}
 
-	k := b.Reshape(a.KProj.Forward(b, x), 1, L, a.NKVHeads, a.HeadDim)
-	q = a.QNorm.Forward(b, q)
-	k = a.KNorm.Forward(b, k)
+// attend is one conversation's attention over L new rows at offset: q, k, v
+// [1, L, heads, hd] -> [1, L, H*hd].
+func (a *Attention) attend(b engine.Backend, q, k, v engine.Tensor, cache *qwen.KVCache, offset, L int) engine.Tensor {
 	q = b.Transpose(q, 0, 2, 1, 3)
 	k = b.Transpose(k, 0, 2, 1, 3)
-	v := b.Transpose(b.Reshape(a.VProj.Forward(b, x), 1, L, a.NKVHeads, a.HeadDim), 0, 2, 1, 3)
+	v = b.Transpose(v, 0, 2, 1, 3)
 
 	// Partial RoPE: only the first RopeDims of head_dim rotate. (The text-only
 	// path of Qwen3.5's mrope: all three position streams are the token index,
@@ -82,7 +110,11 @@ func (a *Attention) Forward(b engine.Backend, x engine.Tensor, cache *qwen.KVCac
 	}
 
 	out := b.SDPA(q, k, v, a.Scale, L > 1) // [1, H, L, hd]
-	out = b.Reshape(b.Transpose(out, 0, 2, 1, 3), 1, L, a.NHeads*a.HeadDim)
+	return b.Reshape(b.Transpose(out, 0, 2, 1, 3), 1, L, a.NHeads*a.HeadDim)
+}
+
+// output gates the attention rows and projects them back: [1, L, H*hd] -> [1, L, hidden].
+func (a *Attention) output(b engine.Backend, out, gate engine.Tensor, L int) engine.Tensor {
 	out = b.Mul(out, b.Sigmoid(b.Reshape(gate, 1, L, a.NHeads*a.HeadDim)))
 	return a.OProj.Forward(b, out)
 }

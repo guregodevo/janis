@@ -3,6 +3,7 @@
 package qwen35
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -94,3 +95,59 @@ func TestAPrefillChunkFreesItsIntermediatesAsItRuns(t *testing.T) {
 // chunks: +1,185 MB swept before the eval, +2,872 MB after it (+3,568 MB with
 // the stream in f32 as well).
 const peakBudgetMB = 2000
+
+// A BATCHED DECODE STEP IS EACH CONVERSATION'S OWN STEP.
+//
+// Three conversations of different lengths, each prefilled on its own
+// session, decode two tokens in one batched forward per step; the same
+// conversations decoded one at a time are the reference. The logits agree
+// to bf16 rounding and pick the same token.
+func TestABatchedStepIsEachConversationsOwnStep(t *testing.T) {
+	b, m := smallModel(t)
+	prompts := [][]int32{{785, 6722, 315, 9625, 374}, {9707, 11, 1879}, {40, 1079, 264, 2632, 315, 279, 1879, 13}}
+	steps := [][]int32{{264, 30, 279}, {1879, 11, 315}}
+	sessions := func() ([][]qwen.LayerCache, []int) {
+		caches := make([][]qwen.LayerCache, len(prompts))
+		offsets := make([]int, len(prompts))
+		for j, p := range prompts {
+			s := m.NewSession()
+			s.Prefill(b, p, nil)
+			caches[j], offsets[j] = s.Caches, len(p)
+		}
+		return caches, offsets
+	}
+
+	own, ownOff := sessions()
+	batch, batchOff := sessions()
+	for n, ids := range steps {
+		got := b.Floats(m.ForwardBatch(b, ids, batchOff, batch))
+		V := len(got) / len(ids)
+		for j := range prompts {
+			want := b.Floats(m.forwardCachedT(b, b.FromInt32(ids[j:j+1], 1), 1, ownOff[j], own[j]))
+			row := got[j*V : (j+1)*V]
+			if len(want) != V {
+				t.Fatalf("vocab %d, batch row %d", len(want), V)
+			}
+			maxDiff, wantTop, gotTop := 0.0, 0, 0
+			for i := range want {
+				if d := math.Abs(float64(want[i] - row[i])); d > maxDiff {
+					maxDiff = d
+				}
+				if want[i] > want[wantTop] {
+					wantTop = i
+				}
+				if row[i] > row[gotTop] {
+					gotTop = i
+				}
+			}
+			t.Logf("step %d, conversation %d: max |diff| %.4f, top %d / %d", n, j, maxDiff, gotTop, wantTop)
+			if gotTop != wantTop || maxDiff > 0.5 {
+				t.Errorf("step %d, conversation %d: batched top %d, own %d, max |diff| %.4f", n, j, gotTop, wantTop, maxDiff)
+			}
+			ownOff[j]++
+		}
+		for j := range batchOff {
+			batchOff[j]++
+		}
+	}
+}
