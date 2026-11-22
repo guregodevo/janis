@@ -64,3 +64,43 @@ func QuantizeAffine(v []float32, rows, cols, groupSize, bits int, scaleDtype str
 	}
 	return words, scales, biases, nil
 }
+
+// DequantizeAffine is QuantizeAffine's inverse, on the stored triple: w is
+// U32 [rows, cols*bits/32], scales and biases [rows, cols/groupSize] in a
+// float dtype. It returns the row-major [rows, cols] values.
+func DequantizeAffine(w, scales, biases safetensors.Entry, groupSize, bits int) ([]float32, error) {
+	if bits != 2 && bits != 4 && bits != 8 {
+		return nil, fmt.Errorf("affine dequantization: %d bits (2, 4 or 8)", bits)
+	}
+	if w.Dtype != "U32" || len(w.Shape) != 2 || len(w.Raw) != 4*w.Shape[0]*w.Shape[1] {
+		return nil, fmt.Errorf("affine dequantization: weight %s %v", w.Dtype, w.Shape)
+	}
+	rows, cols := w.Shape[0], w.Shape[1]*32/bits
+	if groupSize <= 0 || cols%groupSize != 0 {
+		return nil, fmt.Errorf("affine dequantization: %d columns in groups of %d", cols, groupSize)
+	}
+	sc, err := safetensors.DecodeFloats(scales.Dtype, scales.Raw)
+	if err != nil {
+		return nil, err
+	}
+	bi, err := safetensors.DecodeFloats(biases.Dtype, biases.Raw)
+	if err != nil {
+		return nil, err
+	}
+	groups := cols / groupSize
+	if len(sc) != rows*groups || len(bi) != rows*groups {
+		return nil, fmt.Errorf("affine dequantization: %d scales and %d biases for [%d, %d] in groups of %d", len(sc), len(bi), rows, cols, groupSize)
+	}
+	perWord, mask := 32/bits, uint32(1)<<bits-1
+	out := make([]float32, rows*cols)
+	for r := 0; r < rows; r++ {
+		for j := 0; j < cols; j++ {
+			i := r*cols + j
+			word := binary.LittleEndian.Uint32(w.Raw[4*(i/perWord):])
+			q := (word >> uint((j%perWord)*bits)) & mask
+			g := r*groups + j/groupSize
+			out[i] = float32(q)*sc[g] + bi[g]
+		}
+	}
+	return out, nil
+}
