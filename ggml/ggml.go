@@ -999,6 +999,16 @@ var (
 )
 
 // f32 is x as an F32 node in ctx (a cast when it is not).
+// contig is x, copied only when it is not contiguous: a cont node copies
+// even a contiguous tensor, and the batched recurrent state the scan reads
+// is about 100 MB a layer at 32 conversations of the 27B.
+func contig(ctx *C.struct_ggml_context, x *C.struct_ggml_tensor) *C.struct_ggml_tensor {
+	if C.ggml_is_contiguous(x) {
+		return x
+	}
+	return C.ggml_cont(ctx, x)
+}
+
 func f32(ctx *C.struct_ggml_context, x *tensor) *C.struct_ggml_tensor {
 	if x.dt == engine.F32 {
 		return x.t
@@ -2610,7 +2620,7 @@ func (b *Backend) GatedDeltaScan(q, k, v, g, beta, state engine.Tensor) (engine.
 	rows := T*B + Dv*B
 	res := b.op(engine.F32, []int{rows, Hv * Dv}, []*tensor{tq, tk, tv, tg, tb, ts}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		heads := func(t *tensor) *C.struct_ggml_tensor {
-			x := C.ggml_reshape_4d(ctx, C.ggml_cont(ctx, f32(ctx, t)), C.int64_t(Dk), 1, C.int64_t(Hk), C.int64_t(T*B))
+			x := C.ggml_reshape_4d(ctx, contig(ctx, f32(ctx, t)), C.int64_t(Dk), 1, C.int64_t(Hk), C.int64_t(T*B))
 			if rep > 1 {
 				x = C.ggml_repeat_4d(ctx, x, C.int64_t(Dk), C.int64_t(rep), C.int64_t(Hk), C.int64_t(T*B))
 			}
@@ -2618,10 +2628,10 @@ func (b *Backend) GatedDeltaScan(q, k, v, g, beta, state engine.Tensor) (engine.
 		}
 		qh := C.ggml_scale(ctx, heads(tq), C.float(math.Sqrt(float64(Dv))))
 		kh := heads(tk)
-		vh := C.ggml_reshape_4d(ctx, C.ggml_cont(ctx, f32(ctx, tv)), C.int64_t(Dv), C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
-		gh := C.ggml_reshape_4d(ctx, C.ggml_log(ctx, C.ggml_cont(ctx, f32(ctx, tg))), 1, C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
-		bh := C.ggml_reshape_4d(ctx, C.ggml_cont(ctx, f32(ctx, tb)), 1, C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
-		sh := C.ggml_reshape_4d(ctx, C.ggml_cont(ctx, f32(ctx, ts)), C.int64_t(Dk), C.int64_t(Dv), C.int64_t(Hv), C.int64_t(B))
+		vh := C.ggml_reshape_4d(ctx, contig(ctx, f32(ctx, tv)), C.int64_t(Dv), C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
+		gh := C.ggml_reshape_4d(ctx, C.ggml_log(ctx, contig(ctx, f32(ctx, tg))), 1, C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
+		bh := C.ggml_reshape_4d(ctx, contig(ctx, f32(ctx, tb)), 1, C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
+		sh := C.ggml_reshape_4d(ctx, contig(ctx, f32(ctx, ts)), C.int64_t(Dk), C.int64_t(Dv), C.int64_t(Hv), C.int64_t(B))
 		return C.ggml_gated_delta_net(ctx, qh, kh, vh, gh, bh, sh)
 	})
 	y := b.Reshape(b.Slice(res, 0, 0, T*B), B, T, Hv, Dv)
