@@ -128,6 +128,9 @@ type recording struct {
 	masksB map[[2]int]*tensor // F32 [bucket] per (row, bucket)
 	limits []int              // per row: the least room of the caches it writes
 	cur    int                // the row the cache appends are for (AppendRow)
+	// A pool's inputs: the value elements per (room, m), the mask per length.
+	poolCols  map[[2]int]*tensor
+	poolMasks map[int]*tensor
 }
 
 // at is the offset the cache appends being recorded write at.
@@ -301,7 +304,8 @@ func (b *Backend) BeginBatchStep(offsets []int, carry []engine.Tensor) []engine.
 	b.flush()
 	B := len(offsets)
 	rs := &recording{offset: -1, ok: true, cols: map[[2]int]*tensor{}, masks: map[int]*tensor{}, limit: math.MaxInt,
-		offs: append([]int(nil), offsets...), colsB: map[[3]int]*tensor{}, masksB: map[[2]int]*tensor{}, limits: make([]int, B)}
+		offs: append([]int(nil), offsets...), colsB: map[[3]int]*tensor{}, masksB: map[[2]int]*tensor{}, limits: make([]int, B),
+		poolCols: map[[2]int]*tensor{}, poolMasks: map[int]*tensor{}}
 	rs.pos = b.replayInput(engine.I32, 1)
 	rs.row = b.replayInput(engine.I32, 1)
 	rs.posB = b.replayInput(engine.I32, B)
@@ -349,6 +353,57 @@ func (rs *recording) fillRows(offs []int) {
 	for k, t := range rs.masksB {
 		setFloat32(t, maskAt(offs[k[0]], k[1]))
 	}
+	for k, t := range rs.poolCols {
+		setInt32(t, poolColsAt(offs, k[0], k[1]))
+	}
+	lens := make([]int, len(offs))
+	for j, o := range offs {
+		lens[j] = o + 1
+	}
+	for n, t := range rs.poolMasks {
+		setFloat32(t, poolMaskAt(lens, n))
+	}
+}
+
+// replayPoolCols is a pool's value element input for a batched step being
+// recorded. Called without b.mu.
+func (b *Backend) replayPoolCols(room, m int) *tensor {
+	b.mu.Lock()
+	rs := b.rec0
+	t, ok := rs.poolCols[[2]int{room, m}]
+	b.mu.Unlock()
+	if ok {
+		return t
+	}
+	t = b.replayInput(engine.I32, len(rs.offs)*m)
+	setInt32(t, poolColsAt(rs.offs, room, m))
+	b.mu.Lock()
+	rs.poolCols[[2]int{room, m}] = t
+	b.mu.Unlock()
+	return t
+}
+
+// replayPoolMask is a pool's [B, n] mask input for a batched step being
+// recorded. Called without b.mu.
+func (b *Backend) replayPoolMask(n int) *tensor {
+	b.mu.Lock()
+	rs := b.rec0
+	t, ok := rs.poolMasks[n]
+	b.mu.Unlock()
+	if ok {
+		return t
+	}
+	B := len(rs.offs)
+	t = b.replayInput(engine.F32, B, 1, 1, n)
+	lens := make([]int, B)
+	for j, o := range rs.offs {
+		lens[j] = o + 1
+	}
+	setFloat32(t, poolMaskAt(lens, n))
+	b.mu.Lock()
+	rs.poolMasks[n] = t
+	b.mu.Unlock()
+	return t
 }
 
 // replayMask is the [bucket] mask input: 0 up to the step's position,
@@ -585,6 +640,12 @@ func (rs *recording) free() {
 			t.free()
 		}
 		for _, t := range rs.masksB {
+			t.free()
+		}
+		for _, t := range rs.poolCols {
+			t.free()
+		}
+		for _, t := range rs.poolMasks {
 			t.free()
 		}
 	}

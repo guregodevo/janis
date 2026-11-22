@@ -126,7 +126,7 @@ func (c *KVCache) SetCarry([]engine.Tensor) {}
 
 // Settle views the keys and values at n tokens.
 func (c *KVCache) Settle(rp engine.StepReplayer, n int) {
-	if c.K != nil {
+	if c.K != nil && c.pool == nil {
 		c.K, c.V = rp.CacheView(c.K, n), rp.CacheView(c.V, n)
 	}
 }

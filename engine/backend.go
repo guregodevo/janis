@@ -105,6 +105,31 @@ type StepReplayer interface {
 	CacheView(cache Tensor, n int) Tensor
 }
 
+// KVPooler is a backend that keeps B conversations' keys and values of one
+// attention layer in one buffer while they decode together: a batched
+// step's attention for the layer is then a few ops for every row.
+type KVPooler interface {
+	// PoolKV copies conversation j's keys ks[j] and values vs[j]
+	// [1, hk, Lj, d|dv] (nil: none yet) into a pool of room tokens a row.
+	PoolKV(ks, vs []Tensor, hk, d, dv, room int) Pool
+}
+
+// Pool is B conversations' keys and values of one attention layer.
+type Pool interface {
+	Rows() int
+	Room() int
+	// Tensors hold the pool (for Pin/Unpin).
+	Tensors() []Tensor
+	// Append writes k, v [B, hk, 1, d|dv] at row j's token at[j].
+	Append(k, v Tensor, at []int)
+	// Attend is attention for q [B, H, 1, d], row j over its first lens[j]
+	// keys -> [B, H, 1, dv].
+	Attend(q Tensor, lens []int, scale float32) Tensor
+	// Row is conversation j's keys and values at n tokens [1, hk, n, ·],
+	// as caches of its own.
+	Row(j, n int) (k, v Tensor)
+}
+
 // BatchStepReplayer records a decode step of B conversations, one token
 // each, once, and runs the same graph again while the conversations and
 // their order stay: StepReplayer's contract with a row per conversation.

@@ -36,10 +36,42 @@ type KVCache struct {
 	// place (engine.KVAppender); K and V are views of their first Len()
 	// tokens. Nil elsewhere, and after a reset.
 	kBuf, vBuf engine.Tensor
+
+	// pool is set while the conversation decodes in a batch on a backend
+	// that pools keys and values (engine.KVPooler): its n tokens are row
+	// row of the pool, and K and V are nil until something else needs
+	// them (own).
+	pool engine.Pool
+	row  int
+	n    int
+}
+
+// Lend hands the cache's tokens to row of a pool that already holds them;
+// the cache is n tokens long.
+func (c *KVCache) Lend(p engine.Pool, row, n int) {
+	c.K, c.V, c.kBuf, c.vBuf = nil, nil, nil, nil
+	c.pool, c.row, c.n = p, row, n
+}
+
+// Lent is the pool and row the cache is lent to, nil when it is not.
+func (c *KVCache) Lent() (engine.Pool, int) { return c.pool, c.row }
+
+// Grow sets the length of a cache lent to a pool, after a step wrote it.
+func (c *KVCache) Grow(n int) { c.n = n }
+
+// Own takes the cache's tokens back from the pool it is lent to.
+func (c *KVCache) Own() {
+	if c.pool != nil {
+		c.K, c.V = c.pool.Row(c.row, c.n)
+		c.pool = nil
+	}
 }
 
 // Len is the number of cached time steps.
 func (c *KVCache) Len() int {
+	if c.pool != nil {
+		return c.n
+	}
 	if c.K == nil {
 		return 0
 	}
@@ -56,6 +88,7 @@ func (c *KVCache) Forget(int) {}
 
 // Truncate keeps only the first n time steps (for prefix reuse across requests).
 func (c *KVCache) Truncate(b engine.Backend, n int) {
+	c.Own()
 	if c.K == nil {
 		return
 	}
@@ -72,6 +105,9 @@ func (c *KVCache) Truncate(b engine.Backend, n int) {
 
 // Tensors returns the live K/V tensors (none while empty).
 func (c *KVCache) Tensors() []engine.Tensor {
+	if c.pool != nil {
+		return c.pool.Tensors()
+	}
 	if c.K == nil {
 		return nil
 	}
@@ -88,6 +124,7 @@ func (c *KVCache) Tensors() []engine.Tensor {
 // 1.2 GB of f32 cache, more than an L4 has left). MLX hands over the
 // model's own dtype already and is left alone.
 func (c *KVCache) Update(b engine.Backend, kNew, vNew engine.Tensor) (engine.Tensor, engine.Tensor) {
+	c.Own()
 	if rr, ok := b.(engine.RawReader); ok && rr.DTypeOf(kNew) == engine.F32 {
 		kNew, vNew = b.Cast(kNew, engine.F16), b.Cast(vNew, engine.F16)
 	}

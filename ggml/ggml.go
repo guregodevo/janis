@@ -1440,6 +1440,34 @@ func (b *Backend) appendCache(ta, tb *tensor, axis int, vt bool) engine.Tensor {
 	return out
 }
 
+// poolBuffer is a cleared f16 cache buffer of shape [B, H, room, D] and a
+// view of the whole of it, which holds it.
+func (b *Backend) poolBuffer(shape []int, vt bool) *tensor {
+	ctx := C.janis_ctx(ctxMem + C.size_t(C.ggml_tensor_overhead())*64)
+	cne := ne(shape)
+	if vt {
+		cne[0], cne[1] = cne[1], cne[0]
+	}
+	base := C.janis_new(ctx, C.GGML_TYPE_F16, cne[0], cne[1], cne[2], cne[3])
+	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+	if buf == nil {
+		C.ggml_free(ctx)
+		panic("ggml: no room on the device for a key and value pool")
+	}
+	C.ggml_backend_buffer_clear(buf, 0)
+	logAlloc("pool", C.ggml_nbytes(base), shape)
+	grp := &batch{ctx: ctx, buf: buf, base: base, cap: shape[2], vt: vt}
+	out := &tensor{shape: append([]int(nil), shape...), dt: engine.F16, grp: grp, cacheLen: shape[2], pin: true}
+	memMu.Lock()
+	grp.refs++
+	memMu.Unlock()
+	b.mu.Lock()
+	out.t = b.cacheView(grp, shape)
+	b.mu.Unlock()
+	b.track(out)
+	return out
+}
+
 // cacheGrow is the least spare room a cache buffer is made with, in tokens.
 const cacheGrow = 256
 

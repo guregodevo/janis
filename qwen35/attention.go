@@ -70,6 +70,9 @@ func (a *Attention) ForwardBatch(b engine.Backend, x engine.Tensor, caches []*qw
 	B := x.Shape()[1]
 	q, gate, k, v := a.project(b, x, B)
 	if ra, ok := b.(engine.RowAttention); ok {
+		if kp, ok := b.(engine.KVPooler); ok {
+			return a.output(b, a.attendPooled(b, ra, kp, q, k, v, caches, offsets), gate, B)
+		}
 		return a.output(b, a.attendRows(b, ra, q, k, v, caches, offsets), gate, B)
 	}
 	var out engine.Tensor
@@ -139,6 +142,63 @@ func (a *Attention) attendRows(b engine.Backend, ra engine.RowAttention, q, k, v
 	}
 	out := ra.SDPARows(b.Transpose(q, 2, 1, 0, 3), ks, vs, a.Scale) // [B, H, 1, hd]
 	return b.Reshape(b.Transpose(out, 0, 2, 1, 3), 1, B, a.NHeads*a.HeadDim)
+}
+
+// poolSpare is the room a new pool has past its longest row, in tokens: a
+// pool is made again, its rows copied, when a row fills it.
+const poolSpare = 512
+
+// attendPooled is attention for B conversations' next rows with the B
+// conversations' keys and values in one pool (engine.KVPooler): one RoPE
+// each for q and k, one append, one attention for every row. A pool is
+// made, the caches copied in, when the conversations are not in one in
+// this order or it has no room. q, k, v [1, B, heads, hd] -> [1, B, H*hd].
+func (a *Attention) attendPooled(b engine.Backend, ra engine.RowAttention, kp engine.KVPooler, q, k, v engine.Tensor, caches []*qwen.KVCache, offsets []int) engine.Tensor {
+	B := len(caches)
+	pool := sharedPool(caches, offsets)
+	if pool == nil {
+		ks, vs := make([]engine.Tensor, B), make([]engine.Tensor, B)
+		room := 0
+		for j, c := range caches {
+			c.Own()
+			ks[j], vs[j] = c.K, c.V
+			room = max(room, offsets[j]+1)
+		}
+		pool = kp.PoolKV(ks, vs, a.NKVHeads, a.HeadDim, a.HeadDim, room+poolSpare)
+		for j, c := range caches {
+			c.Lend(pool, j, offsets[j])
+		}
+	}
+	// [1, B, heads, hd] -> [1, heads, B, hd]: the rows as the tokens RoPE
+	// rotates, each at its own position; then [B, heads, 1, hd].
+	q = ra.RoPEPositions(b.Transpose(q, 0, 2, 1, 3), a.RopeDims, false, a.RopeBase, 1.0, offsets)
+	k = ra.RoPEPositions(b.Transpose(k, 0, 2, 1, 3), a.RopeDims, false, a.RopeBase, 1.0, offsets)
+	pool.Append(b.Transpose(k, 2, 1, 0, 3), b.Transpose(b.Transpose(v, 0, 2, 1, 3), 2, 1, 0, 3), offsets)
+	lens := make([]int, B)
+	for j, o := range offsets {
+		lens[j] = o + 1
+	}
+	out := pool.Attend(b.Transpose(q, 2, 1, 0, 3), lens, a.Scale) // [B, H, 1, hd]
+	for j, c := range caches {
+		c.Grow(lens[j])
+	}
+	return b.Reshape(b.Transpose(out, 0, 2, 1, 3), 1, B, a.NHeads*a.HeadDim)
+}
+
+// sharedPool is the pool caches are lent to, rows in order, with room for
+// this step; nil when they are not.
+func sharedPool(caches []*qwen.KVCache, offsets []int) engine.Pool {
+	p, _ := caches[0].Lent()
+	if p == nil || p.Rows() != len(caches) {
+		return nil
+	}
+	for j, c := range caches {
+		q, r := c.Lent()
+		if q != p || r != j || c.Len() != offsets[j] || offsets[j] >= p.Room() {
+			return nil
+		}
+	}
+	return p
 }
 
 // output gates the attention rows and projects them back: [1, L, H*hd] -> [1, L, hidden].

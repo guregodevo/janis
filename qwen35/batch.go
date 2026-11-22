@@ -32,8 +32,13 @@ func (d *BatchDecoder) Step(b engine.Backend, toks []int32, offsets []int, cache
 			floats := d.step.RunRows(toks, offsets)
 			for j, cs := range caches {
 				for _, c := range cs {
-					if lc, ok := c.(*LinearCache); ok {
-						lc.steps++
+					switch c := c.(type) {
+					case *LinearCache:
+						c.steps++
+					case *qwen.KVCache:
+						if p, _ := c.Lent(); p != nil {
+							c.Grow(offsets[j] + 1)
+						}
 					}
 				}
 				d.lens[j] = offsets[j] + 1
