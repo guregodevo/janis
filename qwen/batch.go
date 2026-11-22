@@ -40,7 +40,7 @@ func (s *Session) Begin(b engine.Backend, newIDs []int32, nGen int, p SamplePara
 	if r, ok := b.(engine.CacheReserver); ok {
 		r.ReserveCache(len(newIDs) + nGen)
 	}
-	floats, ok := s.prefill(b, newIDs, p.Cancel)
+	floats, ok := s.prefill(b, newIDs, p.Cancel, true) // the prompt-end mark, as Generate
 	if !ok {
 		return nil
 	}
