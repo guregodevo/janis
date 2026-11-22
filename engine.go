@@ -115,6 +115,16 @@ type Engine struct {
 	tokTableOnce sync.Once
 	// q35 is the loaded Qwen3.5 text stack (nil for other families).
 	q35 *qwen35.Model
+
+	// slots are the sessions BeginChat decodes on together (engine_batch.go),
+	// made on the first BeginChat: slotBusy marks a slot holding a reply,
+	// slotUsed when its reply began (slotClock's count), for least recently used.
+	slots       []*qwen.Session
+	slotBusy    []bool
+	slotUsed    []int
+	slotClock   int
+	slotDecoder *qwen35.BatchDecoder
+	slotStep    []int // the slots of the last StepChats, in its order
 	// ink2 is the loaded Inkling 2 text stack (nil for other families).
 	ink2 *inkling2.Model
 	// vision is set for a model with a vision tower (nil otherwise).
@@ -307,13 +317,10 @@ func (e *Engine) ChatUtil(msgs []Message, opts Options) string {
 	return e.chat(msgs, opts, nil, e.utilSession)
 }
 
-func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *qwen.Session) string {
-	ids := e.tok.Encode(chat.ApplyTemplateEffort(e.mtype, msgs, opts.ReasoningEffort))
-	var images [][]byte
-	for _, m := range msgs {
-		images = append(images, m.Images...)
-	}
-
+// sampleParams is a reply's sampling and its token budget, from opts: the
+// repetition penalty, the tool-call grammar, onDelta and opts.OnToken on
+// each committed token, the whitespace-runaway guard.
+func (e *Engine) sampleParams(opts Options, onDelta func(string)) (qwen.SampleParams, int) {
 	maxTok := opts.MaxTokens
 	if maxTok <= 0 {
 		maxTok = 512
@@ -400,6 +407,17 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 			return wsRun >= 16 || (prevCancel != nil && prevCancel())
 		}
 	}
+	return p, maxTok
+}
+
+func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *qwen.Session) string {
+	ids := e.tok.Encode(chat.ApplyTemplateEffort(e.mtype, msgs, opts.ReasoningEffort))
+	var images [][]byte
+	for _, m := range msgs {
+		images = append(images, m.Images...)
+	}
+
+	p, maxTok := e.sampleParams(opts, onDelta)
 
 	mlxComputeMu.Lock()
 	if e.vision != nil {
