@@ -4,12 +4,13 @@
 // with tools. One model is loaded at a time; a request naming another
 // installed model swaps it. Generation is serialized: the engine is one GPU.
 //
-// Tools travel the Hermes way, the single format the engine's grammar
-// enforces: the schemas are rendered into the system prompt, the model
-// answers <tool_call>{"name":…,"arguments":{…}}</tool_call>, and the server
-// hands them back as OpenAI tool_calls. A prior tool call and its result are
+// Tools travel the Hermes way, the format the engine's grammar enforces:
+// the schemas are rendered into the system prompt, the model answers
+// <tool_call>{"name":…,"arguments":{…}}</tool_call>, and the server hands
+// them back as OpenAI tool_calls. A prior tool call and its result are
 // replayed in the same form, so the transcript teaches the model its own
-// protocol.
+// protocol. A model whose chat template writes calls in XML (the Qwen3.5
+// family) gets them in that form instead, with no grammar (xmltools.go).
 package serve
 
 import (
@@ -62,7 +63,10 @@ type Server struct {
 	work    chan func() // every call into the engine, one at a time, on one OS thread
 	current Generator
 	name    string // the installed model's name the engine was opened from
-	logf    func(string, ...any)
+	// xmlTools is whether the loaded model is asked for tools in its own
+	// XML form instead of the Hermes JSON one (xmltools.go).
+	xmlTools bool
+	logf     func(string, ...any)
 
 	// loaded is name for the handlers off the engine thread: GET /v1/models
 	// answers while a long request holds the engine (janis#19).
@@ -159,7 +163,7 @@ func (s *Server) Close() {
 	s.onEngine(func() {
 		if s.current != nil {
 			s.current.Close()
-			s.current, s.name = nil, ""
+			s.current, s.name, s.xmlTools = nil, "", false
 			s.setLoaded("")
 		}
 	})
@@ -255,6 +259,7 @@ func (s *Server) ensure(name string) error {
 		s.current.Close()
 	}
 	s.current, s.name = eng, pick.Name
+	s.xmlTools = usesXMLTools(pick.Path)
 	s.setLoaded(pick.Name)
 	s.logf("loaded %s (%s)", pick.Name, eng.ModelType())
 	return nil
@@ -348,7 +353,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		msgs := renderChat(req)
+		msgs := renderChatFor(req, s.xmlTools)
 		if err := s.checkImages(req, msgs); err != nil {
 			if st != nil {
 				st.send(map[string]any{"error": errorBody(http.StatusBadRequest, err.Error())})
@@ -378,7 +383,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		ctx := r.Context()
 		opts.Cancel = func() bool { return ctx.Err() != nil }
-		if len(req.Tools) > 0 {
+		if len(req.Tools) > 0 && !s.xmlTools {
+			// The grammar is the Hermes JSON envelope: a model trained on the
+			// XML form decodes free.
 			opts.ToolCallGrammar = true
 			opts.ForceToolCall = string(req.ToolChoice) == `"required"`
 		}
@@ -407,7 +414,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				writeCancelled(w)
 				return
 			}
-			text, calls := parseCalls(reply)
+			text, calls := s.parseCalls(reply, req.Tools)
 			finish := "stop"
 			if len(calls) > 0 {
 				finish = "tool_calls"
@@ -550,7 +557,7 @@ func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest,
 		send(map[string]any{"error": cancelledError()})
 		return
 	}
-	_, calls := parseCalls(reply)
+	_, calls := s.parseCalls(reply, req.Tools)
 	finish := "stop"
 	switch {
 	case len(calls) > 0:
@@ -591,7 +598,11 @@ var thinkBlock = regexp.MustCompile(`(?s)<think>.*?</think>\s*`)
 // the tool schemas go into the system prompt, a prior assistant tool call is
 // replayed as its <tool_call> block, a tool result as a <tool_response>
 // under the user role (the Qwen template's own form).
-func renderChat(req chatRequest) []llm.Message {
+func renderChat(req chatRequest) []llm.Message { return renderChatFor(req, false) }
+
+// renderChatFor is renderChat with the tools, and the past calls, in the XML
+// form when xml is set (xmltools.go).
+func renderChatFor(req chatRequest, xml bool) []llm.Message {
 	var out []llm.Message
 	system := ""
 	for _, m := range req.Messages {
@@ -604,7 +615,11 @@ func renderChat(req chatRequest) []llm.Message {
 		if system == "" {
 			system = "You are a helpful assistant."
 		}
-		system += "\n\n" + renderTools(req.Tools)
+		if xml {
+			system += "\n\n" + renderToolsXML(req.Tools)
+		} else {
+			system += "\n\n" + renderTools(req.Tools)
+		}
 	}
 	if strings.TrimSpace(system) != "" {
 		out = append(out, llm.Message{Role: "system", Content: strings.TrimSpace(system)})
@@ -616,6 +631,10 @@ func renderChat(req chatRequest) []llm.Message {
 		case "assistant":
 			text := contentText(m.Content)
 			for _, c := range m.ToolCalls {
+				if xml {
+					text += "\n" + renderCallXML(c.Function.Name, c.Function.Arguments)
+					continue
+				}
 				args := json.RawMessage(c.Function.Arguments)
 				if !json.Valid(args) {
 					b, _ := json.Marshal(c.Function.Arguments)
@@ -645,16 +664,21 @@ func renderTools(tools []chatTool) string {
 	var b strings.Builder
 	b.WriteString("# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n")
 	for _, t := range tools {
-		params := t.Function.Parameters
-		if len(params) == 0 {
-			params = json.RawMessage(`{"type":"object","properties":{}}`)
-		}
-		j, _ := json.Marshal(map[string]any{"type": "function", "function": map[string]any{"name": t.Function.Name, "description": t.Function.Description, "parameters": params}})
-		b.Write(j)
+		b.Write(toolSchema(t))
 		b.WriteByte('\n')
 	}
 	b.WriteString("</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>")
 	return b.String()
+}
+
+// toolSchema is one tool as the tools block lists it.
+func toolSchema(t chatTool) []byte {
+	params := t.Function.Parameters
+	if len(params) == 0 {
+		params = json.RawMessage(`{"type":"object","properties":{}}`)
+	}
+	j, _ := json.Marshal(map[string]any{"type": "function", "function": map[string]any{"name": t.Function.Name, "description": t.Function.Description, "parameters": params}})
+	return j
 }
 
 // contentText is the text of an OpenAI content field: a string, or the text
@@ -749,6 +773,20 @@ func (s *Server) checkImages(req chatRequest, msgs []llm.Message) error {
 
 // parseCalls splits a reply into its text and its tool calls; a think block
 // is dropped from the text.
+// parseCalls reads the calls in the loaded model's form: the XML one, and
+// the Hermes one a model may still write; else the Hermes one alone.
+func (s *Server) parseCalls(reply string, tools []chatTool) (string, []toolCall) {
+	if !s.xmlTools {
+		return parseCalls(reply)
+	}
+	text, calls := parseCallsXML(reply, tools)
+	text, more := parseCalls(text)
+	for i := range more {
+		more[i].ID = fmt.Sprintf("call_%d", len(calls)+i+1)
+	}
+	return text, append(calls, more...)
+}
+
 func parseCalls(reply string) (string, []toolCall) {
 	var calls []toolCall
 	for i, m := range callBlock.FindAllStringSubmatch(reply, -1) {
