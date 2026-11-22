@@ -98,13 +98,22 @@ func (s *Session) replay(b engine.Backend, r *replaying, tok int32, at int) []fl
 	return floats
 }
 
-// settle ends the recorded step: the caches are set at n tokens.
+// settle ends the recorded step: the caches are set at n tokens. The views
+// that hold them now are pinned and the ones they replace let go, as every
+// change of the caches is: an unpinned view was swept by the next request,
+// and a prompt that parted from this one cut the caches back through freed
+// views (a segfault in KVCache.Truncate, 2026-11-22).
 func (r *replaying) settle(s *Session, n int) {
 	if r.step == nil {
 		return
 	}
+	prev := cacheTensors(s.Caches)
 	for _, c := range s.Caches {
 		c.(replayCache).Settle(r.rp, n)
+	}
+	if sw, ok := r.rp.(engine.Sweeper); ok {
+		pinCaches(sw, s.Caches)
+		unpinGone(sw, prev, cacheTensors(s.Caches))
 	}
 	r.step.Close()
 	r.step = nil

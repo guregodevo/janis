@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -100,4 +101,65 @@ func argmax(v []float32) int {
 		}
 	}
 	return best
+}
+
+// TestReplayedStepsThenAPromptThatParts decodes with recorded steps, then
+// reads a prompt that shares only the system prompt with the first (the
+// caches cut back to where they part), then the first again: a recorded
+// step's caches must survive the requests after it, and the replies must
+// be the plain path's (JANIS_GGML_PADDECODE).
+func TestReplayedStepsThenAPromptThatParts(t *testing.T) {
+	if os.Getenv("JANIS_REPLAY_E2E") != "1" {
+		t.Skip("set JANIS_REPLAY_E2E=1 (and JANIS_BACKEND=ggml) to run")
+	}
+	model := os.Getenv("JANIS_REPLAY_MODEL")
+	if model == "" {
+		model = "Qwen3.5-0.8B-MLX-4bit"
+	}
+	second := os.Getenv("JANIS_REPLAY_SECOND")
+	if second == "" {
+		second = "1"
+	}
+	home, _ := os.UserHomeDir()
+	dirs, _ := filepath.Glob(filepath.Join(home, ".cache/huggingface/hub/models--mlx-community--"+model+"/snapshots/*"))
+	if len(dirs) == 0 {
+		t.Skip(model + " not installed")
+	}
+	e, err := Open(dirs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	t.Setenv("JANIS_GGML_PADDECODE", "1")
+	sys := Message{Role: "system", Content: "You are a careful assistant. Answer in plain sentences."}
+	prompts := [][]Message{
+		{sys, {Role: "user", Content: "Name three rivers in Europe. /no_think"}},
+		{sys, {Role: "user", Content: "Name three mountains in Asia. /no_think"}},
+		{sys, {Role: "user", Content: "Name three rivers in Europe. /no_think"}},
+	}
+	replies := func(replay string) []string {
+		t.Setenv("JANIS_GGML_REPLAY", replay)
+		var out []string
+		for _, p := range prompts {
+			out = append(out, e.Chat(p, Options{Temp: 0, MaxTokens: 40}))
+			// What a server does between requests (another session's
+			// call sweeps; the collector runs the finalizers).
+			runtime.GC()
+			e.ChatUtil([]Message{{Role: "user", Content: "Say OK. /no_think"}}, Options{Temp: 0, MaxTokens: 4})
+			runtime.GC()
+		}
+		e.session.Reset(e.bk)
+		return out
+	}
+	plain := replies("0")
+	replayed := replies(second)
+	same := 0
+	for i := range plain {
+		if plain[i] != replayed[i] {
+			t.Errorf("prompt %d: replayed %q, plain %q", i, replayed[i], plain[i])
+		} else {
+			same++
+		}
+	}
+	t.Logf("%s: %d of %d replies the same", model, same, len(plain))
 }
