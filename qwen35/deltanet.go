@@ -74,6 +74,23 @@ func (c *LinearCache) Mark() {
 
 func (c *LinearCache) Forget(n int) { delete(c.marks, n) }
 
+// Carry is the conv tail and the state a decode step replaces.
+func (c *LinearCache) Carry() []engine.Tensor {
+	if c.Conv == nil || c.State == nil {
+		return []engine.Tensor{}
+	}
+	return []engine.Tensor{c.Conv, c.State}
+}
+
+func (c *LinearCache) SetCarry(ts []engine.Tensor) {
+	if len(ts) == 2 {
+		c.Conv, c.State = ts[0], ts[1]
+	}
+}
+
+// Settle: a recorded step's runs advanced the state in place.
+func (c *LinearCache) Settle(_ engine.StepReplayer, n int) { c.steps = n }
+
 func (c *LinearCache) Tensors() []engine.Tensor {
 	ts := make([]engine.Tensor, 0, 2+2*len(c.marks))
 	if c.Conv != nil {

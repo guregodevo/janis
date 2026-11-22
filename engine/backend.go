@@ -71,6 +71,41 @@ type CacheReserver interface {
 	ReserveCache(tokens int)
 }
 
+// StepReplayer is a backend that records a one-token decode step once and
+// runs the same graph again for the tokens after it: what changes from
+// token to token (the token, its position, where the caches are written,
+// how much of them attention reads) is an input of the graph, not its
+// shape. ggml implements it on a GPU, where a graph run again is a CUDA
+// graph replayed.
+type StepReplayer interface {
+	// BeginStep starts recording the step at offset. carry are the states
+	// the step reads and replaces (a recurrent layer's conv tail and
+	// state); each is copied into a buffer of its own, returned in order,
+	// that the forward pass reads instead and the step overwrites in place.
+	// It returns nil when this backend does not replay now.
+	BeginStep(offset int, carry []Tensor) []Tensor
+	// EndStep ends the recording. ids is the step's [1] token input,
+	// logits its output, next[i] the state that replaces carry[i]. It
+	// computes the step and returns its last-position logits, and the step
+	// to replay; the step is nil when the recording cannot be replayed (it
+	// was computed all the same, and next[i] are the states).
+	EndStep(ids, logits Tensor, next []Tensor) (Step, []float32)
+	// CacheView is a cache tensor the recorded step read, viewed at n
+	// tokens: the cache's real length after the step's runs.
+	CacheView(cache Tensor, n int) Tensor
+}
+
+// Step is a recorded decode step.
+type Step interface {
+	// Fits reports whether the step can run at offset (its caches' room).
+	Fits(offset int) bool
+	// Run computes the step for tok at offset and returns its logits. The
+	// carried states are updated in place.
+	Run(tok int32, offset int) []float32
+	// Close frees the step's graph; the caches and states stay.
+	Close()
+}
+
 type Sweeper interface {
 	// PinAll pins everything created so far (used once after weight load).
 	PinAll()
