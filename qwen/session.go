@@ -201,7 +201,16 @@ func canTruncate(caches []LayerCache, n int) bool {
 // the last-position logits on the host; false means cancel fired first. The
 // caller owns s.IDs: Prefill records the whole prompt, Generate appends the
 // reply to it.
-func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) ([]float32, bool) {
+//
+// endMark also marks the prompt one token short of its end, for Generate.
+// The next request of a conversation replays this reply in the template's
+// form, not as generated, so it parts from these ids where the reply
+// begins: a recurrent cache with no mark there went back to the system
+// prompt and prefilled the whole conversation again on every agent call.
+// One token short because the mark keeps the state tensors themselves, and
+// a recorded decode step writes the latest state in place; the last prompt
+// token's chunk makes new ones from the marked state.
+func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool, endMark bool) ([]float32, bool) {
 	sw, _ := b.(engine.Sweeper)
 	old := cacheTensors(s.Caches) // previous turn's caches, to be freed
 	prevLen := cachedLen(s.Caches)
@@ -285,16 +294,22 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 		head := func(ids []int32) []int32 { return ids[:min(4, len(ids))] }
 		debugLog("prefill: total=%d reused=%d new=%d (chunk=%d) marks=%v had=%v got=%v", len(newIDs), P, len(suffix), chunkSize, s.Marks(), head(s.IDs), head(newIDs))
 	}
+	last := 0
+	if endMark {
+		last = len(newIDs) - 1
+	}
 	var logits engine.Tensor
 	for i := 0; i < len(suffix); {
 		end := i + chunkSize
 		if end > len(suffix) {
 			end = len(suffix)
 		}
-		// A chunk ends at the mark, so the state kept is the one at exactly
+		// A chunk ends at a mark, so the state kept is the one at exactly
 		// that length.
-		if m := want - P; m > i && m < end {
-			end = m
+		for _, at := range []int{want, last} {
+			if m := at - P; m > i && m < end {
+				end = m
+			}
 		}
 		chunk := suffix[i:end]
 		i = end
@@ -310,6 +325,9 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 		offset += len(chunk)
 		if want > 0 && offset == want {
 			s.mark(want)
+		}
+		if last > 0 && offset == last && last != want && !canTruncate(s.Caches, 1) {
+			s.mark(last)
 		}
 		if sw != nil {
 			// Sweep this chunk's intermediates BEFORE its eval: the graph holds
@@ -357,7 +375,7 @@ func (s *Session) Prefill(b engine.Backend, newIDs []int32, cancel func() bool) 
 	if r, ok := b.(engine.CacheReserver); ok {
 		r.ReserveCache(len(newIDs))
 	}
-	floats, ok := s.prefill(b, newIDs, cancel)
+	floats, ok := s.prefill(b, newIDs, cancel, false)
 	if !ok {
 		return nil
 	}
@@ -376,7 +394,7 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 	if r, ok := b.(engine.CacheReserver); ok {
 		r.ReserveCache(len(newIDs) + nGen)
 	}
-	floats, ok := s.prefill(b, newIDs, p.Cancel)
+	floats, ok := s.prefill(b, newIDs, p.Cancel, true)
 	if !ok {
 		return nil
 	}
