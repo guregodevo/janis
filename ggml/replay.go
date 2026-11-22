@@ -119,6 +119,23 @@ type recording struct {
 	carry  []*tensor
 	leaves []*tensor // made while recording: the token input
 	embeds []embedRecipe
+
+	// A batched step (BeginBatchStep): row j at offs[j], offset is -1.
+	offs   []int
+	posB   *tensor            // I32 [B]: each row's RoPE position
+	rowsB  []*tensor          // I32 [1] per row: its token's row in a key cache
+	colsB  map[[3]int]*tensor // per (row, capacity, m): its elements in a transposed value cache
+	masksB map[[2]int]*tensor // F32 [bucket] per (row, bucket)
+	limits []int              // per row: the least room of the caches it writes
+	cur    int                // the row the cache appends are for (AppendRow)
+}
+
+// at is the offset the cache appends being recorded write at.
+func (rs *recording) at() int {
+	if rs.offs != nil {
+		return rs.offs[rs.cur]
+	}
+	return rs.offset
 }
 
 // embedRecipe is an embedding row the step reads as a leaf: each run
@@ -134,7 +151,7 @@ func (b *Backend) recordEmbed(out *tensor, gw, gs, gb *gatherRef, groupSize, bit
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if rs := b.rec0; rs != nil {
-		if len(gw.ids.host) != 1 {
+		if n := len(gw.ids.host); n != 1 && (rs.offs == nil || n != len(rs.offs)) {
 			rs.spoil("an embedding of more than one token")
 			return
 		}
@@ -206,6 +223,9 @@ func (rs *recording) fill(offset int) {
 // capacity tokens written m elements a token. Called with b.mu held.
 func (b *Backend) replayCols(capacity, m int) *tensor {
 	rs := b.rec0
+	if rs.offs != nil {
+		return b.replayColsRow(rs.cur, capacity, m)
+	}
 	k := [2]int{capacity, m}
 	if t, ok := rs.cols[k]; ok {
 		return t
@@ -214,12 +234,121 @@ func (b *Backend) replayCols(capacity, m int) *tensor {
 	t := b.replayInput(engine.I32, m)
 	b.mu.Lock()
 	rs.cols[k] = t
+	setInt32(t, colsAt(rs.offset, capacity, m))
+	return t
+}
+
+// replayColsRow is replayCols for row j of a batched step. Called with
+// b.mu held.
+func (b *Backend) replayColsRow(j, capacity, m int) *tensor {
+	rs := b.rec0
+	k := [3]int{j, capacity, m}
+	if t, ok := rs.colsB[k]; ok {
+		return t
+	}
+	b.mu.Unlock()
+	t := b.replayInput(engine.I32, m)
+	b.mu.Lock()
+	rs.colsB[k] = t
+	setInt32(t, colsAt(rs.offs[j], capacity, m))
+	return t
+}
+
+// colsAt is the elements of the token at offset in a transposed value
+// cache of capacity tokens, m elements a token.
+func colsAt(offset, capacity, m int) []int32 {
 	v := make([]int32, m)
 	for i := range v {
-		v[i] = int32(rs.offset + capacity*i)
+		v[i] = int32(offset + capacity*i)
 	}
-	setInt32(t, v)
+	return v
+}
+
+// maskAt is a [n] mask: 0 up to offset, -inf past it.
+func maskAt(offset, n int) []float32 {
+	v := make([]float32, n)
+	for j := offset + 1; j < n; j++ {
+		v[j] = float32(math.Inf(-1))
+	}
+	return v
+}
+
+// replayMaskRow is replayMask for row j of a batched step. Called without
+// b.mu.
+func (b *Backend) replayMaskRow(j, n int) *tensor {
+	b.mu.Lock()
+	rs := b.rec0
+	t, ok := rs.masksB[[2]int{j, n}]
+	b.mu.Unlock()
+	if ok {
+		return t
+	}
+	t = as(b.FromFloats(make([]float32, n), 1, n))
+	t.pin = true
+	setFloat32(t, maskAt(rs.offs[j], n))
+	b.mu.Lock()
+	rs.masksB[[2]int{j, n}] = t
+	b.mu.Unlock()
 	return t
+}
+
+// BeginBatchStep starts recording a decode step of len(offsets)
+// conversations (engine.BatchStepReplayer).
+func (b *Backend) BeginBatchStep(offsets []int, carry []engine.Tensor) []engine.Tensor {
+	if !(replayOn() || replayTest) || (b.cpu && !replayOnCPUNow()) {
+		return nil
+	}
+	b.flush()
+	B := len(offsets)
+	rs := &recording{offset: -1, ok: true, cols: map[[2]int]*tensor{}, masks: map[int]*tensor{}, limit: math.MaxInt,
+		offs: append([]int(nil), offsets...), colsB: map[[3]int]*tensor{}, masksB: map[[2]int]*tensor{}, limits: make([]int, B)}
+	rs.pos = b.replayInput(engine.I32, 1)
+	rs.row = b.replayInput(engine.I32, 1)
+	rs.posB = b.replayInput(engine.I32, B)
+	for j := range offsets {
+		rs.rowsB = append(rs.rowsB, b.replayInput(engine.I32, 1))
+		rs.limits[j] = math.MaxInt
+	}
+	moved := make([]engine.Tensor, len(carry))
+	for i, c := range carry {
+		x := as(c)
+		t := b.replayInput(x.dt, x.shape...)
+		C.ggml_backend_tensor_copy(x.t, t.t)
+		rs.carry = append(rs.carry, t)
+		moved[i] = t
+	}
+	rs.fillRows(offsets)
+	b.mu.Lock()
+	b.rec0 = rs
+	b.mu.Unlock()
+	return moved
+}
+
+// AppendRow names the row the next cache appends are for
+// (engine.BatchStepReplayer).
+func (b *Backend) AppendRow(j int) {
+	b.mu.Lock()
+	if rs := b.rec0; rs != nil && rs.offs != nil {
+		rs.cur = j
+	}
+	b.mu.Unlock()
+}
+
+// fillRows writes a batched step's inputs, row j at offs[j].
+func (rs *recording) fillRows(offs []int) {
+	copy(rs.offs, offs)
+	p := make([]int32, len(offs))
+	for j, o := range offs {
+		p[j] = int32(o)
+		setInt32(rs.rowsB[j], []int32{int32(o)})
+	}
+	setInt32(rs.posB, p)
+	for k, t := range rs.colsB {
+		setInt32(t, colsAt(offs[k[0]], k[1], k[2]))
+	}
+	for k, t := range rs.masksB {
+		setFloat32(t, maskAt(offs[k[0]], k[1]))
+	}
 }
 
 // replayMask is the [bucket] mask input: 0 up to the step's position,
@@ -253,10 +382,14 @@ func (b *Backend) recordAppend(grp *batch, tb *tensor, shape []int, axis int) (*
 	rs := b.rec0
 	n := shape[axis] - 1
 	bucket := min(grp.cap, (n+replayBucket)/replayBucket*replayBucket)
-	if tb.shape[axis] != 1 || n != rs.offset || bucket <= n {
+	if tb.shape[axis] != 1 || n != rs.at() || bucket <= n {
 		return nil, false
 	}
-	rs.limit = min(rs.limit, bucket)
+	if rs.offs != nil {
+		rs.limits[rs.cur] = min(rs.limits[rs.cur], bucket)
+	} else {
+		rs.limit = min(rs.limit, bucket)
+	}
 	base := grp.base
 	src := tb.t
 	var dst, idx *C.struct_ggml_tensor
@@ -271,6 +404,9 @@ func (b *Backend) recordAppend(grp *batch, tb *tensor, shape []int, axis int) (*
 	} else {
 		dst = base
 		idx = b.rec0.row.t
+		if rs.offs != nil {
+			idx = rs.rowsB[rs.cur].t
+		}
 	}
 	if tb.dt != engine.F32 {
 		src = C.ggml_cast(b.rec, src, C.GGML_TYPE_F32)
@@ -317,7 +453,7 @@ func (b *Backend) EndStep(ids, logits engine.Tensor, next []engine.Tensor) (engi
 		}
 		return nil, floats
 	}
-	ctx, pending, extra, extraDeps := b.rec, b.pending, b.extra, b.extraDeps
+	ctx, pending, extra, extraDeps, nodes := b.rec, b.pending, b.extra, b.extraDeps, b.recCap
 	b.rec, b.pending, b.extra, b.extraDeps = nil, nil, nil, nil
 	b.mu.Unlock()
 
@@ -335,7 +471,7 @@ func (b *Backend) EndStep(ids, logits engine.Tensor, next []engine.Tensor) (engi
 			live = append(live, t)
 		}
 	}
-	g := C.ggml_new_graph_custom(ctx, maxNodes, false)
+	g := C.ggml_new_graph_custom(ctx, C.size_t(nodes), false)
 	for _, e := range extra {
 		C.ggml_build_forward_expand(g, e)
 	}
@@ -379,6 +515,37 @@ func (s *step) compute() []float32 {
 
 func (s *step) Fits(offset int) bool { return offset < s.rs.limit }
 
+// EndBatchStep ends the recording of a batched step
+// (engine.BatchStepReplayer).
+func (b *Backend) EndBatchStep(ids, logits engine.Tensor, next []engine.Tensor) (engine.BatchStep, []float32) {
+	s, floats := b.EndStep(ids, logits, next)
+	if s == nil {
+		return nil, floats
+	}
+	return s.(*step), floats
+}
+
+// FitsRows: every row has room in the caches it writes (engine.BatchStep).
+func (s *step) FitsRows(offs []int) bool {
+	for j, o := range offs {
+		if o >= s.rs.limits[j] {
+			return false
+		}
+	}
+	return true
+}
+
+// RunRows computes the batched step for toks[j] at offs[j] (engine.BatchStep).
+func (s *step) RunRows(toks []int32, offs []int) []float32 {
+	setInt32(s.ids, toks)
+	s.ids.host = append([]int32(nil), toks...)
+	for _, e := range s.rs.embeds {
+		setFloat32(e.out, dequantRows(e.w, e.s, e.b, toks, e.groupSize, e.bits))
+	}
+	s.rs.fillRows(offs)
+	return s.compute()
+}
+
 func (s *step) Run(tok int32, offset int) []float32 {
 	setInt32(s.ids, []int32{tok})
 	s.ids.host = []int32{tok}
@@ -408,6 +575,18 @@ func (rs *recording) free() {
 	}
 	for _, t := range rs.masks {
 		t.free()
+	}
+	if rs.offs != nil {
+		rs.posB.free()
+		for _, t := range rs.rowsB {
+			t.free()
+		}
+		for _, t := range rs.colsB {
+			t.free()
+		}
+		for _, t := range rs.masksB {
+			t.free()
+		}
 	}
 }
 

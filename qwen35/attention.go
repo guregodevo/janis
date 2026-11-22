@@ -130,7 +130,11 @@ func (a *Attention) attendRows(b engine.Backend, ra engine.RowAttention, q, k, v
 	v = b.Transpose(v, 0, 2, 1, 3)
 	ks := make([]engine.Tensor, B)
 	vs := make([]engine.Tensor, B)
+	rp, _ := b.(engine.BatchStepReplayer)
 	for j := 0; j < B; j++ {
+		if rp != nil {
+			rp.AppendRow(j) // a recorded step writes row j's caches at its own inputs
+		}
 		ks[j], vs[j] = caches[j].Update(b, b.Slice(k, 2, j, j+1), b.Slice(v, 2, j, j+1))
 	}
 	out := ra.SDPARows(b.Transpose(q, 2, 1, 0, 3), ks, vs, a.Scale) // [B, H, 1, hd]

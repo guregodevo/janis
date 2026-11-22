@@ -163,8 +163,12 @@ func (m *Model) forwardCachedT(b engine.Backend, idsT engine.Tensor, seqLen, off
 // token of conversation j, at offsets[j], on its caches[j] -> logits
 // [1, B, vocab]. The weights are read once for the B tokens.
 func (m *Model) ForwardBatch(b engine.Backend, ids []int32, offsets []int, caches [][]qwen.LayerCache) engine.Tensor {
-	B := len(ids)
-	h := b.Reshape(m.Embed.Forward(b, b.FromInt32(ids, B)), 1, B, m.Cfg.Hidden)
+	return m.forwardBatchT(b, b.FromInt32(ids, len(ids)), offsets, caches)
+}
+
+func (m *Model) forwardBatchT(b engine.Backend, idsT engine.Tensor, offsets []int, caches [][]qwen.LayerCache) engine.Tensor {
+	B := len(offsets)
+	h := b.Reshape(m.Embed.Forward(b, idsT), 1, B, m.Cfg.Hidden)
 	layer := make([]qwen.LayerCache, B)
 	for i, blk := range m.Blocks {
 		for j := range caches {

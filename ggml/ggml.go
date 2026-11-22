@@ -87,6 +87,8 @@ type Backend struct {
 	repack C.ggml_backend_buffer_type_t
 	// cpu is whether the backend runs on the cores.
 	cpu bool
+	// recCap is the node capacity rec was made with (newRec).
+	recCap int
 	// flash is whether attention is ggml's fused flash attention (SDPA);
 	// else the value cache is kept transposed (AppendValues).
 	flash bool
@@ -160,6 +162,21 @@ var flushEvery = func() int {
 
 // maxNodes bounds one recording context (results and intermediates).
 const maxNodes = 8192
+
+// batchNodes bounds the context a batched step is recorded in: the whole
+// step is one graph, and 32 rows of the 27B are about 24,000 nodes.
+const batchNodes = 65536
+
+// newRec makes the recording context, the larger one while a batched step
+// is recorded. Called with b.mu held.
+func (b *Backend) newRec() {
+	n := maxNodes
+	if rs := b.rec0; rs != nil && rs.offs != nil {
+		n = batchNodes
+	}
+	b.rec = C.janis_ctx(C.size_t(C.ggml_tensor_overhead())*C.size_t(n) + C.ggml_graph_overhead_custom(C.size_t(n), false))
+	b.recCap = n
+}
 
 // New opens the CPU backend, or a GPU one when JANIS_GGML_DEVICE=gpu and a
 // device library (libggml-metal, libggml-cuda) sits next to the CPU one.
@@ -644,7 +661,7 @@ func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx
 		fmt.Fprintf(os.Stderr, "ggml op %s:%d %s -> %v\n", file[strings.LastIndex(file, "/")+1:], line, strings.Join(ins, " "), shape)
 	}
 	if b.rec == nil {
-		b.rec = C.janis_ctx(C.size_t(C.ggml_tensor_overhead())*maxNodes + C.ggml_graph_overhead_custom(maxNodes, false))
+		b.newRec()
 	}
 	node := fn(b.rec)
 	out := &tensor{t: node, shape: append([]int(nil), shape...), dt: dt}
@@ -736,7 +753,7 @@ func (b *Backend) flushLocked() {
 			C.ggml_set_output(p.node)
 		}
 	}
-	g := C.ggml_new_graph_custom(ctx, maxNodes, false)
+	g := C.ggml_new_graph_custom(ctx, C.size_t(b.recCap), false)
 	extra, extraDeps := b.extra, b.extraDeps
 	b.extra, b.extraDeps = nil, nil
 	for _, e := range extra {
@@ -1370,7 +1387,7 @@ func (b *Backend) appendCache(ta, tb *tensor, axis int, vt bool) engine.Tensor {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.rec == nil {
-		b.rec = C.janis_ctx(C.size_t(C.ggml_tensor_overhead())*maxNodes + C.ggml_graph_overhead_custom(maxNodes, false))
+		b.newRec()
 	}
 	grp := ta.grp
 	if b.rec0 != nil {
@@ -1774,10 +1791,14 @@ func (b *Backend) RoPEPositions(x engine.Tensor, dims int, traditional bool, bas
 		p[i] = int32(v)
 	}
 	b.mu.Lock()
-	if rs := b.rec0; rs != nil {
+	rs := b.rec0
+	b.mu.Unlock()
+	if rs != nil {
+		if rs.offs != nil && len(pos) == len(rs.offs) {
+			return b.ropeAt(as(x), dims, traditional, base, scale, rs.posB, nil)
+		}
 		rs.spoil("RoPE at several positions")
 	}
-	b.mu.Unlock()
 	return b.ropeAt(as(x), dims, traditional, base, scale, as(b.FromInt32(p, len(p))), nil)
 }
 
@@ -1894,11 +1915,24 @@ func (b *Backend) SDPARows(q engine.Tensor, ks, vs []engine.Tensor, scale float3
 	for j := range ks {
 		inputs = append(inputs, as(ks[j]), as(vs[j]))
 	}
+	// A recorded batched step reads each row's caches padded to its bucket,
+	// the tokens past the row's position masked by an input.
+	masks := make([]*tensor, B)
 	b.mu.Lock()
-	if rs := b.rec0; rs != nil {
-		rs.spoil("attention over several caches")
-	}
+	rs := b.rec0
 	b.mu.Unlock()
+	if rs != nil {
+		if rs.offs == nil || len(rs.offs) != B {
+			rs.spoil("attention over several caches")
+		} else {
+			for j := range ks {
+				if tk, tv := as(ks[j]), as(vs[j]); tk.replay && tv.replay {
+					masks[j] = b.replayMaskRow(j, tk.shape[2])
+					inputs = append(inputs, masks[j])
+				}
+			}
+		}
+	}
 	return b.op(engine.F32, []int{B, H, 1, Dv}, inputs, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		qq := C.ggml_cont(ctx, f32(ctx, tq)) // ne (D, 1, H, B)
 		var out *C.struct_ggml_tensor
@@ -1913,7 +1947,11 @@ func (b *Backend) SDPARows(q engine.Tensor, ks, vs []engine.Tensor, scale float3
 				vv = f32(ctx, tv)
 			}
 			kq := C.ggml_mul_mat(ctx, kk, qj) // ne (Lj, 1, H, 1)
-			p := C.ggml_soft_max_ext(ctx, kq, nil, C.float(scale), 0)
+			var mask *C.struct_ggml_tensor
+			if masks[j] != nil {
+				mask = masks[j].t
+			}
+			p := C.ggml_soft_max_ext(ctx, kq, mask, C.float(scale), 0)
 			vT := C.ggml_transpose(ctx, vv)
 			if !C.ggml_is_transposed(vv) {
 				vT = C.ggml_cont(ctx, vT)

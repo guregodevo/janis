@@ -105,6 +105,32 @@ type StepReplayer interface {
 	CacheView(cache Tensor, n int) Tensor
 }
 
+// BatchStepReplayer records a decode step of B conversations, one token
+// each, once, and runs the same graph again while the conversations and
+// their order stay: StepReplayer's contract with a row per conversation.
+type BatchStepReplayer interface {
+	// BeginBatchStep starts recording the step, row j at offsets[j]; carry
+	// as in BeginStep.
+	BeginBatchStep(offsets []int, carry []Tensor) []Tensor
+	// AppendRow names the row the cache appends that follow write for.
+	AppendRow(j int)
+	// EndBatchStep ends the recording; ids is the [B] token input, logits
+	// [1, B, vocab]. It returns the step (nil when it cannot be replayed)
+	// and the logits, B rows of vocab.
+	EndBatchStep(ids, logits Tensor, next []Tensor) (BatchStep, []float32)
+	CacheView(cache Tensor, n int) Tensor
+}
+
+// BatchStep is a recorded decode step of B conversations.
+type BatchStep interface {
+	// FitsRows reports whether the step can run with row j at offsets[j].
+	FitsRows(offsets []int) bool
+	// RunRows computes the step for toks[j] at offsets[j] and returns the
+	// logits, B rows of vocab. The carried states are updated in place.
+	RunRows(toks []int32, offsets []int) []float32
+	Close()
+}
+
 // Step is a recorded decode step.
 type Step interface {
 	// Fits reports whether the step can run at offset (its caches' room).

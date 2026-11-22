@@ -145,3 +145,112 @@ func TestBatchedDecodeSpeedOnGGML(t *testing.T) {
 		t.Logf("B=%2d: %.1f ms a step, %.0f tok/s", B, 1000*el/steps, float64(B*steps)/el)
 	}
 }
+
+// A RECORDED BATCHED STEP IS EACH CONVERSATION'S OWN STEP.
+//
+// Three conversations decode six tokens through a BatchDecoder with
+// replay on: the first step stacks the recurrent states, the second is
+// recorded, the rest replay it. Each step's logits are compared with each
+// conversation decoded on its own, reading the caches padded as a
+// recorded step does (JANIS_GGML_PADDECODE).
+func TestARecordedBatchedStepIsEachConversationsOwnStepOnGGML(t *testing.T) {
+	t.Setenv("JANIS_GGML_REPLAY", "1")
+	t.Setenv("JANIS_GGML_PADDECODE", "1")
+	b, m := ggmlModel(t)
+	prompts := [][]int32{{785, 6722, 315, 9625, 374}, {9707, 11, 1879}, {40, 1079, 264, 2632, 315, 279, 1879, 13}}
+	toks := [][]int32{{264, 30, 279}, {1879, 11, 315}, {13, 264, 30}, {315, 1879, 11}, {30, 13, 264}, {11, 315, 1879}}
+	sessions := func() ([][]qwen.LayerCache, []int) {
+		caches := make([][]qwen.LayerCache, len(prompts))
+		offsets := make([]int, len(prompts))
+		for j, p := range prompts {
+			s := m.NewSession()
+			s.Prefill(b, p, nil)
+			caches[j], offsets[j] = s.Caches, len(p)
+		}
+		return caches, offsets
+	}
+	own, ownOff := sessions()
+	batch, batchOff := sessions()
+	d := m.NewBatchDecoder()
+	for n, ids := range toks {
+		got := d.Step(b, ids, batchOff, batch)
+		V := len(got) / len(ids)
+		for j := range prompts {
+			want := b.Floats(m.forwardCachedT(b, b.FromInt32(ids[j:j+1], 1), 1, ownOff[j], own[j]))
+			row := got[j*V : (j+1)*V]
+			maxDiff, wantTop, gotTop := 0.0, 0, 0
+			for i := range want {
+				if dd := math.Abs(float64(want[i] - row[i])); dd > maxDiff {
+					maxDiff = dd
+				}
+				if want[i] > want[wantTop] {
+					wantTop = i
+				}
+				if row[i] > row[gotTop] {
+					gotTop = i
+				}
+			}
+			t.Logf("step %d (recorded: %v), conversation %d: max |diff| %.4f, top %d / %d", n, d.step != nil, j, maxDiff, gotTop, wantTop)
+			if gotTop != wantTop || maxDiff > 1 {
+				t.Errorf("step %d, conversation %d: batched top %d, own %d, max |diff| %.4f", n, j, gotTop, wantTop, maxDiff)
+			}
+			ownOff[j]++
+			batchOff[j]++
+		}
+	}
+	if d.step == nil {
+		t.Error("no step was recorded")
+	}
+	d.Settle()
+	for j, cs := range batch {
+		for _, c := range cs {
+			if c.Len() != batchOff[j] {
+				t.Fatalf("conversation %d: a cache holds %d tokens after Settle, want %d", j, c.Len(), batchOff[j])
+			}
+		}
+	}
+}
+
+// Not a check: tokens per second of BatchDecoder steps with replay on.
+func TestRecordedBatchedDecodeSpeedOnGGML(t *testing.T) {
+	t.Setenv("JANIS_GGML_REPLAY", "1")
+	b, m := ggmlModel(t)
+	sizes := []int{1, 4, 8, 16, 32}
+	if v := os.Getenv("JANIS_BATCH_SIZES"); v != "" {
+		sizes = nil
+		for _, f := range strings.Split(v, ",") {
+			if n, err := strconv.Atoi(f); err == nil {
+				sizes = append(sizes, n)
+			}
+		}
+	}
+	prompt := []int32{785, 6722, 315, 9625, 374, 40, 1079, 264, 2632, 315, 279, 1879, 13}
+	for _, B := range sizes {
+		caches := make([][]qwen.LayerCache, B)
+		offsets := make([]int, B)
+		ids := make([]int32, B)
+		for j := range caches {
+			s := m.NewSession()
+			s.Prefill(b, prompt, nil)
+			caches[j], offsets[j], ids[j] = s.Caches, len(prompt), 264
+		}
+		d := m.NewBatchDecoder()
+		for n := 0; n < 2; n++ { // a plain step stacks the states, the next records
+			d.Step(b, ids, offsets, caches)
+			for j := range offsets {
+				offsets[j]++
+			}
+		}
+		const steps = 20
+		start := time.Now()
+		for n := 0; n < steps; n++ {
+			d.Step(b, ids, offsets, caches)
+			for j := range offsets {
+				offsets[j]++
+			}
+		}
+		el := time.Since(start).Seconds()
+		t.Logf("B=%2d: %.1f ms a step, %.0f tok/s (replayed: %v)", B, 1000*el/steps, float64(B*steps)/el, d.step != nil)
+		d.Settle()
+	}
+}
