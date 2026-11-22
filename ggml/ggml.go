@@ -87,6 +87,8 @@ type Backend struct {
 	repack C.ggml_backend_buffer_type_t
 	// cpu is whether the backend runs on the cores.
 	cpu bool
+	// recCap is the node capacity rec was made with (newRec).
+	recCap int
 	// flash is whether attention is ggml's fused flash attention (SDPA);
 	// else the value cache is kept transposed (AppendValues).
 	flash bool
@@ -160,6 +162,21 @@ var flushEvery = func() int {
 
 // maxNodes bounds one recording context (results and intermediates).
 const maxNodes = 8192
+
+// batchNodes bounds the context a batched step is recorded in: the whole
+// step is one graph, and 32 rows of the 27B are about 24,000 nodes.
+const batchNodes = 65536
+
+// newRec makes the recording context, the larger one while a batched step
+// is recorded. Called with b.mu held.
+func (b *Backend) newRec() {
+	n := maxNodes
+	if rs := b.rec0; rs != nil && rs.offs != nil {
+		n = batchNodes
+	}
+	b.rec = C.janis_ctx(C.size_t(C.ggml_tensor_overhead())*C.size_t(n) + C.ggml_graph_overhead_custom(C.size_t(n), false))
+	b.recCap = n
+}
 
 // New opens the CPU backend, or a GPU one when JANIS_GGML_DEVICE=gpu and a
 // device library (libggml-metal, libggml-cuda) sits next to the CPU one.
@@ -644,7 +661,7 @@ func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx
 		fmt.Fprintf(os.Stderr, "ggml op %s:%d %s -> %v\n", file[strings.LastIndex(file, "/")+1:], line, strings.Join(ins, " "), shape)
 	}
 	if b.rec == nil {
-		b.rec = C.janis_ctx(C.size_t(C.ggml_tensor_overhead())*maxNodes + C.ggml_graph_overhead_custom(maxNodes, false))
+		b.newRec()
 	}
 	node := fn(b.rec)
 	out := &tensor{t: node, shape: append([]int(nil), shape...), dt: dt}
@@ -736,7 +753,7 @@ func (b *Backend) flushLocked() {
 			C.ggml_set_output(p.node)
 		}
 	}
-	g := C.ggml_new_graph_custom(ctx, maxNodes, false)
+	g := C.ggml_new_graph_custom(ctx, C.size_t(b.recCap), false)
 	extra, extraDeps := b.extra, b.extraDeps
 	b.extra, b.extraDeps = nil, nil
 	for _, e := range extra {
@@ -982,6 +999,16 @@ var (
 )
 
 // f32 is x as an F32 node in ctx (a cast when it is not).
+// contig is x, copied only when it is not contiguous: a cont node copies
+// even a contiguous tensor, and the batched recurrent state the scan reads
+// is about 100 MB a layer at 32 conversations of the 27B.
+func contig(ctx *C.struct_ggml_context, x *C.struct_ggml_tensor) *C.struct_ggml_tensor {
+	if C.ggml_is_contiguous(x) {
+		return x
+	}
+	return C.ggml_cont(ctx, x)
+}
+
 func f32(ctx *C.struct_ggml_context, x *tensor) *C.struct_ggml_tensor {
 	if x.dt == engine.F32 {
 		return x.t
@@ -1370,7 +1397,7 @@ func (b *Backend) appendCache(ta, tb *tensor, axis int, vt bool) engine.Tensor {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.rec == nil {
-		b.rec = C.janis_ctx(C.size_t(C.ggml_tensor_overhead())*maxNodes + C.ggml_graph_overhead_custom(maxNodes, false))
+		b.newRec()
 	}
 	grp := ta.grp
 	if b.rec0 != nil {
@@ -1420,6 +1447,34 @@ func (b *Backend) appendCache(ta, tb *tensor, axis int, vt bool) engine.Tensor {
 	b.mu.Unlock()
 	b.track(out)
 	b.mu.Lock()
+	return out
+}
+
+// poolBuffer is a cleared f16 cache buffer of shape [B, H, room, D] and a
+// view of the whole of it, which holds it.
+func (b *Backend) poolBuffer(shape []int, vt bool) *tensor {
+	ctx := C.janis_ctx(ctxMem + C.size_t(C.ggml_tensor_overhead())*64)
+	cne := ne(shape)
+	if vt {
+		cne[0], cne[1] = cne[1], cne[0]
+	}
+	base := C.janis_new(ctx, C.GGML_TYPE_F16, cne[0], cne[1], cne[2], cne[3])
+	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+	if buf == nil {
+		C.ggml_free(ctx)
+		panic("ggml: no room on the device for a key and value pool")
+	}
+	C.ggml_backend_buffer_clear(buf, 0)
+	logAlloc("pool", C.ggml_nbytes(base), shape)
+	grp := &batch{ctx: ctx, buf: buf, base: base, cap: shape[2], vt: vt}
+	out := &tensor{shape: append([]int(nil), shape...), dt: engine.F16, grp: grp, cacheLen: shape[2], pin: true}
+	memMu.Lock()
+	grp.refs++
+	memMu.Unlock()
+	b.mu.Lock()
+	out.t = b.cacheView(grp, shape)
+	b.mu.Unlock()
+	b.track(out)
 	return out
 }
 
@@ -1762,6 +1817,30 @@ func (b *Backend) rope(tx *tensor, dims int, traditional bool, base, scale float
 	if tpos == nil {
 		tpos = b.positionsFor(offset, L)
 	}
+	return b.ropeAt(tx, dims, traditional, base, scale, tpos, freqs)
+}
+
+// RoPEPositions is RoPE with token i of x [B, H, L, D] at pos[i]
+// (engine.RowAttention): a batched step's rows, each at its conversation's
+// position.
+func (b *Backend) RoPEPositions(x engine.Tensor, dims int, traditional bool, base, scale float32, pos []int) engine.Tensor {
+	p := make([]int32, len(pos))
+	for i, v := range pos {
+		p[i] = int32(v)
+	}
+	b.mu.Lock()
+	rs := b.rec0
+	b.mu.Unlock()
+	if rs != nil {
+		if rs.offs != nil && len(pos) == len(rs.offs) {
+			return b.ropeAt(as(x), dims, traditional, base, scale, rs.posB, nil)
+		}
+		rs.spoil("RoPE at several positions")
+	}
+	return b.ropeAt(as(x), dims, traditional, base, scale, as(b.FromInt32(p, len(p))), nil)
+}
+
+func (b *Backend) ropeAt(tx *tensor, dims int, traditional bool, base, scale float32, tpos, freqs *tensor) engine.Tensor {
 	mode := C.int(C.GGML_ROPE_TYPE_NEOX)
 	if traditional {
 		mode = C.GGML_ROPE_TYPE_NORMAL
@@ -1858,6 +1937,71 @@ func (b *Backend) SDPA(q, k, v engine.Tensor, scale float32, causal bool) engine
 			vT = C.ggml_cont(ctx, vT)
 		}
 		return C.ggml_mul_mat(ctx, vT, p) // ne (Dv, Lq, H, B)
+	})
+}
+
+// SDPARows is one decode step's attention for B conversations in one op
+// (engine.RowAttention): row j of q [B, H, 1, D] over its own cache's keys
+// and values ks[j], vs[j] [1, Hk, Lj, D], as SDPA's three ops read them
+// (k·q, softmax with the scale, then v·scores, the value cache read
+// transposed in place) -> [B, H, 1, Dv].
+func (b *Backend) SDPARows(q engine.Tensor, ks, vs []engine.Tensor, scale float32) engine.Tensor {
+	tq := as(q)
+	B, H, D := tq.shape[0], tq.shape[1], tq.shape[3]
+	Dv := as(vs[0]).shape[3]
+	inputs := []*tensor{tq}
+	for j := range ks {
+		inputs = append(inputs, as(ks[j]), as(vs[j]))
+	}
+	// A recorded batched step reads each row's caches padded to its bucket,
+	// the tokens past the row's position masked by an input.
+	masks := make([]*tensor, B)
+	b.mu.Lock()
+	rs := b.rec0
+	b.mu.Unlock()
+	if rs != nil {
+		if rs.offs == nil || len(rs.offs) != B {
+			rs.spoil("attention over several caches")
+		} else {
+			for j := range ks {
+				if tk, tv := as(ks[j]), as(vs[j]); tk.replay && tv.replay {
+					masks[j] = b.replayMaskRow(j, tk.shape[2])
+					inputs = append(inputs, masks[j])
+				}
+			}
+		}
+	}
+	return b.op(engine.F32, []int{B, H, 1, Dv}, inputs, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		qq := C.ggml_cont(ctx, f32(ctx, tq)) // ne (D, 1, H, B)
+		var out *C.struct_ggml_tensor
+		for j := 0; j < B; j++ {
+			qj := C.ggml_view_4d(ctx, qq, C.int64_t(D), 1, C.int64_t(H), 1, qq.nb[1], qq.nb[2], qq.nb[3], C.size_t(j)*qq.nb[3])
+			tk, tv := as(ks[j]), as(vs[j])
+			kk, vv := tk.t, tv.t
+			if tk.dt != engine.F32 && tk.dt != engine.F16 {
+				kk = f32(ctx, tk)
+			}
+			if tv.dt != engine.F32 && tv.dt != engine.F16 {
+				vv = f32(ctx, tv)
+			}
+			kq := C.ggml_mul_mat(ctx, kk, qj) // ne (Lj, 1, H, 1)
+			var mask *C.struct_ggml_tensor
+			if masks[j] != nil {
+				mask = masks[j].t
+			}
+			p := C.ggml_soft_max_ext(ctx, kq, mask, C.float(scale), 0)
+			vT := C.ggml_transpose(ctx, vv)
+			if !C.ggml_is_transposed(vv) {
+				vT = C.ggml_cont(ctx, vT)
+			}
+			o := C.ggml_mul_mat(ctx, vT, p) // ne (Dv, 1, H, 1)
+			if out == nil {
+				out = o
+			} else {
+				out = C.ggml_concat(ctx, out, o, 3)
+			}
+		}
+		return out // ne (Dv, 1, H, B)
 	})
 }
 
@@ -2476,7 +2620,7 @@ func (b *Backend) GatedDeltaScan(q, k, v, g, beta, state engine.Tensor) (engine.
 	rows := T*B + Dv*B
 	res := b.op(engine.F32, []int{rows, Hv * Dv}, []*tensor{tq, tk, tv, tg, tb, ts}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		heads := func(t *tensor) *C.struct_ggml_tensor {
-			x := C.ggml_reshape_4d(ctx, C.ggml_cont(ctx, f32(ctx, t)), C.int64_t(Dk), 1, C.int64_t(Hk), C.int64_t(T*B))
+			x := C.ggml_reshape_4d(ctx, contig(ctx, f32(ctx, t)), C.int64_t(Dk), 1, C.int64_t(Hk), C.int64_t(T*B))
 			if rep > 1 {
 				x = C.ggml_repeat_4d(ctx, x, C.int64_t(Dk), C.int64_t(rep), C.int64_t(Hk), C.int64_t(T*B))
 			}
@@ -2484,10 +2628,10 @@ func (b *Backend) GatedDeltaScan(q, k, v, g, beta, state engine.Tensor) (engine.
 		}
 		qh := C.ggml_scale(ctx, heads(tq), C.float(math.Sqrt(float64(Dv))))
 		kh := heads(tk)
-		vh := C.ggml_reshape_4d(ctx, C.ggml_cont(ctx, f32(ctx, tv)), C.int64_t(Dv), C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
-		gh := C.ggml_reshape_4d(ctx, C.ggml_log(ctx, C.ggml_cont(ctx, f32(ctx, tg))), 1, C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
-		bh := C.ggml_reshape_4d(ctx, C.ggml_cont(ctx, f32(ctx, tb)), 1, C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
-		sh := C.ggml_reshape_4d(ctx, C.ggml_cont(ctx, f32(ctx, ts)), C.int64_t(Dk), C.int64_t(Dv), C.int64_t(Hv), C.int64_t(B))
+		vh := C.ggml_reshape_4d(ctx, contig(ctx, f32(ctx, tv)), C.int64_t(Dv), C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
+		gh := C.ggml_reshape_4d(ctx, C.ggml_log(ctx, contig(ctx, f32(ctx, tg))), 1, C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
+		bh := C.ggml_reshape_4d(ctx, contig(ctx, f32(ctx, tb)), 1, C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
+		sh := C.ggml_reshape_4d(ctx, contig(ctx, f32(ctx, ts)), C.int64_t(Dk), C.int64_t(Dv), C.int64_t(Hv), C.int64_t(B))
 		return C.ggml_gated_delta_net(ctx, qh, kh, vh, gh, bh, sh)
 	})
 	y := b.Reshape(b.Slice(res, 0, 0, T*B), B, T, Hv, Dv)

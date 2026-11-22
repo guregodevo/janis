@@ -75,6 +75,30 @@ func (bl *Block) ForwardCached(b engine.Backend, x engine.Tensor, cache qwen.Lay
 	return b.Add(h, bl.FFN.Forward(b, bl.PostNorm.Forward(b, h)))
 }
 
+// ForwardBatch runs B conversations' next tokens, x [1, B, hidden], one row
+// each, with each conversation's cache for this layer and its offset: the
+// norms, projections and MLP once over the B rows, attention and the
+// recurrence per conversation.
+func (bl *Block) ForwardBatch(b engine.Backend, x engine.Tensor, caches []qwen.LayerCache, offsets []int) engine.Tensor {
+	var r engine.Tensor
+	h := bl.InputNorm.Forward(b, x)
+	if bl.Linear != nil {
+		lc := make([]*LinearCache, len(caches))
+		for j, c := range caches {
+			lc[j] = c.(*LinearCache)
+		}
+		r = bl.Linear.ForwardBatch(b, h, lc)
+	} else {
+		kv := make([]*qwen.KVCache, len(caches))
+		for j, c := range caches {
+			kv[j] = c.(*qwen.KVCache)
+		}
+		r = bl.Attn.ForwardBatch(b, h, kv, offsets)
+	}
+	h = b.Add(x, r)
+	return b.Add(h, bl.FFN.Forward(b, bl.PostNorm.Forward(b, h)))
+}
+
 // Model is the Qwen3.5 text stack: embedding, hybrid decoder blocks, final
 // norm, and an untied quantized lm_head.
 type Model struct {
@@ -133,6 +157,26 @@ func (m *Model) forwardCachedT(b engine.Backend, idsT engine.Tensor, seqLen, off
 	h = m.Norm.Forward(b, h)
 	h = b.Slice(h, 1, seqLen-1, seqLen)
 	return m.head(b, h)
+}
+
+// ForwardBatch is one decode step for B conversations: ids[j] is the next
+// token of conversation j, at offsets[j], on its caches[j] -> logits
+// [1, B, vocab]. The weights are read once for the B tokens.
+func (m *Model) ForwardBatch(b engine.Backend, ids []int32, offsets []int, caches [][]qwen.LayerCache) engine.Tensor {
+	return m.forwardBatchT(b, b.FromInt32(ids, len(ids)), offsets, caches)
+}
+
+func (m *Model) forwardBatchT(b engine.Backend, idsT engine.Tensor, offsets []int, caches [][]qwen.LayerCache) engine.Tensor {
+	B := len(offsets)
+	h := b.Reshape(m.Embed.Forward(b, idsT), 1, B, m.Cfg.Hidden)
+	layer := make([]qwen.LayerCache, B)
+	for i, blk := range m.Blocks {
+		for j := range caches {
+			layer[j] = caches[j][i]
+		}
+		h = blk.ForwardBatch(b, h, layer, offsets)
+	}
+	return m.head(b, m.Norm.Forward(b, h))
 }
 
 // Logits runs a full stateless forward pass, returning last-position logits

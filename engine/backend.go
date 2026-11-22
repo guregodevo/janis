@@ -60,6 +60,16 @@ type KVAppender interface {
 	AppendKV(buf, view Tensor, n int, x Tensor) (newBuf, newView Tensor)
 }
 
+// RowAttention is a backend that runs one decode step's attention for B
+// conversations as one op (a batched decode step): q [B, H, 1, D] and,
+// for conversation j, its cache's keys and values ks[j], vs[j]
+// [1, Hk, Lj, D] -> [B, H, 1, Dv], each row over all its keys.
+type RowAttention interface {
+	SDPARows(q Tensor, ks, vs []Tensor, scale float32) Tensor
+	// RoPEPositions is RoPE over x [B, H, L, D], token i at position pos[i].
+	RoPEPositions(x Tensor, dims int, traditional bool, base, scale float32, pos []int) Tensor
+}
+
 type ValueCache interface {
 	AppendValues(cache, x Tensor) Tensor
 }
@@ -93,6 +103,57 @@ type StepReplayer interface {
 	// CacheView is a cache tensor the recorded step read, viewed at n
 	// tokens: the cache's real length after the step's runs.
 	CacheView(cache Tensor, n int) Tensor
+}
+
+// KVPooler is a backend that keeps B conversations' keys and values of one
+// attention layer in one buffer while they decode together: a batched
+// step's attention for the layer is then a few ops for every row.
+type KVPooler interface {
+	// PoolKV copies conversation j's keys ks[j] and values vs[j]
+	// [1, hk, Lj, d|dv] (nil: none yet) into a pool of room tokens a row.
+	PoolKV(ks, vs []Tensor, hk, d, dv, room int) Pool
+}
+
+// Pool is B conversations' keys and values of one attention layer.
+type Pool interface {
+	Rows() int
+	Room() int
+	// Tensors hold the pool (for Pin/Unpin).
+	Tensors() []Tensor
+	// Append writes k, v [B, hk, 1, d|dv] at row j's token at[j].
+	Append(k, v Tensor, at []int)
+	// Attend is attention for q [B, H, 1, d], row j over its first lens[j]
+	// keys -> [B, H, 1, dv].
+	Attend(q Tensor, lens []int, scale float32) Tensor
+	// Row is conversation j's keys and values at n tokens [1, hk, n, ·],
+	// as caches of its own.
+	Row(j, n int) (k, v Tensor)
+}
+
+// BatchStepReplayer records a decode step of B conversations, one token
+// each, once, and runs the same graph again while the conversations and
+// their order stay: StepReplayer's contract with a row per conversation.
+type BatchStepReplayer interface {
+	// BeginBatchStep starts recording the step, row j at offsets[j]; carry
+	// as in BeginStep.
+	BeginBatchStep(offsets []int, carry []Tensor) []Tensor
+	// AppendRow names the row the cache appends that follow write for.
+	AppendRow(j int)
+	// EndBatchStep ends the recording; ids is the [B] token input, logits
+	// [1, B, vocab]. It returns the step (nil when it cannot be replayed)
+	// and the logits, B rows of vocab.
+	EndBatchStep(ids, logits Tensor, next []Tensor) (BatchStep, []float32)
+	CacheView(cache Tensor, n int) Tensor
+}
+
+// BatchStep is a recorded decode step of B conversations.
+type BatchStep interface {
+	// FitsRows reports whether the step can run with row j at offsets[j].
+	FitsRows(offsets []int) bool
+	// RunRows computes the step for toks[j] at offsets[j] and returns the
+	// logits, B rows of vocab. The carried states are updated in place.
+	RunRows(toks []int32, offsets []int) []float32
+	Close()
 }
 
 // Step is a recorded decode step.
