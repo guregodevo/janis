@@ -58,6 +58,13 @@ type Session struct {
 	// [1, seqLen, vocab]. Both nil (the default) leave decoding as it was.
 	Speculator Speculator
 	ForwardAll ForwardFunc
+	// OnLogits, if set, sees the logits each decode step samples from (a
+	// diagnostic hook, for comparing two ways of computing a step).
+	OnLogits func(logits []float32)
+	// Force, if set, is the reply's tokens in order, taken instead of the
+	// sampled ones while it lasts (a diagnostic hook, with OnLogits: two
+	// ways of computing a step compared over the same tokens).
+	Force []int32
 	// Drafted and Accepted count the tokens proposed and the ones kept.
 	Drafted, Accepted int
 
@@ -392,6 +399,7 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 
 	var gen []int32
 	var logits engine.Tensor
+	var rp replaying
 	// A verified run: rows are the logits after each drafted token still
 	// unread, drafts the tokens they were computed on, and valid the number
 	// of tokens the caches hold that the reply has confirmed.
@@ -430,7 +438,10 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 			break
 		}
 		var floats []float32
-		if len(rows) > 0 {
+		if f := s.replay(b, &rp, tok, valid); f != nil {
+			floats = f
+			valid++
+		} else if len(rows) > 0 {
 			// tok was drafted and read already: its logits are here.
 			floats, rows = rows[0], rows[1:]
 			valid++
@@ -468,7 +479,13 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 			}
 			valid++
 		}
+		if s.OnLogits != nil {
+			s.OnLogits(floats)
+		}
 		tok = sampleToken(floats, p, rng, gen)
+		if len(gen) < len(s.Force) {
+			tok = s.Force[len(gen)]
+		}
 		// The rows left were computed on the drafts: they hold only while
 		// the model's own token is the drafted one.
 		if len(rows) > 0 {
@@ -477,6 +494,7 @@ func (s *Session) Generate(b engine.Backend, newIDs []int32, nGen int, p SampleP
 			}
 		}
 	}
+	rp.settle(s, valid) // first: a recorded step's caches read their bucket's length
 	cut()
 
 	s.IDs = append(append([]int32(nil), newIDs...), gen...)

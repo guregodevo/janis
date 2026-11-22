@@ -124,6 +124,8 @@ type Backend struct {
 	// nominally free. A batch that does not fit, or finds every arena busy,
 	// gets a buffer of its own as before.
 	arenas []*arena
+	// rec0 is the decode step being recorded (replay.go), nil otherwise.
+	rec0 *recording
 }
 
 type arena struct {
@@ -226,6 +228,9 @@ func (b *Backend) Close() {
 		C.ggml_backend_buffer_free(a.buf)
 	}
 	b.arenas = nil
+	memMu.Lock()
+	drainOwned(b.buft)
+	memMu.Unlock()
 	if b.be != nil {
 		C.ggml_backend_free(b.be)
 		b.be = nil
@@ -260,7 +265,14 @@ type tensor struct {
 	// the Q4_1 copy alone.
 	gathered bool
 	dropped  bool // the words are gone: only QuantMatmul may use it now
-	cacheLen int  // a cache view: tokens in use along the token axis
+	pooled   bool // buf came from ownPool and goes back to it
+	replay   bool // a cache view a recorded step reads, padded to its bucket
+	// host holds a small I32 leaf's values (token ids, made from Go), and
+	// gather marks rows taken from a leaf at such ids: Dequantize reads
+	// those rows of the weight itself instead of reading the graph back.
+	host     []int32
+	gather   *gatherRef
+	cacheLen int // a cache view: tokens in use along the token axis
 }
 
 type quantCall struct{ groupSize, bits int }
@@ -285,6 +297,64 @@ type batch struct {
 // memMu guards the refcounts and arena state that finalizers touch from
 // their own goroutine while the engine records and flushes.
 var memMu sync.Mutex
+
+// ownPool keeps the buffers own gave survivors once they are freed, by
+// buffer type and size, for the next ones: a decode step pins the same
+// caches every token, and a buffer of its own per cache per token is a
+// device allocation and a free each (cudaMalloc and cudaFree, which
+// synchronize), 4.6 s of the 27B's 19.9 s over 272 tokens on an H100,
+// 2026-11-22. At most ownPoolMax bytes are kept; past it a buffer is freed.
+// Guarded by memMu.
+var ownPool = struct {
+	free  map[ownKey][]C.ggml_backend_buffer_t
+	bytes C.size_t
+}{free: map[ownKey][]C.ggml_backend_buffer_t{}}
+
+type ownKey struct {
+	buft C.ggml_backend_buffer_type_t
+	size C.size_t
+}
+
+const ownPoolMax = 1 << 30
+
+// takeOwned is a buffer of size from the pool, else a new one; nil when
+// the device has no room. Called with memMu held.
+func takeOwned(buft C.ggml_backend_buffer_type_t, size C.size_t) C.ggml_backend_buffer_t {
+	k := ownKey{buft, size}
+	if l := ownPool.free[k]; len(l) > 0 {
+		buf := l[len(l)-1]
+		ownPool.free[k] = l[:len(l)-1]
+		ownPool.bytes -= size
+		return buf
+	}
+	return C.ggml_backend_buft_alloc_buffer(buft, size)
+}
+
+// giveOwned puts a freed survivor's buffer back. Called with memMu held.
+func giveOwned(buf C.ggml_backend_buffer_t) {
+	size := C.ggml_backend_buffer_get_size(buf)
+	if ownPool.bytes+size > ownPoolMax {
+		C.ggml_backend_buffer_free(buf)
+		return
+	}
+	k := ownKey{C.ggml_backend_buffer_get_type(buf), size}
+	ownPool.free[k] = append(ownPool.free[k], buf)
+	ownPool.bytes += size
+}
+
+// drainOwned frees the pooled buffers of buft. Called with memMu held.
+func drainOwned(buft C.ggml_backend_buffer_type_t) {
+	for k, l := range ownPool.free {
+		if k.buft != buft {
+			continue
+		}
+		for _, buf := range l {
+			C.ggml_backend_buffer_free(buf)
+			ownPool.bytes -= k.size
+		}
+		delete(ownPool.free, k)
+	}
+}
 
 // release drops one reference; called with memMu held.
 func (g *batch) release() {
@@ -366,8 +436,12 @@ func (t *tensor) free() {
 		t.t = nil
 	}
 	if t.buf != nil {
-		C.ggml_backend_buffer_free(t.buf)
-		t.buf = nil
+		if t.pooled {
+			giveOwned(t.buf)
+		} else {
+			C.ggml_backend_buffer_free(t.buf)
+		}
+		t.buf, t.pooled = nil, false
 	}
 	if t.ctx != nil {
 		C.ggml_free(t.ctx)
@@ -444,6 +518,11 @@ func (b *Backend) newFrom(dt engine.DType, shape []int, raw unsafe.Pointer, size
 	}
 	out := &tensor{t: t, ctx: ctx, buf: buf, shape: append([]int(nil), shape...), dt: dt}
 	b.track(out)
+	b.mu.Lock()
+	if b.rec0 != nil {
+		b.rec0.leaves = append(b.rec0.leaves, out)
+	}
+	b.mu.Unlock()
 	return out
 }
 
@@ -475,7 +554,68 @@ func (b *Backend) FromInt32(data []int32, shape ...int) engine.Tensor {
 	if len(data) == 0 {
 		return b.newFrom(engine.I32, shape, nil, 0)
 	}
-	return b.newFrom(engine.I32, shape, unsafe.Pointer(&data[0]), len(data)*4)
+	t := b.newFrom(engine.I32, shape, unsafe.Pointer(&data[0]), len(data)*4)
+	if len(data) <= maxHostIDs {
+		t.host = append([]int32(nil), data...)
+	}
+	return t
+}
+
+// maxHostIDs is the most token ids a leaf keeps on the host for gathers.
+const maxHostIDs = 4096
+
+// gatherRef is rows of a leaf weight taken at ids the host knows.
+type gatherRef struct {
+	src, ids *tensor
+}
+
+// leafRow is row r of a 2-D leaf as float32s, read from the device.
+func leafRow(src *tensor, r int) []float32 {
+	cols := src.shape[len(src.shape)-1]
+	switch src.dt {
+	case engine.I32, engine.U32:
+		v := make([]int32, cols)
+		C.ggml_backend_tensor_get(src.t, unsafe.Pointer(&v[0]), C.size_t(r)*C.size_t(src.t.nb[1]), C.size_t(4*cols))
+		out := make([]float32, cols)
+		for i, x := range v {
+			out[i] = math.Float32frombits(uint32(x)) // the words, bit for bit
+		}
+		return out
+	case engine.F16, engine.BF16:
+		v := make([]uint16, cols)
+		C.ggml_backend_tensor_get(src.t, unsafe.Pointer(&v[0]), C.size_t(r)*C.size_t(src.t.nb[1]), C.size_t(2*cols))
+		out := make([]float32, cols)
+		for i, h := range v {
+			if src.dt == engine.BF16 {
+				out[i] = math.Float32frombits(uint32(h) << 16)
+			} else {
+				out[i] = f16tof32(h)
+			}
+		}
+		return out
+	}
+	out := make([]float32, cols)
+	C.ggml_backend_tensor_get(src.t, unsafe.Pointer(&out[0]), C.size_t(r)*C.size_t(src.t.nb[1]), C.size_t(4*cols))
+	return out
+}
+
+// dequantRows is rows of an affine-quantized leaf (words, scales, biases)
+// dequantized on the host, one row after the other.
+func dequantRows(w, sc, bi *tensor, rows []int32, groupSize, bits int) []float32 {
+	valsPerWord := 32 / bits
+	mask := uint32((1 << bits) - 1)
+	P := w.shape[len(w.shape)-1]
+	in := P * valsPerWord
+	out := make([]float32, 0, len(rows)*in)
+	for _, r := range rows {
+		words, s, bb := leafRow(w, int(r)), leafRow(sc, int(r)), leafRow(bi, int(r))
+		for j := 0; j < in; j++ {
+			q := (math.Float32bits(words[j/valsPerWord]) >> uint((j%valsPerWord)*bits)) & mask
+			g := j / groupSize
+			out = append(out, float32(q)*s[g]+bb[g])
+		}
+	}
+	return out
 }
 
 func (b *Backend) FromRaw(dt engine.DType, raw []byte, shape ...int) engine.Tensor {
@@ -543,7 +683,7 @@ func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx
 		ref.strong = out
 	}
 	b.pending = append(b.pending, ref)
-	full := len(b.pending) >= flushEvery
+	full := len(b.pending) >= flushEvery && b.rec0 == nil
 	if full {
 		b.flushLocked()
 	}
@@ -559,6 +699,9 @@ func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx
 func (b *Backend) flushLocked() {
 	if (len(b.pending) == 0 && len(b.extra) == 0) || b.rec == nil {
 		return
+	}
+	if b.rec0 != nil {
+		b.rec0.spoil("a flush mid-step, from " + callers()) // a readback: the step is computed as it comes
 	}
 	ctx, pending := b.rec, b.pending
 	b.rec, b.pending = nil, nil
@@ -901,17 +1044,27 @@ func (b *Backend) own(x *tensor) {
 	ctx := C.janis_ctx(ctxMem)
 	n := ne(x.shape)
 	t := C.janis_new(ctx, x.t._type, n[0], n[1], n[2], n[3])
-	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+	size := C.ggml_backend_buft_get_alloc_size(b.buft, t)
+	memMu.Lock()
+	buf := takeOwned(b.buft, size)
+	memMu.Unlock()
 	if buf == nil {
 		C.ggml_free(ctx)
 		return // no room for the copy: it stays in its batch
+	}
+	if C.ggml_backend_tensor_alloc(buf, t, C.ggml_backend_buffer_get_base(buf)) != C.GGML_STATUS_SUCCESS {
+		memMu.Lock()
+		giveOwned(buf)
+		memMu.Unlock()
+		C.ggml_free(ctx)
+		return
 	}
 	C.ggml_backend_tensor_copy(x.t, t)
 	runtime.KeepAlive(x)
 	memMu.Lock()
 	x.grp.release()
 	memMu.Unlock()
-	x.grp, x.t, x.ctx, x.buf = nil, t, ctx, buf
+	x.grp, x.t, x.ctx, x.buf, x.pooled = nil, t, ctx, buf, true
 }
 
 func (b *Backend) Unpin(ts ...engine.Tensor) {
@@ -1220,6 +1373,17 @@ func (b *Backend) appendCache(ta, tb *tensor, axis int, vt bool) engine.Tensor {
 		b.rec = C.janis_ctx(C.size_t(C.ggml_tensor_overhead())*maxNodes + C.ggml_graph_overhead_custom(maxNodes, false))
 	}
 	grp := ta.grp
+	if b.rec0 != nil {
+		if grp != nil && grp.base != nil && ta.cacheLen == n && grp.cap >= need && grp.vt == vt {
+			if out, ok := b.recordAppend(grp, tb, shape, axis); ok {
+				b.mu.Unlock()
+				b.track(out)
+				b.mu.Lock()
+				return out
+			}
+		}
+		b.rec0.spoil(fmt.Sprintf("a cache append of %d at %d with no room (cap %v)", tb.shape[axis], n, grp != nil && grp.cap >= need))
+	}
 	if grp == nil || grp.base == nil || ta.cacheLen != n || grp.cap < need || grp.vt != vt {
 		// A new buffer with room: the old cache is copied in by the flush.
 		spare := max(cacheSpare(need), b.reserved-need)
@@ -1457,7 +1621,11 @@ func (b *Backend) TakeAxis(a, indices engine.Tensor, axis int) engine.Tensor {
 	n := numel(ti.shape)
 	shape := append([]int{n}, ta.shape[1:]...)
 	rows := numel(ta.shape[1:])
-	return b.op(ta.dt, shape, []*tensor{ta, ti}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+	var gather *gatherRef
+	if ti.host != nil && ta.grp == nil && ta.t != nil && ta.t.data != nil && len(ta.shape) == 2 {
+		gather = &gatherRef{src: ta, ids: ti}
+	}
+	out := b.op(ta.dt, shape, []*tensor{ta, ti}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		src := C.ggml_reshape_2d(ctx, ta.t, C.int64_t(rows), C.int64_t(ta.shape[0]))
 		idx := C.ggml_reshape_1d(ctx, ti.t, C.int64_t(n))
 		got := C.ggml_get_rows(ctx, src, idx) // F32 out for float types; same type for I32
@@ -1468,6 +1636,8 @@ func (b *Backend) TakeAxis(a, indices engine.Tensor, axis int) engine.Tensor {
 		}
 		return C.ggml_cont(ctx, out)
 	})
+	out.gather = gather
+	return out
 }
 
 // ---- reductions and norms ----
@@ -1579,7 +1749,19 @@ func (b *Backend) RoPEFreqs(x engine.Tensor, dims int, traditional bool, scale f
 func (b *Backend) rope(tx *tensor, dims int, traditional bool, base, scale float32, offset int, freqs *tensor) engine.Tensor {
 	nd := len(tx.shape)
 	L := tx.shape[nd-2]
-	tpos := b.positionsFor(offset, L)
+	var tpos *tensor
+	b.mu.Lock()
+	if rs := b.rec0; rs != nil {
+		if L == 1 && offset == rs.offset {
+			tpos = rs.pos
+		} else {
+			rs.spoil(fmt.Sprintf("RoPE of %d at %d", L, offset))
+		}
+	}
+	b.mu.Unlock()
+	if tpos == nil {
+		tpos = b.positionsFor(offset, L)
+	}
 	mode := C.int(C.GGML_ROPE_TYPE_NEOX)
 	if traditional {
 		mode = C.GGML_ROPE_TYPE_NORMAL
@@ -1617,7 +1799,17 @@ func (b *Backend) SDPA(q, k, v engine.Tensor, scale float32, causal bool) engine
 		}
 	}
 	var tmask *tensor
-	if causal {
+	if Lq == 1 && !causal && !tk.replay && padDecode() {
+		// Read as a recorded step reads: padded to its bucket, masked.
+		if p := tk.replayPad(tv); p > Lk {
+			Lkp = p
+			tmask = b.maskFor(1, Lk, Lkp)
+		}
+	}
+	switch {
+	case tk.replay && tv.replay && Lq == 1:
+		tmask = b.replayMask(Lk)
+	case causal:
 		tmask = b.maskFor(Lq, Lk, Lkp)
 	}
 	shape := []int{B, H, Lq, Dv}
@@ -1737,6 +1929,15 @@ func (b *Backend) maskFor(Lq, Lk, Lkp int) *tensor {
 // backend does; the matmul path never needs it.
 func (b *Backend) Dequantize(w, scales, biases engine.Tensor, groupSize, bits int) engine.Tensor {
 	tw := as(w)
+	if gw, gs, gb := tw.gather, as(scales).gather, as(biases).gather; gw != nil && gs != nil && gb != nil && gw.ids == gs.ids && gs.ids == gb.ids {
+		// Rows of the embedding at known ids: read from the weight, with
+		// no readback of the graph (a flush in every decode step).
+		shape := append([]int(nil), tw.shape...)
+		shape[len(shape)-1] = tw.shape[len(shape)-1] * 32 / bits
+		out := as(b.FromFloats(dequantRows(gw.src, gs.src, gb.src, gw.ids.host, groupSize, bits), shape...))
+		b.recordEmbed(out, gw, gs, gb, groupSize, bits)
+		return out
+	}
 	words := b.Ints(w)
 	sc, bi := b.Floats(scales), b.Floats(biases)
 	valsPerWord := 32 / bits
