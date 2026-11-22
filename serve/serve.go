@@ -72,6 +72,9 @@ type Server struct {
 	// answers while a long request holds the engine (janis#19).
 	loadedMu sync.Mutex
 	loaded   string
+
+	// batch is the batch loop's queue (batch.go).
+	batch queue
 }
 
 // New makes a server with the default loader. Name preloads that installed
@@ -251,6 +254,10 @@ func (s *Server) ensure(name string) error {
 	if s.current != nil && s.name == pick.Name {
 		return nil
 	}
+	if s.batch.decoding > 0 {
+		// Loading closes the engine the batch loop decodes on.
+		return fmt.Errorf("model %q is decoding %d replies; ask for it, or wait", s.name, s.batch.decoding)
+	}
 	eng, err := s.load(pick.Path)
 	if err != nil {
 		return fmt.Errorf("load %s: %w", pick.Name, err)
@@ -344,6 +351,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		st = startSSE(w)
 		defer st.stopKeepalive()
 	}
+	// later is the answer of a request decoded in the batch loop: it waits
+	// for its reply off the engine thread, which the loop needs.
+	var later func()
 	err := s.onEngineCtx(r.Context(), func() {
 		if err := s.ensure(req.Model); err != nil {
 			if st != nil {
@@ -408,8 +418,22 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		for _, m := range msgs {
 			inTokens += s.current.NumTokens(m.Content)
 		}
-		if !req.Stream {
-			reply := s.current.ChatStream(msgs, opts, nil)
+		chatFn := s.current.ChatStream
+		if b := s.batched(req, msgs); b != nil {
+			chatFn = func(msgs []llm.Message, opts llm.Options, onDelta func(string)) string {
+				reply, err := s.chatBatched(ctx, b, msgs, opts, onDelta)
+				if err != nil && ctx.Err() == nil {
+					s.logf("batched reply: %v", err)
+				}
+				return reply
+			}
+		}
+		answer := func() {
+			if req.Stream {
+				s.streamChat(st, ctx, req, msgs, opts, id, created, inTokens, chatFn)
+				return
+			}
+			reply := chatFn(msgs, opts, nil)
 			if ctx.Err() != nil {
 				writeCancelled(w)
 				return
@@ -433,10 +457,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				"choices": []map[string]any{{"index": 0, "message": msg, "finish_reason": finish}},
 				"usage":   u,
 			})
+		}
+		if s.batched(req, msgs) != nil {
+			later = answer
 			return
 		}
-		s.streamChat(st, ctx, req, msgs, opts, id, created, inTokens)
+		answer()
 	})
+	if err == nil && later != nil {
+		later()
+	}
 	if err != nil {
 		if st != nil {
 			st.send(map[string]any{"error": cancelledError()})
@@ -515,7 +545,7 @@ func (st *sseStream) stopKeepalive() {
 // streamChat writes server-sent events: the role, text deltas as they come
 // (held back by the length of "<tool_call>" so an opening tag is never
 // half-sent), then the tool calls, the finish and, when asked, the usage.
-func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest, msgs []llm.Message, opts llm.Options, id string, created int64, inTokens int) {
+func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest, msgs []llm.Message, opts llm.Options, id string, created int64, inTokens int, chatFn func([]llm.Message, llm.Options, func(string)) string) {
 	send := st.send
 	chunk := func(delta map[string]any, finish any) map[string]any {
 		return map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": s.name,
@@ -549,7 +579,7 @@ func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest,
 			emitted = safe
 		}
 	}
-	reply := s.current.ChatStream(msgs, opts, onDelta)
+	reply := chatFn(msgs, opts, onDelta)
 	st.stopKeepalive()
 	// A generation the stopping server cut short is not finished: no finish
 	// chunk and no [DONE], an error event a client raises instead.
