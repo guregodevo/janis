@@ -1762,6 +1762,26 @@ func (b *Backend) rope(tx *tensor, dims int, traditional bool, base, scale float
 	if tpos == nil {
 		tpos = b.positionsFor(offset, L)
 	}
+	return b.ropeAt(tx, dims, traditional, base, scale, tpos, freqs)
+}
+
+// RoPEPositions is RoPE with token i of x [B, H, L, D] at pos[i]
+// (engine.RowAttention): a batched step's rows, each at its conversation's
+// position.
+func (b *Backend) RoPEPositions(x engine.Tensor, dims int, traditional bool, base, scale float32, pos []int) engine.Tensor {
+	p := make([]int32, len(pos))
+	for i, v := range pos {
+		p[i] = int32(v)
+	}
+	b.mu.Lock()
+	if rs := b.rec0; rs != nil {
+		rs.spoil("RoPE at several positions")
+	}
+	b.mu.Unlock()
+	return b.ropeAt(as(x), dims, traditional, base, scale, as(b.FromInt32(p, len(p))), nil)
+}
+
+func (b *Backend) ropeAt(tx *tensor, dims int, traditional bool, base, scale float32, tpos, freqs *tensor) engine.Tensor {
 	mode := C.int(C.GGML_ROPE_TYPE_NEOX)
 	if traditional {
 		mode = C.GGML_ROPE_TYPE_NORMAL
@@ -1858,6 +1878,54 @@ func (b *Backend) SDPA(q, k, v engine.Tensor, scale float32, causal bool) engine
 			vT = C.ggml_cont(ctx, vT)
 		}
 		return C.ggml_mul_mat(ctx, vT, p) // ne (Dv, Lq, H, B)
+	})
+}
+
+// SDPARows is one decode step's attention for B conversations in one op
+// (engine.RowAttention): row j of q [B, H, 1, D] over its own cache's keys
+// and values ks[j], vs[j] [1, Hk, Lj, D], as SDPA's three ops read them
+// (k·q, softmax with the scale, then v·scores, the value cache read
+// transposed in place) -> [B, H, 1, Dv].
+func (b *Backend) SDPARows(q engine.Tensor, ks, vs []engine.Tensor, scale float32) engine.Tensor {
+	tq := as(q)
+	B, H, D := tq.shape[0], tq.shape[1], tq.shape[3]
+	Dv := as(vs[0]).shape[3]
+	inputs := []*tensor{tq}
+	for j := range ks {
+		inputs = append(inputs, as(ks[j]), as(vs[j]))
+	}
+	b.mu.Lock()
+	if rs := b.rec0; rs != nil {
+		rs.spoil("attention over several caches")
+	}
+	b.mu.Unlock()
+	return b.op(engine.F32, []int{B, H, 1, Dv}, inputs, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		qq := C.ggml_cont(ctx, f32(ctx, tq)) // ne (D, 1, H, B)
+		var out *C.struct_ggml_tensor
+		for j := 0; j < B; j++ {
+			qj := C.ggml_view_4d(ctx, qq, C.int64_t(D), 1, C.int64_t(H), 1, qq.nb[1], qq.nb[2], qq.nb[3], C.size_t(j)*qq.nb[3])
+			tk, tv := as(ks[j]), as(vs[j])
+			kk, vv := tk.t, tv.t
+			if tk.dt != engine.F32 && tk.dt != engine.F16 {
+				kk = f32(ctx, tk)
+			}
+			if tv.dt != engine.F32 && tv.dt != engine.F16 {
+				vv = f32(ctx, tv)
+			}
+			kq := C.ggml_mul_mat(ctx, kk, qj) // ne (Lj, 1, H, 1)
+			p := C.ggml_soft_max_ext(ctx, kq, nil, C.float(scale), 0)
+			vT := C.ggml_transpose(ctx, vv)
+			if !C.ggml_is_transposed(vv) {
+				vT = C.ggml_cont(ctx, vT)
+			}
+			o := C.ggml_mul_mat(ctx, vT, p) // ne (Dv, 1, H, 1)
+			if out == nil {
+				out = o
+			} else {
+				out = C.ggml_concat(ctx, out, o, 3)
+			}
+		}
+		return out // ne (Dv, 1, H, B)
 	})
 }
 

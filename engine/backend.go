@@ -60,6 +60,16 @@ type KVAppender interface {
 	AppendKV(buf, view Tensor, n int, x Tensor) (newBuf, newView Tensor)
 }
 
+// RowAttention is a backend that runs one decode step's attention for B
+// conversations as one op (a batched decode step): q [B, H, 1, D] and,
+// for conversation j, its cache's keys and values ks[j], vs[j]
+// [1, Hk, Lj, D] -> [B, H, 1, Dv], each row over all its keys.
+type RowAttention interface {
+	SDPARows(q Tensor, ks, vs []Tensor, scale float32) Tensor
+	// RoPEPositions is RoPE over x [B, H, L, D], token i at position pos[i].
+	RoPEPositions(x Tensor, dims int, traditional bool, base, scale float32, pos []int) Tensor
+}
+
 type ValueCache interface {
 	AppendValues(cache, x Tensor) Tensor
 }

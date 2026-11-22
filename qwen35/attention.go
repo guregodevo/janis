@@ -69,6 +69,9 @@ func (a *Attention) Forward(b engine.Backend, x engine.Tensor, cache *qwen.KVCac
 func (a *Attention) ForwardBatch(b engine.Backend, x engine.Tensor, caches []*qwen.KVCache, offsets []int) engine.Tensor {
 	B := x.Shape()[1]
 	q, gate, k, v := a.project(b, x, B)
+	if ra, ok := b.(engine.RowAttention); ok {
+		return a.output(b, a.attendRows(b, ra, q, k, v, caches, offsets), gate, B)
+	}
 	var out engine.Tensor
 	for j := 0; j < B; j++ {
 		o := a.attend(b, b.Slice(q, 1, j, j+1), b.Slice(k, 1, j, j+1), b.Slice(v, 1, j, j+1), caches[j], offsets[j], 1)
@@ -111,6 +114,27 @@ func (a *Attention) attend(b engine.Backend, q, k, v engine.Tensor, cache *qwen.
 
 	out := b.SDPA(q, k, v, a.Scale, L > 1) // [1, H, L, hd]
 	return b.Reshape(b.Transpose(out, 0, 2, 1, 3), 1, L, a.NHeads*a.HeadDim)
+}
+
+// attendRows is attention for B conversations' next rows on a backend
+// that runs it as one op: q and k rotated in one RoPE each, row j at its
+// conversation's offset, each row's k and v appended to its own cache, and
+// every row's attention in one SDPARows. q, k, v [1, B, heads, hd] ->
+// [1, B, H*hd].
+func (a *Attention) attendRows(b engine.Backend, ra engine.RowAttention, q, k, v engine.Tensor, caches []*qwen.KVCache, offsets []int) engine.Tensor {
+	B := q.Shape()[1]
+	// [1, B, heads, hd] -> [1, heads, B, hd]: the rows as the tokens RoPE
+	// rotates, each at its own position.
+	q = ra.RoPEPositions(b.Transpose(q, 0, 2, 1, 3), a.RopeDims, false, a.RopeBase, 1.0, offsets)
+	k = ra.RoPEPositions(b.Transpose(k, 0, 2, 1, 3), a.RopeDims, false, a.RopeBase, 1.0, offsets)
+	v = b.Transpose(v, 0, 2, 1, 3)
+	ks := make([]engine.Tensor, B)
+	vs := make([]engine.Tensor, B)
+	for j := 0; j < B; j++ {
+		ks[j], vs[j] = caches[j].Update(b, b.Slice(k, 2, j, j+1), b.Slice(v, 2, j, j+1))
+	}
+	out := ra.SDPARows(b.Transpose(q, 2, 1, 0, 3), ks, vs, a.Scale) // [B, H, 1, hd]
+	return b.Reshape(b.Transpose(out, 0, 2, 1, 3), 1, B, a.NHeads*a.HeadDim)
 }
 
 // output gates the attention rows and projects them back: [1, L, H*hd] -> [1, L, hidden].
