@@ -167,3 +167,37 @@ func TestLinearCacheMarks(t *testing.T) {
 		t.Fatal("a reset drops the state and the marks")
 	}
 }
+
+// An agent's next request replays the reply in the template's form, not as
+// generated, and adds a tool result: it parts from the session where the
+// reply began. Generate marks the prompt one token short of its end, so the
+// next request prefills that token and what is new, not the conversation.
+func TestHybridSessionReturnsToTheEndOfTheLastPrompt(t *testing.T) {
+	b := cpu.New()
+	s, total, reset := hybridSession(b)
+	prompt := []int32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	s.Generate(b, prompt, 2, qwen.SampleParams{})
+	if fmt.Sprint(s.Marks()) != "[11]" {
+		t.Fatalf("the prompt is marked one token short of its end: %v", s.Marks())
+	}
+	next := append(append([]int32(nil), prompt...), 55, 56, 57) // the reply as rendered, then a tool result
+	reset()
+	s.Prefill(b, next, nil)
+	if got := total(); got != 4 {
+		t.Fatalf("the next request prefilled %d tokens, want 4: the prompt's last token and the 3 new ones", got)
+	}
+	if linear := s.Caches[0].(*LinearCache); linear.Len() != len(next) {
+		t.Fatalf("the recurrent layer holds the request: %d", linear.Len())
+	}
+
+	// A model with no recurrent layer returns to any length: no mark.
+	kv := &qwen.Session{NLayers: 1, Forward: func(b engine.Backend, _ engine.Tensor, n, offset int, caches []qwen.LayerCache) engine.Tensor {
+		c := caches[0].(*qwen.KVCache)
+		c.K, c.V = b.FromFloats(make([]float32, offset+n), 1, 1, offset+n, 1), b.FromFloats(make([]float32, offset+n), 1, 1, offset+n, 1)
+		return b.FromFloats([]float32{0, 1}, 1, 2)
+	}, PrefillChunk: 4}
+	kv.Generate(b, prompt, 2, qwen.SampleParams{})
+	if len(kv.Marks()) != 0 {
+		t.Fatalf("a KV-only session needs no mark: %v", kv.Marks())
+	}
+}
