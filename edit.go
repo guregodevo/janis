@@ -128,7 +128,10 @@ func (e *Engine) Weights() ([]Weight, error) {
 }
 
 // ReadWeight returns the weight's values as the model uses them now, row
-// major, with its shape: a quantized matrix dequantized to [out, in].
+// major, with its shape: a quantized matrix dequantized to [out, in]. It
+// reads the bytes the weight was made from, the edit's or the checkpoint's,
+// not the backend's copy: ggml repacks a matrix to its own format on first
+// use and keeps no MLX layout to read back.
 func (e *Engine) ReadWeight(name string) ([]float32, []int, error) {
 	p, err := e.param(name)
 	if err != nil {
@@ -136,15 +139,42 @@ func (e *Engine) ReadWeight(name string) ([]float32, []int, error) {
 	}
 	mlxComputeMu.Lock()
 	defer mlxComputeMu.Unlock()
-	var t engine.Tensor
-	if l := p.Quant; l != nil {
-		t = e.bk.Dequantize(l.Weight, l.Scales, l.Biases, l.GroupSize, l.Bits)
-	} else {
-		t = e.bk.Cast(*p.Plain, engine.F32)
+	get := func(n string) (safetensors.Entry, error) {
+		if rec, ok := e.edits[name]; ok {
+			if en, ok := rec.entries[n]; ok {
+				return en, nil
+			}
+		}
+		dt, shape, raw, err := e.st.Get(n)
+		if err != nil {
+			return safetensors.Entry{}, fmt.Errorf("weight edits: %w", err)
+		}
+		return safetensors.Entry{Dtype: dt, Shape: shape, Raw: raw}, nil
 	}
-	v, shape := e.bk.Floats(t), append([]int(nil), t.Shape()...)
-	sweep(e.bk)
-	return v, shape, nil
+	if l := p.Quant; l != nil {
+		pre := quantPrefix(name)
+		var en [3]safetensors.Entry
+		for i, suffix := range []string{".weight", ".scales", ".biases"} {
+			if en[i], err = get(pre + suffix); err != nil {
+				return nil, nil, err
+			}
+		}
+		v, err := qwen.DequantizeAffine(en[0], en[1], en[2], l.GroupSize, l.Bits)
+		if err != nil {
+			return nil, nil, fmt.Errorf("weight edits: %s: %w", name, err)
+		}
+		rows := en[0].Shape[0]
+		return v, []int{rows, len(v) / rows}, nil
+	}
+	en, err := get(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	v, err := safetensors.DecodeFloats(en.Dtype, en.Raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("weight edits: %s: %w", name, err)
+	}
+	return v, append([]int(nil), en.Shape...), nil
 }
 
 // EditWeight replaces the weight with v, row major in the shape ReadWeight

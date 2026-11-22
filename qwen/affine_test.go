@@ -31,6 +31,18 @@ func TestQuantizeAffineDequantizes(t *testing.T) {
 		s, _ := TensorFrom(b, safetensors.Entry{Dtype: "BF16", Shape: []int{rows, cols / gs}, Raw: scales})
 		bi, _ := TensorFrom(b, safetensors.Entry{Dtype: "BF16", Shape: []int{rows, cols / gs}, Raw: biases})
 		got := b.Floats(b.Dequantize(w, s, bi, gs, bits))
+		inGo, err := DequantizeAffine(
+			safetensors.Entry{Dtype: "U32", Shape: []int{rows, cols * bits / 32}, Raw: packed},
+			safetensors.Entry{Dtype: "BF16", Shape: []int{rows, cols / gs}, Raw: scales},
+			safetensors.Entry{Dtype: "BF16", Shape: []int{rows, cols / gs}, Raw: biases}, gs, bits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range got {
+			if inGo[i] != got[i] {
+				t.Fatalf("%d bits: DequantizeAffine[%d] = %v, the backend's %v", bits, i, inGo[i], got[i])
+			}
+		}
 		sc, _ := safetensors.DecodeFloats("BF16", scales)
 		for i, x := range v {
 			step := sc[(i/cols)*(cols/gs)+(i%cols)/gs]
