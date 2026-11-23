@@ -131,6 +131,10 @@ type recording struct {
 	// A pool's inputs: the value elements per (room, m), the mask per length.
 	poolCols  map[[2]int]*tensor
 	poolMasks map[int]*tensor
+	// The rows on and off ([B, 1, 1, 1], 1 and 0) of a step with rows
+	// held (RowsOn), nil until asked for.
+	onB, offB *tensor
+	on        []bool
 }
 
 // at is the offset the cache appends being recorded write at.
@@ -363,6 +367,46 @@ func (rs *recording) fillRows(offs []int) {
 	for n, t := range rs.poolMasks {
 		setFloat32(t, poolMaskAt(lens, n))
 	}
+	if rs.onB != nil {
+		on, off := rowsOnAt(rs.on)
+		setFloat32(rs.onB, on)
+		setFloat32(rs.offB, off)
+	}
+}
+
+// rowsOnAt is 1 for each row on and 0 for each held, and its complement.
+func rowsOnAt(rows []bool) (on, off []float32) {
+	on, off = make([]float32, len(rows)), make([]float32, len(rows))
+	for j, r := range rows {
+		if r {
+			on[j] = 1
+		} else {
+			off[j] = 1
+		}
+	}
+	return on, off
+}
+
+// RowsOn is the rows on and off of a batched step (engine.RowHolder): the
+// step's inputs while it is recorded, else tensors of their own.
+func (b *Backend) RowsOn(rows []bool) (engine.Tensor, engine.Tensor) {
+	B := len(rows)
+	b.mu.Lock()
+	rs := b.rec0
+	b.mu.Unlock()
+	if rs == nil || rs.offs == nil || len(rs.offs) != B {
+		on, off := rowsOnAt(rows)
+		return b.FromFloats(on, B, 1, 1, 1), b.FromFloats(off, B, 1, 1, 1)
+	}
+	if rs.onB == nil {
+		rs.onB = b.replayInput(engine.F32, B, 1, 1, 1)
+		rs.offB = b.replayInput(engine.F32, B, 1, 1, 1)
+	}
+	rs.on = append(rs.on[:0], rows...)
+	on, off := rowsOnAt(rows)
+	setFloat32(rs.onB, on)
+	setFloat32(rs.offB, off)
+	return rs.onB, rs.offB
 }
 
 // replayPoolCols is a pool's value element input for a batched step being
@@ -590,6 +634,15 @@ func (s *step) FitsRows(offs []int) bool {
 	return true
 }
 
+// RunRowsOn is RunRows with the rows on (engine.HeldStep); a step recorded
+// without RowsOn reads none.
+func (s *step) RunRowsOn(toks []int32, offs []int, on []bool) []float32 {
+	if s.rs.onB != nil {
+		s.rs.on = append(s.rs.on[:0], on...)
+	}
+	return s.RunRows(toks, offs)
+}
+
 // RunRows computes the batched step for toks[j] at offs[j] (engine.BatchStep).
 func (s *step) RunRows(toks []int32, offs []int) []float32 {
 	setInt32(s.ids, toks)
@@ -647,6 +700,10 @@ func (rs *recording) free() {
 		}
 		for _, t := range rs.poolMasks {
 			t.free()
+		}
+		if rs.onB != nil {
+			rs.onB.free()
+			rs.offB.free()
 		}
 	}
 }

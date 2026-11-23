@@ -195,3 +195,119 @@ func maxInt(a, b int) int {
 	}
 	return b
 }
+
+// ON FIXED ROWS, REPLIES THAT JOIN AND LEAVE ARE THE REPLIES DECODED ALONE.
+//
+// JANIS_FIXED_ROWS: a reply joins the batch mid-way, another ends and its
+// row is held, then a follow-up of the ended conversation joins on its
+// slot, reading the state the held row kept. Greedy, each text equals the
+// one Chat gives alone (the follow-up on the session that read the first
+// turn). Logs how the steps ran: after the first stack, joins and leaves
+// should not stack the rows again.
+func TestOnFixedRowsRepliesThatJoinAndLeaveAreTheRepliesAlone(t *testing.T) {
+	joinAndLeave(t, 24)
+}
+
+// ON FIXED ROWS, A ROW THAT FILLS ITS POOL IS STACKED AGAIN.
+//
+// Replies 600 tokens long in pools with 256 tokens of room past the
+// longest row (JANIS_POOL_SPARE=256): rows fill their pool while they
+// decode and when they join. The rows are stacked again, more than once,
+// and every reply has its text. The texts are not compared to the replies
+// alone: past a few hundred tokens a near tie flips on the rounding of
+// another batch size, on fixed rows and off them alike (2026-11-23: the
+// same word at the same place, both ways). Every row is taken back and stacked in
+// a new pool; the texts stay the ones decoded alone. (A pool made in a
+// recorded step was run again at every replay, from the freed old pool:
+// a segfault, 2026-11-23.)
+func TestOnFixedRowsARowThatFillsItsPoolIsStackedAgain(t *testing.T) {
+	t.Setenv("JANIS_POOL_SPARE", "256")
+	kinds := joinAndLeave(t, 600)
+	if kinds["plain"] < 2 {
+		t.Errorf("steps %v: no row stacked again after the first stack", kinds)
+	}
+}
+
+// joinAndLeave decodes the replies of the fixed-row tests and returns how
+// its steps ran; the texts must be the replies alone when maxTokens is
+// short enough for no near tie to flip.
+func joinAndLeave(t *testing.T, maxTokens int) map[string]int {
+	old := fixedRows
+	fixedRows = true
+	t.Cleanup(func() { fixedRows = old })
+	e := batchEngine(t, 3)
+	opts := Options{Temp: 0, MaxTokens: maxTokens}
+	a := userPrompt("Name three prime numbers.")
+	b := userPrompt("Write one sentence about the sea, and nothing else.")
+	if maxTokens > 100 {
+		a = userPrompt("Name three prime numbers, then explain at length why each is prime.")
+		b = userPrompt("Write a long story about the sea.")
+	}
+	fresh := func() {
+		if e.slotDecoder != nil {
+			e.slotDecoder.Settle()
+		}
+		e.session, e.slots = e.q35.NewSession(), nil
+	}
+	followUp := func(reply string) []Message {
+		return append(append([]Message{}, a...), Message{Role: "assistant", Content: reply}, Message{Role: "user", Content: "Now name three more."})
+	}
+	fresh()
+	aloneA := e.Chat(a, opts)
+	aloneA2 := e.Chat(followUp(aloneA), opts)
+	fresh()
+	aloneB := e.Chat(b, opts)
+	fresh()
+
+	kinds := map[string]int{}
+	begin := func(m []Message) Reply {
+		r, err := e.BeginChat(m, opts, nil)
+		if err != nil || r == nil {
+			t.Fatalf("BeginChat: %v %v", r, err)
+		}
+		return r
+	}
+	step := func(live []Reply) {
+		e.StepChats(live)
+		kinds[e.slotDecoder.Last]++
+	}
+	ra := begin(a)
+	for i := 0; i < 6; i++ {
+		step([]Reply{ra})
+	}
+	rb := begin(b) // joins while a decodes
+	live := []Reply{ra, rb}
+	for !ra.Done() {
+		step(live)
+	}
+	togetherA := e.FinishChat(ra) // a's row is held from here
+	ra2 := begin(followUp(togetherA))
+	if ra2.(*chatGen).slot != ra.(*chatGen).slot {
+		t.Errorf("the follow-up is on slot %d, the first turn was on %d", ra2.(*chatGen).slot, ra.(*chatGen).slot)
+	}
+	live = []Reply{rb, ra2}
+	out := map[Reply]string{}
+	for len(live) > 0 {
+		step(live)
+		for j := len(live) - 1; j >= 0; j-- {
+			if live[j].Done() {
+				out[live[j]] = e.FinishChat(live[j])
+				live = slices.Delete(live, j, j+1)
+			}
+		}
+	}
+	t.Logf("steps: %v", kinds)
+	for _, c := range []struct{ name, alone, together string }{
+		{"a", aloneA, togetherA}, {"b", aloneB, out[rb]}, {"a's follow-up", aloneA2, out[ra2]},
+	} {
+		t.Logf("%s alone    %q", c.name, c.alone)
+		t.Logf("%s together %q", c.name, c.together)
+		if c.together == "" {
+			t.Errorf("%s: no text", c.name)
+		}
+		if maxTokens <= 100 && c.alone != c.together {
+			t.Errorf("%s:\n alone    %q\n together %q", c.name, c.alone, c.together)
+		}
+	}
+	return kinds
+}

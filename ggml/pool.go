@@ -39,6 +39,11 @@ func (b *Backend) PoolKV(ks, vs []engine.Tensor, hk, d, dv, room int) engine.Poo
 	p.k = b.poolBuffer([]int{B, hk, room, d}, false)
 	p.v = b.poolBuffer([]int{B, hk, room, dv}, !b.flash)
 	b.mu.Lock()
+	if b.rec0 != nil {
+		// The copies would be nodes of the recorded step, run again at
+		// every replay from a pool freed after it.
+		b.rec0.spoil("a pool made while a step is recorded")
+	}
 	if b.rec == nil {
 		b.newRec()
 	}
@@ -236,4 +241,41 @@ func (p *kvPool) Row(j, n int) (engine.Tensor, engine.Tensor) {
 		return nil, nil
 	}
 	return row(p.k, p.d), row(p.v, p.dv)
+}
+
+// SetRow copies k, v [1, Hk, L, D] into row j from its first token, now
+// (engine.PoolRowWriter): a conversation joining the pool at its row. The
+// tokens past L keep what they held; nothing reads them.
+func (p *kvPool) SetRow(j int, k, v engine.Tensor) {
+	if k == nil {
+		return
+	}
+	b := p.b
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.rec == nil {
+		b.newRec()
+	}
+	b.writeCacheRow(p.k.grp, as(k), j)
+	b.writeCacheRow(p.v.grp, as(v), j)
+	b.flushLocked()
+}
+
+// WriteRow copies src [1, ...] into row j of dst [B, ...], now
+// (engine.RowWriter): a recurrent state joining a batch's stack at its row.
+func (b *Backend) WriteRow(dst engine.Tensor, j int, src engine.Tensor) {
+	d, s := as(dst), as(src)
+	b.own(d)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.rec == nil {
+		b.newRec()
+	}
+	m := ne(s.shape)
+	g := len(d.shape) - 1
+	row := C.ggml_view_4d(b.rec, d.t, m[0], m[1], m[2], m[3], d.t.nb[1], d.t.nb[2], d.t.nb[3], C.size_t(j)*C.size_t(d.t.nb[g]))
+	C.ggml_backend_view_init(row)
+	b.extra = append(b.extra, C.ggml_cpy(b.rec, s.t, row))
+	b.extraDeps = append(b.extraDeps, s, d)
+	b.flushLocked()
 }

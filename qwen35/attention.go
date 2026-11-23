@@ -2,6 +2,8 @@ package qwen35
 
 import (
 	"math"
+	"os"
+	"strconv"
 
 	"github.com/guregodevo/janis/engine"
 	"github.com/guregodevo/janis/qwen"
@@ -144,9 +146,15 @@ func (a *Attention) attendRows(b engine.Backend, ra engine.RowAttention, q, k, v
 	return b.Reshape(b.Transpose(out, 0, 2, 1, 3), 1, B, a.NHeads*a.HeadDim)
 }
 
-// poolSpare is the room a new pool has past its longest row, in tokens: a
-// pool is made again, its rows copied, when a row fills it.
-const poolSpare = 512
+// poolSpare is the room a new pool has past its longest row, in tokens
+// (JANIS_POOL_SPARE, 512 unset): a pool is made again, its rows copied,
+// when a row fills it.
+func poolSpare() int {
+	if n, err := strconv.Atoi(os.Getenv("JANIS_POOL_SPARE")); err == nil && n > 0 {
+		return n
+	}
+	return 512
+}
 
 // attendPooled is attention for B conversations' next rows with the B
 // conversations' keys and values in one pool (engine.KVPooler): one RoPE
@@ -164,7 +172,7 @@ func (a *Attention) attendPooled(b engine.Backend, ra engine.RowAttention, kp en
 			ks[j], vs[j] = c.K, c.V
 			room = max(room, offsets[j]+1)
 		}
-		pool = kp.PoolKV(ks, vs, a.NKVHeads, a.HeadDim, a.HeadDim, room+poolSpare)
+		pool = kp.PoolKV(ks, vs, a.NKVHeads, a.HeadDim, a.HeadDim, room+poolSpare())
 		for j, c := range caches {
 			c.Lend(pool, j, offsets[j])
 		}
