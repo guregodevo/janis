@@ -156,6 +156,38 @@ type BatchStep interface {
 	Close()
 }
 
+// RowHolder is a backend whose batched steps can hold rows: a held row is
+// computed with the others, its recurrent state kept as it was, its keys
+// and values written past its length, where nothing reads them, and its
+// logits not read. A batch whose rows never change (a row a slot, held
+// while the slot has no reply) keeps its stacks and its recorded step
+// while replies come and go.
+type RowHolder interface {
+	// RowsOn is on [B, 1, 1, 1] (1 for a row that decodes, 0 for a held
+	// one) and off, 1 - on, both F32. While a batched step is recorded
+	// they are its inputs, written at each run (HeldStep.RunRowsOn).
+	RowsOn(on []bool) (onT, offT Tensor)
+}
+
+// HeldStep is a recorded batched step that runs with rows held.
+type HeldStep interface {
+	RunRowsOn(toks []int32, offsets []int, on []bool) []float32
+}
+
+// RowWriter is a backend that writes into a row of a tensor in place: a
+// conversation joining a batch's stack at its row.
+type RowWriter interface {
+	// WriteRow copies src [1, ...] into row j of dst [B, ...], now.
+	WriteRow(dst Tensor, j int, src Tensor)
+}
+
+// PoolRowWriter is a Pool whose row can be written again: a conversation
+// joining the pool at its row.
+type PoolRowWriter interface {
+	// SetRow copies k, v [1, hk, L, d|dv] into row j from its first token, now.
+	SetRow(j int, k, v Tensor)
+}
+
 // Step is a recorded decode step.
 type Step interface {
 	// Fits reports whether the step can run at offset (its caches' room).

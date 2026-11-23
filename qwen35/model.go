@@ -79,7 +79,7 @@ func (bl *Block) ForwardCached(b engine.Backend, x engine.Tensor, cache qwen.Lay
 // each, with each conversation's cache for this layer and its offset: the
 // norms, projections and MLP once over the B rows, attention and the
 // recurrence per conversation.
-func (bl *Block) ForwardBatch(b engine.Backend, x engine.Tensor, caches []qwen.LayerCache, offsets []int) engine.Tensor {
+func (bl *Block) ForwardBatch(b engine.Backend, x engine.Tensor, caches []qwen.LayerCache, offsets []int, held *rowsOn) engine.Tensor {
 	var r engine.Tensor
 	h := bl.InputNorm.Forward(b, x)
 	if bl.Linear != nil {
@@ -87,7 +87,7 @@ func (bl *Block) ForwardBatch(b engine.Backend, x engine.Tensor, caches []qwen.L
 		for j, c := range caches {
 			lc[j] = c.(*LinearCache)
 		}
-		r = bl.Linear.ForwardBatch(b, h, lc)
+		r = bl.Linear.ForwardBatch(b, h, lc, held)
 	} else {
 		kv := make([]*qwen.KVCache, len(caches))
 		for j, c := range caches {
@@ -163,10 +163,10 @@ func (m *Model) forwardCachedT(b engine.Backend, idsT engine.Tensor, seqLen, off
 // token of conversation j, at offsets[j], on its caches[j] -> logits
 // [1, B, vocab]. The weights are read once for the B tokens.
 func (m *Model) ForwardBatch(b engine.Backend, ids []int32, offsets []int, caches [][]qwen.LayerCache) engine.Tensor {
-	return m.forwardBatchT(b, b.FromInt32(ids, len(ids)), offsets, caches)
+	return m.forwardBatchT(b, b.FromInt32(ids, len(ids)), offsets, caches, nil)
 }
 
-func (m *Model) forwardBatchT(b engine.Backend, idsT engine.Tensor, offsets []int, caches [][]qwen.LayerCache) engine.Tensor {
+func (m *Model) forwardBatchT(b engine.Backend, idsT engine.Tensor, offsets []int, caches [][]qwen.LayerCache, held *rowsOn) engine.Tensor {
 	B := len(offsets)
 	h := b.Reshape(m.Embed.Forward(b, idsT), 1, B, m.Cfg.Hidden)
 	layer := make([]qwen.LayerCache, B)
@@ -174,7 +174,7 @@ func (m *Model) forwardBatchT(b engine.Backend, idsT engine.Tensor, offsets []in
 		for j := range caches {
 			layer[j] = caches[j][i]
 		}
-		h = blk.ForwardBatch(b, h, layer, offsets)
+		h = blk.ForwardBatch(b, h, layer, offsets, held)
 	}
 	return m.head(b, m.Norm.Forward(b, h))
 }

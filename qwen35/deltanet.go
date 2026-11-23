@@ -203,17 +203,18 @@ func LoadGatedDeltaNet(b engine.Backend, st *safetensors.File, prefix string, cf
 func (d *GatedDeltaNet) Forward(b engine.Backend, x engine.Tensor, cache *LinearCache) engine.Tensor {
 	S := x.Shape()[1]
 	qkv, z, aProj, bProj := d.project(b, x, S)
-	ys := d.scan(b, qkv, aProj, bProj, []*LinearCache{cache}, S)
+	ys := d.scan(b, qkv, aProj, bProj, []*LinearCache{cache}, S, nil)
 	return d.output(b, x, ys, z, S)
 }
 
 // ForwardBatch runs B conversations' next tokens, x [1, B, hidden], one row
 // each: the projections once over the B rows, and the conv and the
-// recurrence as one op each over the B conversations' stacked states.
-func (d *GatedDeltaNet) ForwardBatch(b engine.Backend, x engine.Tensor, caches []*LinearCache) engine.Tensor {
+// recurrence as one op each over the B conversations' stacked states. A
+// held row (held, nil for none) keeps its tail and state.
+func (d *GatedDeltaNet) ForwardBatch(b engine.Backend, x engine.Tensor, caches []*LinearCache, held *rowsOn) engine.Tensor {
 	B := x.Shape()[1]
 	qkv, z, aProj, bProj := d.project(b, x, B)
-	ys := d.scan(b, qkv, aProj, bProj, caches, 1)
+	ys := d.scan(b, qkv, aProj, bProj, caches, 1, held)
 	return d.output(b, x, ys, z, B)
 }
 
@@ -231,7 +232,7 @@ func (d *GatedDeltaNet) project(b engine.Backend, x engine.Tensor, S int) (qkv, 
 // on its cache's tail and state -> ys [1, B*S, Hv, Dv]. The B conversations'
 // tails and states are stacked into one conv and one scan; one conversation
 // builds exactly the graph it always did.
-func (d *GatedDeltaNet) scan(b engine.Backend, qkv, aProj, bProj engine.Tensor, caches []*LinearCache, S int) engine.Tensor {
+func (d *GatedDeltaNet) scan(b engine.Backend, qkv, aProj, bProj engine.Tensor, caches []*LinearCache, S int, held *rowsOn) engine.Tensor {
 	B := len(caches)
 	convDim := 2*d.KHeads*d.KDim + d.VHeads*d.VDim
 	keyDim := d.KHeads * d.KDim
@@ -315,7 +316,7 @@ func (d *GatedDeltaNet) scan(b engine.Backend, qkv, aProj, bProj engine.Tensor, 
 	beta := b.Sigmoid(b.Cast(bProj, engine.F32))                                      // [B, S, Hv]
 	g := b.Exp(b.Mul(b.Softplus(b.Cast(b.Add(aProj, d.DtBias), engine.F32)), d.NegA)) // [B, S, Hv]
 
-	var state engine.Tensor
+	var state, oldState engine.Tensor
 	if lent != nil {
 		state = lent.state
 	} else {
@@ -331,9 +332,16 @@ func (d *GatedDeltaNet) scan(b engine.Backend, qkv, aProj, bProj engine.Tensor, 
 
 	// The whole recurrence is one fused op (a metal kernel on MLX, a plain
 	// loop on CPU); k-head → v-head mapping happens inside it.
+	oldState = state
 	ys, state := b.GatedDeltaScan(
 		b.Cast(q, engine.F32), b.Cast(k, engine.F32), b.Cast(v, engine.F32),
 		g, beta, state) // ys [B, S, Hv, Dv]
+	if held != nil && B > 1 {
+		// A held row's tail and state are the ones it came with.
+		on3, off3 := b.Reshape(held.on, B, 1, 1), b.Reshape(held.off, B, 1, 1)
+		newTails = b.Add(b.Mul(tails, off3), b.Mul(newTails, on3))
+		state = b.Add(b.Mul(oldState, held.off), b.Mul(state, held.on))
+	}
 	if B > 1 {
 		// Each conversation's row stays in the stack until something else
 		// needs it.
@@ -350,6 +358,10 @@ func (d *GatedDeltaNet) scan(b engine.Backend, qkv, aProj, bProj engine.Tensor, 
 	}
 	return ys
 }
+
+// rowsOn are a batched step's rows on and off, [B, 1, 1, 1] each
+// (engine.RowHolder): a held row's recurrent state stays as it was.
+type rowsOn struct{ on, off engine.Tensor }
 
 // lentStack is the stack caches decoded in together last step, rows in
 // caches' order; nil when they did not.
@@ -386,3 +398,28 @@ func (d *GatedDeltaNet) Conv(b engine.Backend, convIn engine.Tensor) engine.Tens
 }
 
 func sqrtf(v float32) float32 { return float32(math.Sqrt(float64(v))) }
+
+// Lent reports whether the state is a row of a batch's stack.
+func (c *LinearCache) Lent() bool { return c.lent != nil }
+
+// CanJoin: sib is a row of a stack of rows rows, and the backend writes
+// rows in place (qwen.RowJoiner).
+func (c *LinearCache) CanJoin(b engine.Backend, sib qwen.LayerCache, _, rows int) bool {
+	s, ok := sib.(*LinearCache)
+	if !ok || s.lent == nil || c.lent != nil || c.Conv == nil || c.State == nil || s.lent.conv.Shape()[0] != rows {
+		return false
+	}
+	_, ok = b.(engine.RowWriter)
+	return ok
+}
+
+// Join writes the tail and the state into row j of sib's stack and lends
+// them there (qwen.RowJoiner).
+func (c *LinearCache) Join(b engine.Backend, sib qwen.LayerCache, j int) {
+	l := sib.(*LinearCache).lent
+	w := b.(engine.RowWriter)
+	w.WriteRow(l.conv, j, c.Conv)
+	w.WriteRow(l.state, j, c.State)
+	c.Conv, c.State = nil, nil
+	c.lent = &lentRow{b: l.b, conv: l.conv, state: l.state, row: j}
+}

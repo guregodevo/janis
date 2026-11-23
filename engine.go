@@ -124,7 +124,8 @@ type Engine struct {
 	slotUsed    []int
 	slotClock   int
 	slotDecoder *qwen35.BatchDecoder
-	slotStep    []int // the slots of the last StepChats, in its order
+	slotStep    []int       // the slots of the last StepChats, in its order
+	slotStats   *batchStats // JANIS_BATCH_STATS=1, else nil
 	// ink2 is the loaded Inkling 2 text stack (nil for other families).
 	ink2 *inkling2.Model
 	// vision is set for a model with a vision tower (nil otherwise).
@@ -421,6 +422,9 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 	p, maxTok := e.sampleParams(opts, onDelta)
 
 	mlxComputeMu.Lock()
+	if fixedRows && e.slots != nil && sess == e.session {
+		e.settleSlots() // slot 0 decodes alone: every row back from the batch
+	}
 	if e.vision != nil {
 		ids = e.see(sess, ids, images)
 	}

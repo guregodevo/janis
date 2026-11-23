@@ -7,6 +7,8 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/guregodevo/janis/engine"
 )
@@ -14,6 +16,41 @@ import (
 // debugPrefill logs the prefix-reuse split per generation (MLX_DEBUG_PREFILL=1)
 // so we can see how much of a prompt is re-prefilled vs reused across turns.
 var debugPrefill = os.Getenv("MLX_DEBUG_PREFILL") == "1"
+
+// prefillTrace (JANIS_PREFILL_TRACE=1) logs where each prefill's time
+// goes: the set-up, each chunk's graph, its pins and sweep, its eval, the
+// marks, the logits read.
+var prefillTrace = os.Getenv("JANIS_PREFILL_TRACE") == "1"
+
+// phaseClock times a prefill's phases for prefillTrace; nil when off.
+type phaseClock struct {
+	t0, t time.Time
+	parts []string
+}
+
+func newPhaseClock() *phaseClock {
+	if !prefillTrace {
+		return nil
+	}
+	now := time.Now()
+	return &phaseClock{t0: now, t: now}
+}
+
+func (c *phaseClock) lap(name string) {
+	if c == nil {
+		return
+	}
+	now := time.Now()
+	c.parts = append(c.parts, fmt.Sprintf("%s %.1f", name, float64(now.Sub(c.t).Microseconds())/1000))
+	c.t = now
+}
+
+func (c *phaseClock) log(what string) {
+	if c == nil {
+		return
+	}
+	debugLog("prefill trace %s: %.1f ms | %s", what, float64(time.Since(c.t0).Microseconds())/1000, strings.Join(c.parts, " | "))
+}
 
 func debugLog(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "[mlx] "+format+"\n", a...)
@@ -211,6 +248,7 @@ func canTruncate(caches []LayerCache, n int) bool {
 // a recorded decode step writes the latest state in place; the last prompt
 // token's chunk makes new ones from the marked state.
 func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool, endMark bool) ([]float32, bool) {
+	clk := newPhaseClock()
 	sw, _ := b.(engine.Sweeper)
 	old := cacheTensors(s.Caches) // previous turn's caches, to be freed
 	prevLen := cachedLen(s.Caches)
@@ -275,6 +313,7 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool, 
 
 	suffix := newIDs[P:]
 	offset := P
+	clk.lap(fmt.Sprintf("setup (reuse %d of %d)", P, len(newIDs)))
 
 	// Chunked prefill. Forwarding a long prompt in one pass holds EVERY layer's
 	// activations (~seq × intermediate × layers) live until the single eval —
@@ -322,12 +361,15 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool, 
 			sw.Unpin(logits)
 		}
 		logits = s.Forward(b, b.FromInt32(chunk, len(chunk)), len(chunk), offset, s.Caches)
+		clk.lap(fmt.Sprintf("graph %d", len(chunk)))
 		offset += len(chunk)
 		if want > 0 && offset == want {
 			s.mark(want)
+			clk.lap("mark")
 		}
 		if last > 0 && offset == last && last != want && !canTruncate(s.Caches, 1) {
 			s.mark(last)
+			clk.lap("mark")
 		}
 		if sw != nil {
 			// Sweep this chunk's intermediates BEFORE its eval: the graph holds
@@ -341,7 +383,9 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool, 
 			pinCaches(sw, s.Caches)
 			unpinGone(sw, prev, cacheTensors(s.Caches))
 			sw.Sweep()
+			clk.lap("pin+sweep")
 			b.Eval(append(cacheTensors(s.Caches), logits)...)
+			clk.lap("eval")
 		}
 		if cancel != nil && cancel() {
 			// Cancelled mid-prefill: the cache now holds `offset` tokens, so record
@@ -352,12 +396,15 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool, 
 		}
 	}
 	floats := b.Floats(logits) // last-position logits
+	clk.lap("logits")
 	if sw != nil {
 		sw.Unpin(logits)
 		pinCaches(sw, s.Caches)
 		unpinGone(sw, old, cacheTensors(s.Caches))
 		sw.Sweep()
+		clk.lap("sweep")
 	}
+	clk.log(fmt.Sprintf("%d new", len(suffix)))
 	return floats, true
 }
 
