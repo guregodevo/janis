@@ -22,6 +22,7 @@ import (
 // fakeEngine answers with a script and records the rendered prompt.
 type fakeEngine struct {
 	reply     string
+	thinking  string // heard through opts.OnReasoning before the reply
 	got       []llm.Message
 	opts      llm.Options
 	state     string
@@ -49,6 +50,9 @@ func (f *fakeEngine) ChatStream(msgs []llm.Message, opts llm.Options, onDelta fu
 		for _, w := range strings.Fields(f.reply) { // a word a token, as NumTokens counts
 			opts.OnToken(0, w)
 		}
+	}
+	if f.thinking != "" && opts.OnReasoning != nil {
+		opts.OnReasoning(f.thinking)
 	}
 	if onDelta != nil {
 		for i := 0; i < len(f.reply); i += 3 { // three bytes at a time, like tokens
@@ -199,6 +203,28 @@ func TestAReplyTheBudgetCutEndsLength(t *testing.T) {
 		if _, finish, _, _ := readStream(t, resp); finish != c.finish {
 			t.Errorf("%s streamed: finish %q, want %s", c.name, finish, c.finish)
 		}
+	}
+}
+
+// The thinking a reply carried apart counts in usage with the reply, and is
+// handed back as reasoning_content, not in the content.
+func TestUsageCountsTheThinking(t *testing.T) {
+	installFake(t, "Qwen3-8B-4bit", 40960)
+	srv := newTestServer(t, &fakeEngine{reply: "The answer.", thinking: "Let me see."})
+	body := `{"model":"Qwen3-8B-4bit","messages":[{"role":"user","content":"go"}]`
+	_, v := post(t, srv.URL+"/v1/chat/completions", body+`}`)
+	msg := v["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "The answer." || msg["reasoning_content"] != "Let me see." {
+		t.Fatalf("message: %v", msg)
+	}
+	if u := v["usage"].(map[string]any); u["completion_tokens"].(float64) != 5 {
+		t.Fatalf("usage: %v", u)
+	}
+	resp, _ := post(t, srv.URL+"/v1/chat/completions", body+`,"stream":true,"stream_options":{"include_usage":true}}`)
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(raw), `"reasoning_content":"Let me see."`) || !strings.Contains(string(raw), `"completion_tokens":5`) {
+		t.Fatalf("stream: %s", raw)
 	}
 }
 

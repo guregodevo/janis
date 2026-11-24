@@ -44,10 +44,13 @@ const hermesFiller = "You are a helpful assistant."
 // ApplyTemplateEffort is ApplyTemplate with a thinking effort for the
 // families that take one (Inkling 2: none, minimal, low, medium, high,
 // xhigh, max). "" is the family's default, and so is a name it does not
-// know.
+// know. Qwen3 and Qwen3.5 think or not: "none" is off, any other name on.
 func ApplyTemplateEffort(modelType string, msgs []Message, effort string) string {
-	if modelType == "inkling2_loop" {
+	switch {
+	case modelType == "inkling2_loop":
 		return inkling(msgs, effort)
+	case thinksInline(modelType):
+		return chatml(msgs, !qwenThinks(effort))
 	}
 	return ApplyTemplate(modelType, msgs)
 }

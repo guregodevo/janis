@@ -253,11 +253,11 @@ func Open(modelDir string) (*Engine, error) {
 	return e, nil
 }
 
-// reply is the generated tokens as text, and the thinking apart for a
-// family that writes it as a message of its own.
+// reply is the generated tokens as text, and the thinking apart: a
+// message of its own for Inkling 2, the <think> block for Qwen3.
 func (e *Engine) reply(ids []int32) (text, reasoning string) {
 	if e.ink == nil {
-		return e.tok.Decode(ids), ""
+		return chat.SplitThinking(e.mtype, e.tok.Decode(ids))
 	}
 	return chat.InklingReply(ids, *e.ink, e.tok.Decode)
 }
