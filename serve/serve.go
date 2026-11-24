@@ -209,7 +209,9 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 func installedModels() ([]hostfit.InstalledModel, error) { return hostfit.ListInstalled() }
 
 // contextLength is the model's own window, from its config.json; 0 when the
-// file does not say.
+// file does not say. A multimodal checkpoint (Qwen3.5, Qwen3.8) keeps it in
+// text_config: read only at the top, the 27B listed no window and a client
+// guessed 128k for a 262,144-token model.
 func contextLength(dir string) int {
 	b, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if err != nil {
@@ -217,9 +219,15 @@ func contextLength(dir string) int {
 	}
 	var cfg struct {
 		MaxPositionEmbeddings int `json:"max_position_embeddings"`
+		TextConfig            struct {
+			MaxPositionEmbeddings int `json:"max_position_embeddings"`
+		} `json:"text_config"`
 	}
 	_ = json.Unmarshal(b, &cfg)
-	return cfg.MaxPositionEmbeddings
+	if cfg.MaxPositionEmbeddings > 0 {
+		return cfg.MaxPositionEmbeddings
+	}
+	return cfg.TextConfig.MaxPositionEmbeddings
 }
 
 // ensure loads name (an installed model's name, or "" for whatever is

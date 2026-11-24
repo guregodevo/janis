@@ -584,3 +584,23 @@ func TestAStreamedRequestForAnUnknownModelGetsAnErrorEvent(t *testing.T) {
 		t.Fatalf("%q", b)
 	}
 }
+
+func TestTheContextLengthOfAMultimodalCheckpointIsItsTextConfigs(t *testing.T) {
+	for _, c := range []struct {
+		config string
+		want   int
+	}{
+		{`{"max_position_embeddings": 32768}`, 32768},
+		{`{"model_type": "qwen3_5", "text_config": {"max_position_embeddings": 262144}}`, 262144},
+		{`{"max_position_embeddings": 40960, "text_config": {"max_position_embeddings": 262144}}`, 40960},
+		{`{"model_type": "qwen3_5"}`, 0},
+	} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(c.config), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := contextLength(dir); got != c.want {
+			t.Errorf("%s: context length %d, want %d", c.config, got, c.want)
+		}
+	}
+}
