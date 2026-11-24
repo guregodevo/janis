@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -414,6 +415,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if traceTokens {
 			opts.OnToken = func(id int32, text string) { s.logf("token %d %q", id, text) }
 		}
+		budget := countTokens(&opts)
 		inTokens := 0
 		for _, m := range msgs {
 			inTokens += s.current.NumTokens(m.Content)
@@ -430,7 +432,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		answer := func() {
 			if req.Stream {
-				s.streamChat(st, ctx, req, msgs, opts, id, created, inTokens, chatFn)
+				s.streamChat(st, ctx, req, msgs, opts, budget, id, created, inTokens, chatFn)
 				return
 			}
 			reply := chatFn(msgs, opts, nil)
@@ -439,10 +441,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			text, calls := s.parseCalls(reply, req.Tools)
-			finish := "stop"
-			if len(calls) > 0 {
-				finish = "tool_calls"
-			}
+			finish := finishReason(len(calls), budget.spent())
 			u := usage{PromptTokens: inTokens, CompletionTokens: s.current.NumTokens(reply)}
 			u.TotalTokens = u.PromptTokens + u.CompletionTokens
 			msg := map[string]any{"role": "assistant", "content": text}
@@ -545,7 +544,7 @@ func (st *sseStream) stopKeepalive() {
 // streamChat writes server-sent events: the role, text deltas as they come
 // (held back by the length of "<tool_call>" so an opening tag is never
 // half-sent), then the tool calls, the finish and, when asked, the usage.
-func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest, msgs []llm.Message, opts llm.Options, id string, created int64, inTokens int, chatFn func([]llm.Message, llm.Options, func(string)) string) {
+func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest, msgs []llm.Message, opts llm.Options, budget *tokenBudget, id string, created int64, inTokens int, chatFn func([]llm.Message, llm.Options, func(string)) string) {
 	send := st.send
 	chunk := func(delta map[string]any, finish any) map[string]any {
 		return map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": s.name,
@@ -588,10 +587,9 @@ func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest,
 		return
 	}
 	_, calls := s.parseCalls(reply, req.Tools)
-	finish := "stop"
+	finish := finishReason(len(calls), budget.spent())
 	switch {
 	case len(calls) > 0:
-		finish = "tool_calls"
 		for i := range calls {
 			idx := i
 			calls[i].Index = &idx
@@ -608,6 +606,41 @@ func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest,
 		send(map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": s.name, "choices": []any{}, "usage": u})
 	}
 	st.write([]byte("data: [DONE]\n\n"))
+}
+
+// tokenBudget counts the tokens a reply commits against its max_tokens. A
+// stop token is never committed, so a reply that reached the budget was cut.
+type tokenBudget struct {
+	max int
+	n   atomic.Int64
+}
+
+// countTokens wraps opts.OnToken with the count, keeping what it did.
+func countTokens(opts *llm.Options) *tokenBudget {
+	b := &tokenBudget{max: opts.MaxTokens}
+	prev := opts.OnToken
+	opts.OnToken = func(id int32, text string) {
+		b.n.Add(1)
+		if prev != nil {
+			prev(id, text)
+		}
+	}
+	return b
+}
+
+func (b *tokenBudget) spent() bool { return b.max > 0 && int(b.n.Load()) >= b.max }
+
+// finishReason is the OpenAI finish_reason: tool_calls for a reply that
+// called, length for one the token budget cut, else stop. A client reads
+// stop as a finished answer; length says the reply was cut and may go on.
+func finishReason(calls int, cut bool) string {
+	switch {
+	case calls > 0:
+		return "tool_calls"
+	case cut:
+		return "length"
+	}
+	return "stop"
 }
 
 // ---- the Hermes protocol ----
