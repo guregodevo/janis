@@ -45,6 +45,11 @@ func (f *fakeEngine) ChatStream(msgs []llm.Message, opts llm.Options, onDelta fu
 		}
 		return "Half"
 	}
+	if opts.OnToken != nil {
+		for _, w := range strings.Fields(f.reply) { // a word a token, as NumTokens counts
+			opts.OnToken(0, w)
+		}
+	}
 	if onDelta != nil {
 		for i := 0; i < len(f.reply); i += 3 { // three bytes at a time, like tokens
 			end := min(i+3, len(f.reply))
@@ -168,6 +173,32 @@ func TestAPlainAnswerStreamedAndNot(t *testing.T) {
 	text, finish, sawUsage, sawDone := readStream(t, resp)
 	if text != "The capital of France is Paris." || finish != "stop" || !sawUsage || !sawDone {
 		t.Fatalf("stream: %q %q usage=%v done=%v", text, finish, sawUsage, sawDone)
+	}
+}
+
+// A reply the token budget cut ends "length", streamed or not: a client
+// reads "stop" as a finished answer and drops it when it is empty, as a cut
+// tool call is (live 2026-11-23: memdoor sent the same prompt again).
+func TestAReplyTheBudgetCutEndsLength(t *testing.T) {
+	installFake(t, "Qwen3-8B-4bit", 40960)
+	tools := `"tools":[{"type":"function","function":{"name":"write_file","parameters":{"type":"object"}}}]`
+	cases := []struct{ name, reply, maxTokens, finish string }{
+		{"prose cut", "one two three four", `"max_tokens":4`, "length"},
+		{"prose ended", "one two three", `"max_tokens":4`, "stop"},
+		{"tool call cut", `<tool_call> {"name": "write_file", "arguments": {"path":`, `"max_completion_tokens":5`, "length"},
+		{"tool call closed", `<tool_call> {"name": "write_file", "arguments": {}} </tool_call>`, `"max_tokens":7`, "tool_calls"},
+	}
+	for _, c := range cases {
+		srv := newTestServer(t, &fakeEngine{reply: c.reply})
+		body := `{"model":"Qwen3-8B-4bit","messages":[{"role":"user","content":"go"}],` + tools + `,` + c.maxTokens
+		_, v := post(t, srv.URL+"/v1/chat/completions", body+`}`)
+		if got := v["choices"].([]any)[0].(map[string]any)["finish_reason"]; got != c.finish {
+			t.Errorf("%s: finish %v, want %s", c.name, got, c.finish)
+		}
+		resp, _ := post(t, srv.URL+"/v1/chat/completions", body+`,"stream":true}`)
+		if _, finish, _, _ := readStream(t, resp); finish != c.finish {
+			t.Errorf("%s streamed: finish %q, want %s", c.name, finish, c.finish)
+		}
 	}
 }
 
