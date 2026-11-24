@@ -14,6 +14,49 @@ import (
 // MLX_ENABLE_THINKING=1.
 func thinkingEnabled() bool { return os.Getenv("MLX_ENABLE_THINKING") == "1" }
 
+// qwenThinks reports whether a Qwen3 turn thinks: as the request's
+// reasoning_effort says ("none" off, any level on), else as
+// MLX_ENABLE_THINKING says.
+func qwenThinks(effort string) bool {
+	switch effort {
+	case "":
+		return thinkingEnabled()
+	case "none":
+		return false
+	}
+	return true
+}
+
+// thinksInline reports whether a family writes its thinking in the reply,
+// as <think>…</think> before the answer (Qwen3, Qwen3.5).
+func thinksInline(modelType string) bool {
+	switch modelType {
+	case "qwen3", "qwen3_moe", "qwen3_5":
+		return true
+	}
+	return false
+}
+
+// SplitThinking parts a reply of a family that thinks inline into the answer
+// and the thinking: the text inside <think>…</think>, or after an open
+// <think> a cut reply never closed. Leading whitespace is dropped from each,
+// so both only grow as the reply does. Another family's reply is the answer.
+func SplitThinking(modelType, reply string) (text, reasoning string) {
+	if !thinksInline(modelType) {
+		return reply, ""
+	}
+	rest := strings.TrimLeft(reply, " \t\r\n")
+	if !strings.HasPrefix(rest, "<think>") {
+		return reply, ""
+	}
+	rest = rest[len("<think>"):]
+	think, answer, closed := strings.Cut(rest, "</think>")
+	if !closed {
+		return "", strings.TrimLeft(rest, " \t\r\n")
+	}
+	return strings.TrimLeft(answer, " \t\r\n"), strings.TrimLeft(think, " \t\r\n")
+}
+
 // Message is one chat turn.
 type Message struct {
 	Role    string `json:"role"`
@@ -41,7 +84,7 @@ func ApplyTemplate(modelType string, msgs []Message) string {
 		// unless thinking is explicitly enabled. Without this, a 30B-A3B agent
 		// turn spent its entire decode budget inside <think>, the provider
 		// stripped it, and the agent went silent ("empty final text").
-		return chatml(msgs, !thinkingEnabled())
+		return chatml(msgs, !qwenThinks(""))
 	default: // qwen2 -> ChatML (no reasoning)
 		return chatml(msgs, false)
 	}

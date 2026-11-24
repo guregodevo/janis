@@ -129,3 +129,60 @@ func TestInklingReplyIsReadMessageByMessage(t *testing.T) {
 		}
 	}
 }
+
+// A request's reasoning_effort turns Qwen's thinking on or off; with none
+// the server's MLX_ENABLE_THINKING decides, as before.
+func TestQwenThinksAsTheRequestSays(t *testing.T) {
+	msgs := []Message{{Role: "user", Content: "hi"}}
+	primed := func(out string) bool { return strings.HasSuffix(out, "<think>\n\n</think>\n\n") }
+	cases := []struct {
+		env, effort string
+		thinks      bool
+	}{
+		{"", "", false},
+		{"1", "", true},
+		{"", "high", true},
+		{"", "low", true},
+		{"1", "none", false},
+	}
+	for _, c := range cases {
+		t.Setenv("MLX_ENABLE_THINKING", c.env)
+		for _, mt := range []string{"qwen3", "qwen3_moe", "qwen3_5"} {
+			if out := ApplyTemplateEffort(mt, msgs, c.effort); primed(out) == c.thinks {
+				t.Errorf("%s env=%q effort=%q: thinks %v, want %v", mt, c.env, c.effort, !primed(out), c.thinks)
+			}
+		}
+	}
+	t.Setenv("MLX_ENABLE_THINKING", "")
+	if out := ApplyTemplateEffort("llama", msgs, "high"); strings.Contains(out, "<think>") {
+		t.Errorf("llama took a think block: %q", out)
+	}
+}
+
+// Qwen's <think> block leaves the reply as its thinking; a cut reply that
+// never closed it is all thinking. Read token by token, both only grow, so
+// a stream can send each as deltas.
+func TestSplitThinkingPartsQwensReply(t *testing.T) {
+	cases := []struct{ mt, reply, text, reasoning string }{
+		{"qwen3_5", "<think>\nLet me see.\n</think>\n\nThe answer.", "The answer.", "Let me see.\n"},
+		{"qwen3", "<think>\nStill going", "", "Still going"},
+		{"qwen3_5", "The answer, no thinking.", "The answer, no thinking.", ""},
+		{"qwen3_5", "<think>\n\n</think>\n\n<tool_call>{}</tool_call>", "<tool_call>{}</tool_call>", ""},
+		{"llama", "<think>x</think>y", "<think>x</think>y", ""},
+	}
+	for _, c := range cases {
+		if text, reasoning := SplitThinking(c.mt, c.reply); text != c.text || reasoning != c.reasoning {
+			t.Errorf("%s %q: (%q, %q), want (%q, %q)", c.mt, c.reply, text, reasoning, c.text, c.reasoning)
+		}
+	}
+	tokens := []string{"<think>", "\n", "Let", " me", " see", ".\n", "</think>", "\n\n", "The", " answer", "."}
+	var reply, lastText, lastReasoning string
+	for _, tok := range tokens {
+		reply += tok
+		text, reasoning := SplitThinking("qwen3_5", reply)
+		if !strings.HasPrefix(text, lastText) || !strings.HasPrefix(reasoning, lastReasoning) {
+			t.Fatalf("after %q: (%q, %q) does not extend (%q, %q)", reply, text, reasoning, lastText, lastReasoning)
+		}
+		lastText, lastReasoning = text, reasoning
+	}
+}

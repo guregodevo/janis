@@ -450,7 +450,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 			text, calls := s.parseCalls(reply, req.Tools)
 			finish := finishReason(len(calls), budget.spent())
-			u := usage{PromptTokens: inTokens, CompletionTokens: s.current.NumTokens(reply)}
+			u := usage{PromptTokens: inTokens, CompletionTokens: s.current.NumTokens(reply) + s.current.NumTokens(reasoning.String())}
 			u.TotalTokens = u.PromptTokens + u.CompletionTokens
 			msg := map[string]any{"role": "assistant", "content": text}
 			if reasoning.Len() > 0 {
@@ -559,6 +559,14 @@ func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest,
 			"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": finish}}}
 	}
 	send(chunk(map[string]any{"role": "assistant", "content": ""}, nil))
+	// The thinking is generated tokens too: usage counts it with the reply.
+	var thought strings.Builder
+	if heard := opts.OnReasoning; heard != nil {
+		opts.OnReasoning = func(d string) {
+			thought.WriteString(d)
+			heard(d)
+		}
+	}
 	var full strings.Builder
 	emitted, inCall := 0, false
 	onDelta := func(d string) {
@@ -609,7 +617,7 @@ func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest,
 	}
 	send(chunk(map[string]any{}, finish))
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
-		u := usage{PromptTokens: inTokens, CompletionTokens: s.current.NumTokens(reply)}
+		u := usage{PromptTokens: inTokens, CompletionTokens: s.current.NumTokens(reply) + s.current.NumTokens(thought.String())}
 		u.TotalTokens = u.PromptTokens + u.CompletionTokens
 		send(map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": s.name, "choices": []any{}, "usage": u})
 	}
