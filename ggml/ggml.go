@@ -151,17 +151,21 @@ func repeatSize(n int, sz C.size_t) []C.size_t {
 }
 
 // A flush records at most this many results before computing: a decode
-// step of a 28-layer model is one or two graphs instead of hundreds
-// (JANIS_GGML_FLUSH overrides, for measuring).
+// step is one graph, and a graph is one blocking compute with the GPU idle
+// while the next is recorded. At 512 a step of the Qwen3.8-27B hybrid
+// (about 2,600 results, 5,200 nodes) was six graphs: 13.5 tok/s steady on an
+// A6000, 17.5 as one graph (2026-11-24). JANIS_GGML_FLUSH overrides, for
+// measuring.
 var flushEvery = func() int {
 	if n, err := strconv.Atoi(os.Getenv("JANIS_GGML_FLUSH")); err == nil && n > 0 {
 		return n
 	}
-	return 512
+	return maxNodes / 4
 }()
 
-// maxNodes bounds one recording context (results and intermediates).
-const maxNodes = 8192
+// maxNodes bounds one recording context (results and intermediates): a
+// result is about two nodes, so flushEvery results leave room to spare.
+const maxNodes = 16384
 
 // batchNodes bounds the context a batched step is recorded in: the whole
 // step is one graph, and 32 rows of the 27B are about 24,000 nodes.
