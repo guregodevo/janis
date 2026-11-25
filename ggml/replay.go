@@ -80,12 +80,21 @@ var replayOnCPU = false
 // replayTest makes BeginStep record whatever the environment says (tests).
 var replayTest = false
 
-// padDecode (JANIS_GGML_PADDECODE=1) has a plain decode step read the
-// caches the way a recorded one does, padded to the bucket and masked: the
-// two then compute the same sums in the same order, and a test can ask
-// for the same logits bit for bit. Off, a padded read and an exact one
-// part by rounding.
-func padDecode() bool { return os.Getenv("JANIS_GGML_PADDECODE") == "1" }
+// padDecode has a plain decode step read the caches the way a recorded one
+// does, padded to the bucket and masked: the two then compute the same
+// sums in the same order, so a reply is the same whichever of its steps
+// were replayed. On where steps are recorded (replayOn), unless
+// JANIS_GGML_PADDECODE=0; JANIS_GGML_PADDECODE=1 turns it on anywhere.
+// Off, a padded read and an exact one part by rounding.
+func (b *Backend) padDecode() bool {
+	switch os.Getenv("JANIS_GGML_PADDECODE") {
+	case "1":
+		return true
+	case "0":
+		return false
+	}
+	return b.replayOn()
+}
 
 // replayPad is the bucket a recorded step reads key cache k and value
 // cache v at, or 0 when they are not cache views.
@@ -97,12 +106,21 @@ func (k *tensor) replayPad(v *tensor) int {
 	return min(k.grp.cap, v.grp.cap, (n-1+replayBucket)/replayBucket*replayBucket)
 }
 
-// replayOn is whether the GPU backends record decode steps: opt-in,
-// JANIS_GGML_REPLAY=1, read at each recording. Off, decoding is what it
-// was; on, the logits part from it by rounding (padDecode).
-func replayOn() bool {
-	v := os.Getenv("JANIS_GGML_REPLAY")
-	return v == "1" || v == "cpu"
+// replayOn is whether this backend records decode steps, read at each
+// recording: on CUDA by default (the 27B on an RTX 5090 decodes at 60.6
+// tok/s with it, 38.5 without, 2026-11-25), JANIS_GGML_REPLAY=0 turns it
+// off; on another GPU (Metal, not measured) JANIS_GGML_REPLAY=1 turns it
+// on; on the CPU backend JANIS_GGML_REPLAY=cpu.
+func (b *Backend) replayOn() bool {
+	switch os.Getenv("JANIS_GGML_REPLAY") {
+	case "0":
+		return false
+	case "1":
+		return !b.cpu
+	case "cpu":
+		return true
+	}
+	return strings.HasPrefix(b.name, "CUDA")
 }
 
 func replayOnCPUNow() bool { return replayOnCPU || os.Getenv("JANIS_GGML_REPLAY") == "cpu" }
@@ -183,7 +201,7 @@ func setFloat32(t *tensor, v []float32) {
 
 // BeginStep starts recording a decode step at offset (engine.StepReplayer).
 func (b *Backend) BeginStep(offset int, carry []engine.Tensor) []engine.Tensor {
-	if !(replayOn() || replayTest) || (b.cpu && !replayOnCPUNow()) {
+	if !(b.replayOn() || replayTest) || (b.cpu && !replayOnCPUNow()) {
 		return nil
 	}
 	b.flush()
@@ -302,7 +320,7 @@ func (b *Backend) replayMaskRow(j, n int) *tensor {
 // BeginBatchStep starts recording a decode step of len(offsets)
 // conversations (engine.BatchStepReplayer).
 func (b *Backend) BeginBatchStep(offsets []int, carry []engine.Tensor) []engine.Tensor {
-	if !(replayOn() || replayTest) || (b.cpu && !replayOnCPUNow()) {
+	if !(b.replayOn() || replayTest) || (b.cpu && !replayOnCPUNow()) {
 		return nil
 	}
 	b.flush()

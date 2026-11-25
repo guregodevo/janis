@@ -57,8 +57,10 @@ holds get their own; a 32-token prefill chunk of the 27B that held 2.2 GB of
 temporaries holds a few tens of MB, and the prefill chunk can be 64 on a
 24 GB card (`MLX_PREFILL_CHUNK`).
 
-With `JANIS_GGML_REPLAY=1` a decode step on a GPU is recorded once and
-run again for the tokens after it (`ggml/replay.go`; off by default). ggml
+On CUDA a decode step is recorded once and run again for the tokens
+after it (`ggml/replay.go`): the 27B on an RTX 5090 decodes at 60.6 tok/s
+with it and 38.5 without. `JANIS_GGML_REPLAY=0` turns it off; on Metal,
+not measured, `JANIS_GGML_REPLAY=1` turns it on. ggml
 replays a graph as a CUDA graph only when its nodes, addresses, shapes and
 parameters are the last run's, so what moves from token to token is an
 input the step writes before each run: the token's embedding row (read
@@ -70,7 +72,9 @@ in place. On the H100 the 27B's step was 34 ms of GPU work and about
 32 ms of recording, building and laying out a graph of 5,464 nodes; the
 same graph run again is 14.9 ms. A step reads the caches padded, so its
 sums are not in the order of an exact read: the logits part by rounding,
-about a logit, and the greedy replies after a few dozen tokens. With
-`JANIS_GGML_PADDECODE=1` a plain step reads them padded too, and the two
-give the same logits bit for bit (`TestReplayedStepsLive`).
+about a logit, and the greedy replies after a few dozen tokens. Where
+steps are recorded, a plain step reads the caches padded too, and the two
+give the same logits bit for bit (`TestReplayedStepsLive`): a reply is the
+same whichever of its steps were replayed. `JANIS_GGML_PADDECODE=0` turns
+the padded reads off, `=1` on where no step is recorded.
 
