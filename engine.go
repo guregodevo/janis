@@ -421,7 +421,16 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 
 	p, maxTok := e.sampleParams(opts, onDelta)
 
+	out := e.generate(sess, ids, images, maxTok, p)
+	text, _ := e.reply(out)
+	return text
+}
+
+// generate prefills ids on sess and decodes the reply, under the compute
+// lock; a panic (out of device memory) releases the lock with it.
+func (e *Engine) generate(sess *qwen.Session, ids []int32, images [][]byte, maxTok int, p qwen.SampleParams) []int32 {
 	mlxComputeMu.Lock()
+	defer mlxComputeMu.Unlock()
 	if fixedRows && e.slots != nil && sess == e.session {
 		e.settleSlots() // slot 0 decodes alone: every row back from the batch
 	}
@@ -445,9 +454,7 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 		// The next prompt read may be another session's, with no pictures.
 		e.ink2.SetImages(nil, nil)
 	}
-	mlxComputeMu.Unlock()
-	text, _ := e.reply(out)
-	return text
+	return out
 }
 
 // NumTokens returns the token count of text (for usage stats).

@@ -201,6 +201,7 @@ func (e *Engine) StepChats(rs []Reply) {
 		set = append(set, c.slot)
 	}
 	mlxComputeMu.Lock()
+	defer mlxComputeMu.Unlock()
 	if fixedRows {
 		t0 := time.Now()
 		if !slices.Equal(set, e.slotStep) && e.slotStats != nil {
@@ -219,7 +220,6 @@ func (e *Engine) StepChats(rs []Reply) {
 		qwen.StepRows(e.bk, e.slotDecoder, e.slots, byslot)
 		e.slotStats.step(e.slotDecoder.Last, len(gens), time.Since(t))
 		e.slotStats.flush()
-		mlxComputeMu.Unlock()
 		return
 	}
 	if !slices.Equal(set, e.slotStep) {
@@ -237,21 +237,49 @@ func (e *Engine) StepChats(rs []Reply) {
 	qwen.StepBatch(e.bk, e.slotDecoder, gens)
 	e.slotStats.step(e.slotDecoder.Last, len(gens), time.Since(t))
 	e.slotStats.flush()
-	mlxComputeMu.Unlock()
+}
+
+// ResetSessions drops every session's conversation and the batch's
+// recorded step, after an engine call failed partway (out of device
+// memory): a session's caches may hold a prefill or a step that never
+// ended. Each session reads its next prompt from the first token.
+func (e *Engine) ResetSessions() {
+	mlxComputeMu.Lock()
+	defer mlxComputeMu.Unlock()
+	if a, ok := e.bk.(interface{ AbortStep() }); ok {
+		a.AbortStep()
+	}
+	if e.slotDecoder != nil {
+		e.slotDecoder.Drop()
+	}
+	for _, s := range append([]*qwen.Session{e.session, e.utilSession}, e.slots...) {
+		if s != nil {
+			s.Reset(e.bk)
+		}
+	}
+	for i := range e.slotBusy {
+		e.slotBusy[i] = false
+	}
+	e.slotStep = nil
+	if sw, ok := e.bk.(engine.Sweeper); ok {
+		sw.Sweep()
+	}
 }
 
 // FinishChat ends a reply, done or not, frees its slot and returns its text.
 func (e *Engine) FinishChat(r Reply) string {
 	c := r.(*chatGen)
-	mlxComputeMu.Lock()
-	if !fixedRows {
-		t := time.Now()
-		e.settleSlots() // the batch loses a row
-		e.slotStats.add("settle", time.Since(t))
-	}
-	out := c.g.Finish()
-	e.slotBusy[c.slot] = false
-	mlxComputeMu.Unlock()
+	out := func() []int32 {
+		mlxComputeMu.Lock()
+		defer mlxComputeMu.Unlock()
+		if !fixedRows {
+			t := time.Now()
+			e.settleSlots() // the batch loses a row
+			e.slotStats.add("settle", time.Since(t))
+		}
+		e.slotBusy[c.slot] = false
+		return c.g.Finish()
+	}()
 	text, _ := e.reply(out)
 	return text
 }

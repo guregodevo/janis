@@ -540,6 +540,18 @@ type step struct {
 }
 
 // EndStep ends the recording and computes the step (engine.StepReplayer).
+// AbortStep drops a step being recorded whose recording failed partway
+// (out of device memory): the ops that follow are computed as usual.
+func (b *Backend) AbortStep() {
+	b.mu.Lock()
+	rs := b.rec0
+	b.rec0 = nil
+	b.mu.Unlock()
+	if rs != nil {
+		rs.free()
+	}
+}
+
 func (b *Backend) EndStep(ids, logits engine.Tensor, next []engine.Tensor) (engine.Step, []float32) {
 	b.mu.Lock()
 	rs := b.rec0

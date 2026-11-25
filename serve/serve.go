@@ -119,10 +119,21 @@ func (s *Server) onEngine(f func()) { _ = s.onEngineCtx(context.Background(), f)
 // thread, a done ctx (the client gone, the server stopping) takes it out of
 // the queue with ctx.Err(), and f never runs (janis#19). Once f runs, it
 // runs to its end; f reads ctx to stop early.
+//
+// A panic in f (out of device memory) drops what the engine's sessions
+// hold and is raised again on the caller's goroutine: net/http ends that
+// request, and the engine thread serves the next.
 func (s *Server) onEngineCtx(ctx context.Context, f func()) error {
 	done := make(chan struct{})
+	var failed any
 	job := func() {
 		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				failed = r
+				s.resetEngine(s.current)
+			}
+		}()
 		f()
 	}
 	select {
@@ -131,6 +142,9 @@ func (s *Server) onEngineCtx(ctx context.Context, f func()) error {
 		return ctx.Err()
 	}
 	<-done
+	if failed != nil {
+		panic(failed)
+	}
 	return nil
 }
 
@@ -428,14 +442,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		for _, m := range msgs {
 			inTokens += s.current.NumTokens(m.Content)
 		}
-		chatFn := s.current.ChatStream
+		gen := s.current
+		chatFn := func(msgs []llm.Message, opts llm.Options, onDelta func(string)) (string, error) {
+			return gen.ChatStream(msgs, opts, onDelta), nil
+		}
 		if b := s.batched(req, msgs); b != nil {
-			chatFn = func(msgs []llm.Message, opts llm.Options, onDelta func(string)) string {
+			chatFn = func(msgs []llm.Message, opts llm.Options, onDelta func(string)) (string, error) {
 				reply, err := s.chatBatched(ctx, b, msgs, opts, onDelta)
 				if err != nil && ctx.Err() == nil {
 					s.logf("batched reply: %v", err)
+					return reply, err
 				}
-				return reply
+				return reply, nil
 			}
 		}
 		answer := func() {
@@ -443,9 +461,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				s.streamChat(st, ctx, req, msgs, opts, budget, id, created, inTokens, chatFn)
 				return
 			}
-			reply := chatFn(msgs, opts, nil)
+			reply, err := chatFn(msgs, opts, nil)
 			if ctx.Err() != nil {
 				writeCancelled(w)
+				return
+			}
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			text, calls := s.parseCalls(reply, req.Tools)
@@ -552,7 +574,7 @@ func (st *sseStream) stopKeepalive() {
 // streamChat writes server-sent events: the role, text deltas as they come
 // (held back by the length of "<tool_call>" so an opening tag is never
 // half-sent), then the tool calls, the finish and, when asked, the usage.
-func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest, msgs []llm.Message, opts llm.Options, budget *tokenBudget, id string, created int64, inTokens int, chatFn func([]llm.Message, llm.Options, func(string)) string) {
+func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest, msgs []llm.Message, opts llm.Options, budget *tokenBudget, id string, created int64, inTokens int, chatFn func([]llm.Message, llm.Options, func(string)) (string, error)) {
 	send := st.send
 	chunk := func(delta map[string]any, finish any) map[string]any {
 		return map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": s.name,
@@ -594,12 +616,16 @@ func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest,
 			emitted = safe
 		}
 	}
-	reply := chatFn(msgs, opts, onDelta)
+	reply, err := chatFn(msgs, opts, onDelta)
 	st.stopKeepalive()
 	// A generation the stopping server cut short is not finished: no finish
 	// chunk and no [DONE], an error event a client raises instead.
 	if ctx.Err() != nil {
 		send(map[string]any{"error": cancelledError()})
+		return
+	}
+	if err != nil {
+		send(map[string]any{"error": errorBody(http.StatusInternalServerError, err.Error())})
 		return
 	}
 	_, calls := s.parseCalls(reply, req.Tools)

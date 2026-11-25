@@ -706,7 +706,7 @@ func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx
 	b.pending = append(b.pending, ref)
 	full := len(b.pending) >= flushEvery && b.rec0 == nil
 	if full {
-		b.flushLocked()
+		b.flushHeld()
 	}
 	b.mu.Unlock()
 	b.track(out)
@@ -768,10 +768,10 @@ func (b *Backend) flushLocked() {
 	}
 	t1 := time.Now()
 	galloc := C.ggml_gallocr_new(b.buft)
-	if !C.ggml_gallocr_alloc_graph(galloc, g) {
+	if !allocGraph(galloc, g) {
 		// Out of device memory. Computing the graph over unallocated
-		// tensors was a SIGSEGV that took the server down; a panic is
-		// caught per request by net/http and the server answers the next one.
+		// tensors was a SIGSEGV that took the server down; the server
+		// recovers the panic and answers the next request.
 		C.ggml_gallocr_free(galloc)
 		C.ggml_free(ctx)
 		panic(fmt.Sprintf("ggml: no room on the device for a batch of %d results, %d of them held (%.1f MiB without reuse)", len(pending), len(live), float64(total)/(1<<20)))
@@ -946,11 +946,37 @@ func (b *Backend) placeInArena(ctx *C.struct_ggml_context) *arena {
 	return a
 }
 
+// allocGraph lays out g's tensors in galloc's buffer; false when the
+// device has no room.
+func allocGraph(galloc C.ggml_gallocr_t, g *C.struct_ggml_cgraph) bool {
+	if failAllocs > 0 {
+		failAllocs--
+		return false
+	}
+	return bool(C.ggml_gallocr_alloc_graph(galloc, g))
+}
+
+// failAllocs is how many graph layouts fail as on a full device: for tests.
+var failAllocs int
+
 // flush computes whatever is recorded (a readback, Eval, Sweep need it).
 func (b *Backend) flush() {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.flushLocked()
-	b.mu.Unlock()
+}
+
+// flushHeld is flushLocked for a caller that unlocks b.mu itself after: a
+// panic (no room on the device) releases the lock with it, so the server
+// that recovers it can still use the backend.
+func (b *Backend) flushHeld() {
+	defer func() {
+		if r := recover(); r != nil {
+			b.mu.Unlock()
+			panic(r)
+		}
+	}()
+	b.flushLocked()
 }
 
 // dumpQuantCall writes a NaN-producing QuantMatmul's input and weight
@@ -2026,7 +2052,7 @@ func (b *Backend) positionsFor(offset, L int) *tensor {
 	t.pin = true
 	b.mu.Lock()
 	if len(b.positions) > 64 { // a decode step moves on: let the old ones go
-		b.flushLocked()
+		b.flushHeld()
 		for _, old := range b.positions {
 			old.free()
 		}
@@ -2059,7 +2085,7 @@ func (b *Backend) maskFor(Lq, Lk, Lkp int) *tensor {
 	t.pin = true
 	b.mu.Lock()
 	if len(b.masks) > 64 {
-		b.flushLocked()
+		b.flushHeld()
 		for _, old := range b.masks {
 			old.free()
 		}

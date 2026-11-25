@@ -142,6 +142,15 @@ func (d *BatchDecoder) Settle() {
 	d.step, d.members, d.all, d.lens = nil, nil, nil, nil
 }
 
+// Drop ends the recorded step without setting the caches at their
+// lengths: for caches about to be dropped (Engine.ResetSessions).
+func (d *BatchDecoder) Drop() {
+	if d.step != nil {
+		d.step.Close()
+	}
+	d.step, d.members, d.all, d.lens = nil, nil, nil, nil
+}
+
 func (d *BatchDecoder) same(caches [][]qwen.LayerCache) bool {
 	if len(caches) != len(d.members) {
 		return false

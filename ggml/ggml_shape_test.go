@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -390,4 +391,57 @@ func TestADecodeStepIsOneGraph(t *testing.T) {
 	if g.lastBatch.results != 2600 {
 		t.Fatalf("the last graph computed %d results of 2600: the step was split", g.lastBatch.results)
 	}
+}
+
+// A FLUSH WITH NO ROOM LEAVES THE BACKEND USABLE.
+//
+// A layout that fails as on a full device panics, through a readback and
+// through a recording that fills a flush; the server recovers the panic,
+// and the backend's next call must not wait forever on the lock the
+// panic left.
+func TestAFlushWithNoRoomLeavesTheBackendUsable(t *testing.T) {
+	g := New()
+	defer g.Close()
+	defer func() { failAllocs = 0 }()
+	noRoom := func(name string, f func()) {
+		t.Helper()
+		failAllocs = 1
+		got := make(chan any)
+		go func() {
+			defer func() { got <- recover() }()
+			f()
+		}()
+		select {
+		case r := <-got:
+			if r == nil || !strings.Contains(fmt.Sprint(r), "no room on the device") {
+				t.Errorf("%s: %v, want the no-room panic", name, r)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s waits on the lock an earlier panic left", name)
+		}
+	}
+	usable := func(name string) {
+		t.Helper()
+		done := make(chan []float32)
+		go func() { done <- g.Floats(g.SiLU(g.FromFloats(rnd(4, 3), 4))) }()
+		select {
+		case v := <-done:
+			if len(v) != 4 {
+				t.Errorf("after %s: %d values", name, len(v))
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("after %s the backend's next call waits on its lock", name)
+		}
+	}
+	x := g.FromFloats(rnd(64, 1), 8, 8)
+	g.Pin(x)
+	noRoom("a readback", func() { g.Floats(g.SiLU(x)) })
+	usable("a readback")
+	noRoom("a full recording", func() {
+		y := x
+		for i := 0; i <= flushEvery; i++ {
+			y = g.SiLU(y)
+		}
+	})
+	usable("a full recording")
 }

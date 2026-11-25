@@ -2,6 +2,8 @@ package serve
 
 import (
 	"context"
+	"fmt"
+	"runtime/debug"
 	"sync"
 
 	llm "github.com/guregodevo/janis"
@@ -77,7 +79,13 @@ func (s *Server) chatBatched(ctx context.Context, b Batcher, msgs []llm.Message,
 func (s *Server) runBatch(b Batcher) {
 	var replies []llm.Reply
 	var owners []*pendingChat
+	var starting *pendingChat
 	defer func() { s.batch.decoding = 0 }()
+	defer func() {
+		if r := recover(); r != nil {
+			s.engineFailed(b, r, append(owners, starting))
+		}
+	}()
 	finish := func(i int) {
 		pc := owners[i]
 		pc.reply = b.FinishChat(replies[i])
@@ -93,7 +101,9 @@ func (s *Server) runBatch(b Batcher) {
 		s.runQueued()
 		if len(replies) < b.Slots() {
 			if pc := s.nextWaiting(len(replies) == 0); pc != nil {
+				starting = pc
 				s.start(b, pc, &replies, &owners)
+				starting = nil
 			} else if len(replies) == 0 {
 				return
 			}
@@ -108,6 +118,44 @@ func (s *Server) runBatch(b Batcher) {
 			}
 		}
 	}
+}
+
+// engineFailed answers the requests an engine call failed under (a panic:
+// out of device memory) with the error, drops what the engine's sessions
+// hold, and starts the loop again for the requests still waiting: the
+// server stays up. Runs on the engine thread.
+func (s *Server) engineFailed(b Batcher, r any, hit []*pendingChat) {
+	s.logf("engine failed: %v\n%s", r, debug.Stack())
+	err := fmt.Errorf("the engine failed: %v", r)
+	for _, pc := range hit {
+		if pc != nil {
+			pc.err = err
+			close(pc.done)
+		}
+	}
+	s.resetEngine(b)
+	s.batch.mu.Lock()
+	s.batch.running = len(s.batch.waiting) > 0
+	again := s.batch.running
+	s.batch.mu.Unlock()
+	if again {
+		go s.onEngine(func() { s.runBatch(b) })
+	}
+}
+
+// resetEngine drops what g's sessions hold, when g can (llm.Engine): their
+// caches may hold a prefill or a step that never ended.
+func (s *Server) resetEngine(g any) {
+	r, ok := g.(interface{ ResetSessions() })
+	if !ok {
+		return
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			s.logf("engine reset failed: %v", p)
+		}
+	}()
+	r.ResetSessions()
 }
 
 // runQueued runs the engine calls waiting for the thread, without waiting
