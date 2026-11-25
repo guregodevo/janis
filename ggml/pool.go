@@ -185,7 +185,7 @@ func (p *kvPool) Attend(q engine.Tensor, lens []int, scale float32) engine.Tenso
 			rs.spoil("pool attention outside a batched step")
 		}
 		L = min(p.room, (longest+kvPad-1)/kvPad*kvPad)
-		if padDecode() {
+		if p.b.padDecode() {
 			// Read as a recorded step reads: padded to its bucket, masked.
 			L = min(p.room, (longest-1+replayBucket)/replayBucket*replayBucket)
 		}

@@ -1908,7 +1908,7 @@ func (b *Backend) SDPA(q, k, v engine.Tensor, scale float32, causal bool) engine
 		}
 	}
 	var tmask *tensor
-	if Lq == 1 && !causal && !tk.replay && padDecode() {
+	if Lq == 1 && !causal && !tk.replay && b.padDecode() {
 		// Read as a recorded step reads: padded to its bucket, masked.
 		if p := tk.replayPad(tv); p > Lk {
 			Lkp = p
