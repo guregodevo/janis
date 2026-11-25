@@ -373,3 +373,21 @@ func TestPackQ4KKeepsAnAffineRow(t *testing.T) {
 	}
 	t.Logf("worst |Q4_K - source| %.4g against a widest range of %.4g", worst, span)
 }
+
+// TestADecodeStepIsOneGraph: a step of about 2,600 results, the size of a
+// Qwen3.8-27B decode step, is computed as one graph. At 512 results a flush
+// it was six, each a blocking compute (13.5 against 17.5 tok/s on an A6000,
+// 2026-11-24).
+func TestADecodeStepIsOneGraph(t *testing.T) {
+	g := New()
+	defer g.Close()
+	x := g.FromFloats(rnd(64, 41), 8, 8)
+	y := x
+	for i := 0; i < 2600; i++ {
+		y = g.SiLU(y)
+	}
+	g.Eval(y)
+	if g.lastBatch.results != 2600 {
+		t.Fatalf("the last graph computed %d results of 2600: the step was split", g.lastBatch.results)
+	}
+}
