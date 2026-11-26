@@ -636,6 +636,7 @@ func (b *Backend) EndStep(ids, logits engine.Tensor, next []engine.Tensor) (engi
 
 func (s *step) compute() []float32 {
 	t0 := time.Now()
+	replayT.t0 = t0
 	if st := C.ggml_backend_graph_compute(s.b.be, s.g); st != C.GGML_STATUS_SUCCESS {
 		panic("ggml: a recorded decode step failed")
 	}
@@ -652,8 +653,8 @@ func (s *step) compute() []float32 {
 		}
 		replayT.compute, replayT.read, replayT.n, replayT.last = replayT.compute+t1.Sub(t0), replayT.read+now.Sub(t1), replayT.n+1, now
 		if replayT.n == 100 {
-			fmt.Fprintf(os.Stderr, "ggml replay: 100 steps of %d nodes: graph call %.2f ms, logits read %.2f ms, between steps %.2f ms\n",
-				int(C.ggml_graph_n_nodes(s.g)), replayT.compute.Seconds()*10, replayT.read.Seconds()*10, replayT.gap.Seconds()*10)
+			fmt.Fprintf(os.Stderr, "ggml replay: 100 steps of %d nodes: graph call %.2f ms, logits read %.2f ms, between steps %.2f ms (inputs %.2f ms)\n",
+				int(C.ggml_graph_n_nodes(s.g)), replayT.compute.Seconds()*10, replayT.read.Seconds()*10, replayT.gap.Seconds()*10, replayT.set.Seconds()*10)
 			if n := int(C.ggml_graph_n_nodes(s.g)); !histSeen[-n] {
 				histSeen[-n] = true
 				fmt.Fprintf(os.Stderr, "ggml replay: %d nodes by op: %s\n", n, opHist(s.g))
@@ -665,9 +666,9 @@ func (s *step) compute() []float32 {
 }
 
 type replayTiming struct {
-	compute, read, gap time.Duration
-	n                  int
-	last               time.Time
+	compute, read, gap, set time.Duration
+	n                       int
+	last, t0                time.Time
 }
 
 var replayT replayTiming
@@ -715,6 +716,10 @@ func (s *step) RunRows(toks []int32, offs []int) []float32 {
 }
 
 func (s *step) Run(tok int32, offset int) []float32 {
+	if timing {
+		t := time.Now()
+		defer func() { replayT.set += replayT.t0.Sub(t) }()
+	}
 	setInt32(s.ids, []int32{tok})
 	s.ids.host = []int32{tok}
 	for _, e := range s.rs.embeds {

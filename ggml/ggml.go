@@ -2894,9 +2894,9 @@ func (b *Backend) Conv1dDepthwise(x, w engine.Tensor) engine.Tensor {
 	K := tw.shape[1]
 	shape := []int{B, L - K + 1, Cn}
 	return b.op(engine.F32, shape, []*tensor{tx, tw}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-		xs := C.ggml_reshape_3d(ctx, C.ggml_cont(ctx, f32(ctx, tx)), C.int64_t(Cn), C.int64_t(L), C.int64_t(B))
+		xs := C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, tx)), C.int64_t(Cn), C.int64_t(L), C.int64_t(B))
 		sx := C.ggml_cont(ctx, C.ggml_transpose(ctx, xs))
-		c := C.ggml_reshape_2d(ctx, C.ggml_cont(ctx, f32(ctx, tw)), C.int64_t(K), C.int64_t(Cn))
+		c := C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tw)), C.int64_t(K), C.int64_t(Cn))
 		return C.ggml_ssm_conv(ctx, sx, c)
 	})
 }
