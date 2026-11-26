@@ -15,6 +15,9 @@ import (
 type SampleParams struct {
 	Temp float32
 	TopP float32
+	// TopK (>0) keeps the K most likely tokens before the top-p cut, which is
+	// then taken over those K. 0 keeps every token.
+	TopK int
 	Seed uint64
 	Stop map[int32]bool // stop generation when one of these is produced
 	// OnToken, if set, is called for each emitted token (for streaming).
@@ -143,11 +146,23 @@ func sampleToken(logits []float32, p SampleParams, rng *rand.Rand, recent []int3
 	if len(idx) == 0 {
 		idx = topPCandidates(probs, topP, nil)
 	}
+	// total is the probability the top-p cut is a share of: all of it, or
+	// what the K most likely tokens hold.
+	total := 1.0
+	if p.TopK > 0 {
+		if idx = topProbs(probs, p.TopK, allow); len(idx) == 0 {
+			idx = topProbs(probs, p.TopK, nil)
+		}
+		total = 0
+		for _, id := range idx {
+			total += probs[id]
+		}
+	}
 	var cum float64
 	cut := len(idx)
 	for rank, id := range idx {
 		cum += probs[id]
-		if cum >= topP {
+		if cum >= topP*total {
 			cut = rank + 1
 			break
 		}
