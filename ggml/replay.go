@@ -606,7 +606,7 @@ func (b *Backend) EndStep(ids, logits engine.Tensor, next []engine.Tensor) (engi
 		C.ggml_build_forward_expand(g, e)
 	}
 	for _, t := range live {
-		C.ggml_set_output(t.t)
+		keep(t.t)
 		C.ggml_build_forward_expand(g, t.t)
 	}
 	for i, nx := range next {

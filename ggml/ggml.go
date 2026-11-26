@@ -69,6 +69,12 @@ static void janis_op_hist(struct ggml_cgraph * g, char * out, size_t cap) {
 		n[best] = 0;
 	}
 }
+// janis_keep marks t as a result that outlives its graph. A view has no
+// memory of its own: the allocator frees its source once the view's last
+// reader in the graph has run, unless the source is marked too.
+static void janis_keep(struct ggml_tensor * t) {
+	for (; t != NULL; t = t->view_src) ggml_set_output(t);
+}
 static struct ggml_tensor * janis_new(struct ggml_context * c, enum ggml_type t, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
 	return ggml_new_tensor_4d(c, t, ne0, ne1, ne2, ne3);
 }
@@ -798,7 +804,7 @@ func (b *Backend) flushLocked() {
 			// writing a fused node's own buffer unless it is flagged an
 			// output; without the flag the 30B MoE read never-written
 			// memory as its activations.
-			C.ggml_set_output(p.node)
+			keep(p.node)
 		}
 	}
 	g := C.ggml_new_graph_custom(ctx, C.size_t(b.recCap), false)
@@ -1095,6 +1101,9 @@ func f32(ctx *C.struct_ggml_context, x *tensor) *C.struct_ggml_tensor {
 	}
 	return C.ggml_cast(ctx, x.t, C.GGML_TYPE_F32)
 }
+
+// keep marks t, and what it is a view of, as outliving its graph.
+func keep(t *C.struct_ggml_tensor) { C.janis_keep(t) }
 
 // opHist is the graph's node count per op, most frequent first.
 func opHist(g *C.struct_ggml_cgraph) string {
@@ -1418,8 +1427,10 @@ func (b *Backend) Reshape(x engine.Tensor, shape ...int) engine.Tensor {
 		}
 	}
 	return b.op(tx.dt, shape, []*tensor{tx}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		// A view: a reshape reads the same values in the same order, and a
+		// copy of every one was a fifth of a decode step's nodes.
 		m := ne(shape)
-		return C.ggml_cont(ctx, C.ggml_reshape_4d(ctx, tx.t, m[0], m[1], m[2], m[3]))
+		return C.ggml_reshape_4d(ctx, contig(ctx, tx.t), m[0], m[1], m[2], m[3])
 	})
 }
 
@@ -1447,9 +1458,34 @@ func (b *Backend) Transpose(x engine.Tensor, axes ...int) engine.Tensor {
 	for j, a := range axes {
 		dst[nd-1-a] = C.int(nd - 1 - j)
 	}
+	// Axes of one element may move without the values moving: a token's
+	// [1, heads, dim] and [heads, 1, dim] are the same memory. Then it is a
+	// reshape, a view; else the permuted copy.
+	if sameOrder(tx.shape, axes) {
+		return b.op(tx.dt, shape, []*tensor{tx}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+			m := ne(shape)
+			return C.ggml_reshape_4d(ctx, contig(ctx, tx.t), m[0], m[1], m[2], m[3])
+		})
+	}
 	return b.op(tx.dt, shape, []*tensor{tx}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		return C.ggml_cont(ctx, C.ggml_permute(ctx, tx.t, dst[0], dst[1], dst[2], dst[3]))
 	})
+}
+
+// sameOrder reports whether transposing shape by axes leaves the axes of
+// more than one element in their order: the values then stay where they are.
+func sameOrder(shape []int, axes []int) bool {
+	last := -1
+	for _, a := range axes {
+		if shape[a] == 1 {
+			continue
+		}
+		if a < last {
+			return false
+		}
+		last = a
+	}
+	return true
 }
 
 func (b *Backend) Concat(a, bb engine.Tensor, axis int) engine.Tensor {
