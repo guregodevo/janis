@@ -718,7 +718,13 @@ func (s *step) RunRows(toks []int32, offs []int) []float32 {
 func (s *step) Run(tok int32, offset int) []float32 {
 	if timing {
 		t := time.Now()
-		defer func() { replayT.set += replayT.t0.Sub(t) }()
+		t0 := &replayT.t0
+		*t0 = time.Time{}
+		defer func() {
+			if !t0.IsZero() {
+				replayT.set += t0.Sub(t)
+			}
+		}()
 	}
 	setInt32(s.ids, []int32{tok})
 	s.ids.host = []int32{tok}
