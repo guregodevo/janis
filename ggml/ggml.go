@@ -122,12 +122,12 @@ static struct ggml_tensor * janis_group_sums(struct ggml_context * c, struct ggm
 	struct ggml_tensor * sums = ggml_sum_rows(c, ggml_reshape_3d(c, x, gs, in / gs, rest));
 	return ggml_reshape_4d(c, sums, in / gs, x->ne[1], x->ne[2], x->ne[3]);
 }
-// janis_affine8_mul is W x for an 8-bit affine weight kept as its codes: q
-// (Q8_0, ne in, out) holds scale * (code - 128) and off (F32, ne groups,
-// out) holds bias + 128 * scale, so W x = q x + off sums, with sums the
-// group sums of x (janis_group_sums).
-static struct ggml_tensor * janis_affine8_mul(struct ggml_context * c, struct ggml_tensor * q, struct ggml_tensor * off, struct ggml_tensor * x, struct ggml_tensor * sums) {
-	return ggml_add(c, ggml_mul_mat(c, q, x), ggml_mul_mat(c, off, sums));
+// janis_affine8_input is x (ne in, ...) followed by spread times its group
+// sums: what an 8-bit affine weight's code columns and offset columns
+// multiply (affine8). spread is F32, ne (in/gs, extra).
+static struct ggml_tensor * janis_affine8_input(struct ggml_context * c, struct ggml_tensor * x, struct ggml_tensor * spread, int64_t gs) {
+	if (!ggml_is_contiguous(x)) x = ggml_cont(c, x);
+	return ggml_concat(c, x, ggml_mul_mat(c, spread, janis_group_sums(c, x, gs)), 0);
 }
 */
 import "C"
@@ -152,8 +152,10 @@ import (
 // Backend is one ggml backend (CPU, or the device JANIS_GGML_DEVICE names)
 // behind the engine's interface. One generation at a time, as the others.
 type Backend struct {
-	be   C.ggml_backend_t
-	buft C.ggml_backend_buffer_type_t
+	// spreads are affine8's spread matrices, by the number of groups.
+	spreads map[int]*tensor
+	be      C.ggml_backend_t
+	buft    C.ggml_backend_buffer_type_t
 	// repack is the CPU's weight-repacking buffer type, nil on a device:
 	// where a dense 4-bit weight goes as Q4_K (see q4K).
 	repack C.ggml_backend_buffer_type_t
@@ -351,10 +353,13 @@ type tensor struct {
 	where string     // the op's call site, kept when tracing or checking
 	quant *quantCall // set on a QuantMatmul result: what a dump needs to replay it
 	q4    *tensor    // the Q4_1 repack of a packed weight, built once
-	off   *tensor    // on an 8-bit weight's Q8_0 codes: its per-group offsets (affine8)
-	// sums is this tensor's sums over each group of sumsGS values along its
-	// last axis, made for the first 8-bit weight that multiplies it and
-	// read by the others (q, k and v share an input; so do gate and up).
+	// offCols, on an 8-bit weight's Q8_0 codes: the columns after the codes
+	// that hold its per-group offsets (affine8), 0 for any other tensor.
+	offCols int
+	// sums is this tensor followed by what an 8-bit weight's offset columns
+	// multiply (affine8Input), for groups of sumsGS values along its last
+	// axis: made for the first 8-bit weight that multiplies it and read by
+	// the others (q, k and v share an input; so do gate and up).
 	sums   *tensor
 	sumsGS int
 	f32w   *tensor // a small bf16 weight's f32 copy (f32Weight)
@@ -524,7 +529,7 @@ func (t *tensor) Shape() []int { return append([]int(nil), t.shape...) }
 func (t *tensor) free() {
 	memMu.Lock()
 	defer memMu.Unlock()
-	if t.freed || t.grp == nil && t.ctx == nil && t.buf == nil && t.q4 == nil && t.off == nil && t.f32w == nil {
+	if t.freed || t.grp == nil && t.ctx == nil && t.buf == nil && t.q4 == nil && t.f32w == nil {
 		return
 	}
 	t.freed = true
@@ -552,13 +557,6 @@ func (t *tensor) free() {
 		t.q4 = nil
 		memMu.Unlock()
 		q.free()
-		memMu.Lock()
-	}
-	if t.off != nil {
-		o := t.off
-		t.off = nil
-		memMu.Unlock()
-		o.free()
 		memMu.Lock()
 	}
 	t.sums = nil
@@ -2791,15 +2789,25 @@ func unpackQ4K(raw []byte, n int) []float32 {
 // JANIS_GGML_AFFINE8=0 keeps it as f16, as before.
 var affine8On = os.Getenv("JANIS_GGML_AFFINE8") != "0"
 
-// affine8 is the device form of an 8-bit affine weight [out, in]: its codes
-// as ggml's Q8_0 (blocks of 32: f16 scale d, 32 int8) and its offsets. A
-// value is code*scale + bias = scale*(code-128) + (bias + 128*scale): the
-// first term is a Q8_0 block with d the group's scale and the code moved to
-// int8, exact in the codes; the second is one number a group, kept f32
-// ([out, groups]) and applied to the sums of the input over each group
-// (janis_affine8_mul). 8.5 bits a weight and half a bit of offsets, where
-// the f16 copy was 16: Qwen3.8-27B-8bit holds 54 GB as f16. Built once on
-// every core, pinned; the words go.
+// affine8 is the device form of an 8-bit affine weight [out, in]: one ggml
+// Q8_0 matrix (blocks of 32: f16 scale d, 32 int8) of its codes and, after
+// them, its offsets. A value is code*scale + bias = scale*(code-128) +
+// (bias + 128*scale). The first term is a Q8_0 block with d the group's scale
+// and the code moved to int8, exact in the codes. The second is one number a
+// group, times the sum of the input over that group: it is written in
+// affine8Digits columns of the same matrix, as int8 digits in base 128 of the
+// row's offset scale, and those columns multiply the group sums, the sums
+// over 128 and the sums over 128^2, which follow the input (affine8Input).
+// An offset is held to 2^-21 of its row's largest. One multiply a weight:
+// kept f32 beside the codes, the offsets were a multiply and an add more a
+// weight, a fifth of the 27B's decode step. 8.5 bits a weight and 0.4 of
+// offsets, where the f16 copy was 16: Qwen3.8-27B-8bit holds 54 GB as f16.
+// Built once on every core, pinned; the words go.
+const affine8Digits = 3
+
+// affine8Cols is the offset columns of a weight of G groups: whole blocks.
+func affine8Cols(G int) int { return (affine8Digits*G + 31) / 32 * 32 }
+
 func (b *Backend) affine8(tw, ts, tb *tensor, groupSize int) *tensor {
 	if tw.q4 != nil {
 		return tw.q4
@@ -2811,28 +2819,48 @@ func (b *Backend) affine8(tw, ts, tb *tensor, groupSize int) *tensor {
 	in := P * valsPerWord
 	G := ts.shape[len(ts.shape)-1]
 	rows := numel(tw.shape) / P
-	raw := make([]byte, rows*(in/32)*blk)
-	offs := make([]float32, rows*G)
+	extra := affine8Cols(G)
+	cols := in + extra
+	raw := make([]byte, rows*(cols/32)*blk)
 	var wg sync.WaitGroup
 	workers := runtime.NumCPU()
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
+			offs := make([]float64, G)
+			digits := make([]int8, extra)
 			for r := w; r < rows; r += workers {
-				for g := 0; g < G; g++ {
-					// The block's scale is the group's, as f16: the offset is taken
-					// against that f16 value, so code 128 is the bias exactly.
-					d := f32tof16(sc[r*G+g])
-					offs[r*G+g] = bi[r*G+g] + 128*f16tof32(d)
-				}
+				row := raw[r*(cols/32)*blk:]
 				for blkIdx := 0; blkIdx < in/32; blkIdx++ {
-					o := (r*(in/32) + blkIdx) * blk
-					binary.LittleEndian.PutUint16(raw[o:], f32tof16(sc[r*G+blkIdx*32/groupSize]))
+					o := blkIdx * blk
+					binary.LittleEndian.PutUint16(row[o:], f32tof16(sc[r*G+blkIdx*32/groupSize]))
 					for j := 0; j < 32; j++ {
 						e := blkIdx*32 + j
 						code := (uint32(words[r*P+e/valsPerWord]) >> uint((e%valsPerWord)*bits)) & 0xff
-						raw[o+2+j] = byte(int8(int(code) - 128))
+						row[o+2+j] = byte(int8(int(code) - 128))
+					}
+				}
+				// The block's scale is the group's, as f16: the offset is taken
+				// against that f16 value, so code 128 is the bias exactly.
+				var most float64
+				for g := 0; g < G; g++ {
+					offs[g] = float64(bi[r*G+g]) + 128*float64(f16tof32(f32tof16(sc[r*G+g])))
+					most = math.Max(most, math.Abs(offs[g]))
+				}
+				d16 := offsetScale(most)
+				d := float64(f16tof32(d16))
+				clear(digits)
+				for g := 0; g < G && d > 0; g++ {
+					for j, c := range offsetDigits(offs[g] / d) {
+						digits[j*G+g] = c
+					}
+				}
+				for e := 0; e < extra; e += 32 {
+					o := (in + e) / 32 * blk
+					binary.LittleEndian.PutUint16(row[o:], d16)
+					for j := 0; j < 32; j++ {
+						row[o+2+j] = byte(digits[e+j])
 					}
 				}
 			}
@@ -2840,7 +2868,7 @@ func (b *Backend) affine8(tw, ts, tb *tensor, groupSize int) *tensor {
 	}
 	wg.Wait()
 	shape := append([]int(nil), tw.shape...)
-	shape[len(shape)-1] = in
+	shape[len(shape)-1] = cols
 	ctx := C.janis_ctx(ctxMem)
 	n := ne(shape)
 	t := C.janis_new(ctx, C.GGML_TYPE_Q8_0, n[0], n[1], n[2], n[3])
@@ -2851,10 +2879,7 @@ func (b *Backend) affine8(tw, ts, tb *tensor, groupSize int) *tensor {
 	}
 	logAlloc("Q8_0 weight (affine8)", C.ggml_nbytes(t), shape)
 	C.ggml_backend_tensor_set(t, unsafe.Pointer(&raw[0]), 0, C.size_t(len(raw)))
-	q := &tensor{t: t, ctx: ctx, buf: buf, shape: shape, dt: engine.F16, pin: true}
-	offShape := append(append([]int(nil), tw.shape[:len(tw.shape)-1]...), G)
-	q.off = b.newFrom(engine.F32, offShape, unsafe.Pointer(&offs[0]), len(offs)*4)
-	q.off.pin = true
+	q := &tensor{t: t, ctx: ctx, buf: buf, shape: shape, dt: engine.F16, pin: true, offCols: extra}
 	tw.q4 = q
 	if !tw.gathered && tw.buf != nil {
 		C.ggml_backend_buffer_free(tw.buf)
@@ -2862,6 +2887,65 @@ func (b *Backend) affine8(tw, ts, tb *tensor, groupSize int) *tensor {
 		tw.buf, tw.ctx, tw.t, tw.dropped = nil, nil, nil, true
 	}
 	return q
+}
+
+// offsetDigits is v, within ±127, as affine8Digits int8 digits in base 128,
+// the first the units: v is within 128^-2/2 of their sum.
+func offsetDigits(v float64) (digits [affine8Digits]int8) {
+	for j := range digits {
+		c := math.Max(-127, math.Min(127, math.Round(v)))
+		digits[j] = int8(c)
+		v = (v - c) * 128
+	}
+	return digits
+}
+
+// offsetScale is the f16 scale of a row's offset digits: the least whose
+// 127 reaches most, the row's largest offset.
+func offsetScale(most float64) uint16 {
+	d := f32tof16(float32(most / 127))
+	for float64(f16tof32(d))*127 < most {
+		d++
+	}
+	return d
+}
+
+// affine8Input is x followed by what an 8-bit weight's offset columns
+// multiply: x's sums over each group of gs values, times 1, 1/128 and
+// 1/128^2, and zeros to a whole block. One input's is made once.
+func (b *Backend) affine8Input(x *tensor, gs int) *tensor {
+	if s := x.sums; s != nil && !s.freed && x.sumsGS == gs {
+		return s
+	}
+	in := x.shape[len(x.shape)-1]
+	G := in / gs
+	extra := affine8Cols(G)
+	b.mu.Lock()
+	spread := b.spreads[G]
+	b.mu.Unlock()
+	if spread == nil {
+		m := make([]float32, extra*G)
+		for j, f := 0, float32(1); j < affine8Digits; j, f = j+1, f/128 {
+			for g := 0; g < G; g++ {
+				m[(j*G+g)*G+g] = f
+			}
+		}
+		spread = b.newFrom(engine.F32, []int{extra, G}, unsafe.Pointer(&m[0]), len(m)*4)
+		spread.pin = true
+		b.mu.Lock()
+		if b.spreads == nil {
+			b.spreads = map[int]*tensor{}
+		}
+		b.spreads[G] = spread
+		b.mu.Unlock()
+	}
+	shape := append([]int(nil), x.shape...)
+	shape[len(shape)-1] = in + extra
+	s := b.op(engine.F32, shape, []*tensor{x, spread}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		return C.janis_affine8_input(ctx, f32(ctx, x), spread.t, C.int64_t(gs))
+	})
+	x.sums, x.sumsGS = s, gs
+	return s
 }
 
 // deviceF16 is the device copy of an affine weight ggml has no block type
@@ -2899,21 +2983,6 @@ func (b *Backend) deviceF16(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 	return q
 }
 
-// groupSums is x's sums over each group of gs values along its last axis,
-// computed once for every 8-bit weight that multiplies x.
-func (b *Backend) groupSums(x *tensor, gs int) *tensor {
-	if s := x.sums; s != nil && !s.freed && x.sumsGS == gs {
-		return s
-	}
-	shape := append([]int(nil), x.shape...)
-	shape[len(shape)-1] /= gs
-	s := b.op(engine.F32, shape, []*tensor{x}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-		return C.janis_group_sums(ctx, f32(ctx, x), C.int64_t(gs))
-	})
-	x.sums, x.sumsGS = s, gs
-	return s
-}
-
 // QuantMatmul: x @ Wᵀ with W [out, in] affine 4-bit, on ggml's Q4_1 kernel.
 func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool, groupSize, bits int) engine.Tensor {
 	if !transpose {
@@ -2929,16 +2998,13 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 	nx := len(tx.shape)
 	shape := append(append([]int(nil), tx.shape[:nx-1]...), q.shape[0])
 	inputs := []*tensor{tx, q, as(w), as(scales), as(biases)}
-	var sums *tensor
-	if q.off != nil {
-		sums = b.groupSums(tx, groupSize)
-		inputs = append(inputs, q.off, sums)
+	in := tx
+	if q.offCols > 0 {
+		in = b.affine8Input(tx, groupSize)
+		inputs = append(inputs, in)
 	}
 	out := b.op(engine.F32, shape, inputs, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-		if q.off != nil {
-			return C.janis_affine8_mul(ctx, q.t, q.off.t, f32(ctx, tx), sums.t)
-		}
-		return C.ggml_mul_mat(ctx, q.t, f32(ctx, tx)) // ne (out, M, …)
+		return C.ggml_mul_mat(ctx, q.t, f32(ctx, in)) // ne (out, M, …)
 	})
 	out.quant = &quantCall{groupSize: groupSize, bits: bits}
 	return out

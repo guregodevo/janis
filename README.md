@@ -53,7 +53,7 @@ Use Ollama or llama.cpp instead for Windows, vision models, architectures
 janis does not load ([Models](#models)), several models loaded at once, or
 the fastest decode of a small model on NVIDIA (Qwen3-8B on an L4:
 llama.cpp's 47.0 tok/s against 43.2), or 8-bit weights there (the 27B on
-an A100: 39.6 against 30.0).
+an A100: 39.6 against 33.3).
 
 ## Install
 
