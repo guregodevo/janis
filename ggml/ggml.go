@@ -28,6 +28,7 @@ package ggml
 #cgo linux LDFLAGS: -lstdc++ -lm
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -53,6 +54,20 @@ static ggml_backend_buffer_type_t janis_repack_buft(ggml_backend_t be) {
 }
 static void janis_dequant_q4k(const void * x, float * y, int64_t k) {
 	ggml_get_type_traits(GGML_TYPE_Q4_K)->to_float(x, y, k);
+}
+// janis_op_hist writes the graph's node count per op, most frequent first
+// ("MUL_MAT 520 ADD 410 ..."), for JANIS_GGML_TIMING.
+static void janis_op_hist(struct ggml_cgraph * g, char * out, size_t cap) {
+	int n[GGML_OP_COUNT] = {0};
+	for (int i = 0; i < ggml_graph_n_nodes(g); i++) n[ggml_graph_node(g, i)->op]++;
+	size_t at = 0; out[0] = 0;
+	for (;;) {
+		int best = -1;
+		for (int o = 0; o < GGML_OP_COUNT; o++) if (n[o] > 0 && (best < 0 || n[o] > n[best])) best = o;
+		if (best < 0 || at + 48 > cap) break;
+		at += snprintf(out + at, cap - at, "%s %d ", ggml_op_name((enum ggml_op) best), n[best]);
+		n[best] = 0;
+	}
 }
 static struct ggml_tensor * janis_new(struct ggml_context * c, enum ggml_type t, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
 	return ggml_new_tensor_4d(c, t, ne0, ne1, ne2, ne3);
@@ -872,6 +887,10 @@ func (b *Backend) flushLocked() {
 		t3 := time.Now()
 		fmt.Fprintf(os.Stderr, "ggml flush: %d results, %d held, %d nodes, %s build, %s alloc, %s compute\n",
 			len(pending), len(live), int(C.ggml_graph_n_nodes(g)), t1.Sub(t0).Round(10*time.Microsecond), t2.Sub(t1).Round(10*time.Microsecond), t3.Sub(t2).Round(10*time.Microsecond))
+		if n := int(C.ggml_graph_n_nodes(g)); n > 500 && !histSeen[n] {
+			histSeen[n] = true
+			fmt.Fprintf(os.Stderr, "ggml flush: %d nodes by op: %s\n", n, opHist(g))
+		}
 	}
 	grp := &batch{ctx: ctx, galloc: galloc, refs: len(live)}
 	// Results nobody holds any more are freed by their finalizers, and
@@ -1052,6 +1071,8 @@ func jsonInts(v []int) string {
 var (
 	trace  = os.Getenv("JANIS_GGML_TRACE") == "1"
 	timing = os.Getenv("JANIS_GGML_TIMING") == "1"
+	// histSeen is the graph sizes whose op counts timing already printed.
+	histSeen = map[int]bool{}
 	// check (JANIS_GGML_CHECK=1) reads every result back after each flush
 	// and stops at the first NaN or Inf, naming the op that made it.
 	check = os.Getenv("JANIS_GGML_CHECK") == "1"
@@ -1073,6 +1094,13 @@ func f32(ctx *C.struct_ggml_context, x *tensor) *C.struct_ggml_tensor {
 		return x.t
 	}
 	return C.ggml_cast(ctx, x.t, C.GGML_TYPE_F32)
+}
+
+// opHist is the graph's node count per op, most frequent first.
+func opHist(g *C.struct_ggml_cgraph) string {
+	var buf [4096]C.char
+	C.janis_op_hist(g, &buf[0], 4096)
+	return C.GoString(&buf[0])
 }
 
 // Eval computes everything recorded so far; the engine calls it once per

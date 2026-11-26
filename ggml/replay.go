@@ -15,6 +15,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/guregodevo/janis/engine"
@@ -634,13 +635,42 @@ func (b *Backend) EndStep(ids, logits engine.Tensor, next []engine.Tensor) (engi
 }
 
 func (s *step) compute() []float32 {
+	t0 := time.Now()
 	if st := C.ggml_backend_graph_compute(s.b.be, s.g); st != C.GGML_STATUS_SUCCESS {
 		panic("ggml: a recorded decode step failed")
 	}
 	out := make([]float32, s.vocab)
+	t1 := time.Now()
 	C.ggml_backend_tensor_get(s.logits.t, unsafe.Pointer(&out[0]), 0, C.size_t(4*s.vocab))
+	if timing {
+		// JANIS_GGML_TIMING: a replayed step's graph call and its read of
+		// the logits, averaged over a hundred steps, with the time between
+		// steps (everything outside the two).
+		now := time.Now()
+		if !replayT.last.IsZero() {
+			replayT.gap += t0.Sub(replayT.last)
+		}
+		replayT.compute, replayT.read, replayT.n, replayT.last = replayT.compute+t1.Sub(t0), replayT.read+now.Sub(t1), replayT.n+1, now
+		if replayT.n == 100 {
+			fmt.Fprintf(os.Stderr, "ggml replay: 100 steps of %d nodes: graph call %.2f ms, logits read %.2f ms, between steps %.2f ms\n",
+				int(C.ggml_graph_n_nodes(s.g)), replayT.compute.Seconds()*10, replayT.read.Seconds()*10, replayT.gap.Seconds()*10)
+			if n := int(C.ggml_graph_n_nodes(s.g)); !histSeen[-n] {
+				histSeen[-n] = true
+				fmt.Fprintf(os.Stderr, "ggml replay: %d nodes by op: %s\n", n, opHist(s.g))
+			}
+			replayT = replayTiming{}
+		}
+	}
 	return out
 }
+
+type replayTiming struct {
+	compute, read, gap time.Duration
+	n                  int
+	last               time.Time
+}
+
+var replayT replayTiming
 
 func (s *step) Fits(offset int) bool { return offset < s.rs.limit }
 
