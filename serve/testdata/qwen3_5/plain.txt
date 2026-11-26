@@ -1,0 +1,8 @@
+<|im_start|>user
+Solve this programming problem.
+Read stdin and print the answer.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

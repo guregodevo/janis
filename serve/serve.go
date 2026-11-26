@@ -333,6 +333,18 @@ type chatTool struct {
 		Description string          `json:"description"`
 		Parameters  json.RawMessage `json:"parameters"`
 	} `json:"function"`
+	// raw is the tool as the request wrote it: the Qwen3.5 template lists
+	// it that way, its keys in the caller's order (xmltools.go).
+	raw json.RawMessage
+}
+
+func (t *chatTool) UnmarshalJSON(b []byte) error {
+	type plain chatTool
+	if err := json.Unmarshal(b, (*plain)(t)); err != nil {
+		return err
+	}
+	t.raw = append(json.RawMessage(nil), b...)
+	return nil
 }
 
 type toolCall struct {
@@ -715,16 +727,19 @@ func renderChatFor(req chatRequest, xml bool) []llm.Message {
 			system += contentText(m.Content) + "\n"
 		}
 	}
-	if len(req.Tools) > 0 {
+	if len(req.Tools) > 0 && xml {
+		// The template's order: the tools, then the system text.
+		if system = strings.TrimSpace(system); system != "" {
+			system = renderToolsXML(req.Tools) + "\n\n" + system
+		} else {
+			system = renderToolsXML(req.Tools)
+		}
+	} else if len(req.Tools) > 0 {
 		system = strings.TrimSpace(system)
 		if system == "" {
 			system = "You are a helpful assistant."
 		}
-		if xml {
-			system += "\n\n" + renderToolsXML(req.Tools)
-		} else {
-			system += "\n\n" + renderTools(req.Tools)
-		}
+		system += "\n\n" + renderTools(req.Tools)
 	}
 	if strings.TrimSpace(system) != "" {
 		out = append(out, llm.Message{Role: "system", Content: strings.TrimSpace(system)})
@@ -735,9 +750,19 @@ func renderChatFor(req chatRequest, xml bool) []llm.Message {
 			continue
 		case "assistant":
 			text := contentText(m.Content)
-			for _, c := range m.ToolCalls {
+			if xml {
+				text = strings.TrimSpace(text)
+			}
+			for i, c := range m.ToolCalls {
 				if xml {
-					text += "\n" + renderCallXML(c.Function.Name, c.Function.Arguments)
+					// The template's spacing: a blank line between the text and
+					// its first call, a newline between calls.
+					if i > 0 {
+						text += "\n"
+					} else if text != "" {
+						text += "\n\n"
+					}
+					text += renderCallXML(c.Function.Name, c.Function.Arguments)
 					continue
 				}
 				args := json.RawMessage(c.Function.Arguments)
@@ -750,7 +775,11 @@ func renderChatFor(req chatRequest, xml bool) []llm.Message {
 			}
 			out = append(out, llm.Message{Role: "assistant", Content: strings.TrimSpace(text)})
 		case "tool":
-			body := "<tool_response>\n" + contentText(m.Content) + "\n</tool_response>"
+			result := contentText(m.Content)
+			if xml {
+				result = strings.TrimSpace(result)
+			}
+			body := "<tool_response>\n" + result + "\n</tool_response>"
 			if n := len(out); n > 0 && out[n-1].Role == "user" && strings.HasPrefix(out[n-1].Content, "<tool_response>") {
 				out[n-1].Content += "\n" + body // several results answer one turn
 				continue
@@ -758,7 +787,11 @@ func renderChatFor(req chatRequest, xml bool) []llm.Message {
 			out = append(out, llm.Message{Role: "user", Content: body})
 		default:
 			images, _ := contentImages(m.Content)
-			out = append(out, llm.Message{Role: "user", Content: contentText(m.Content), Images: images})
+			text := contentText(m.Content)
+			if xml {
+				text = strings.TrimSpace(text)
+			}
+			out = append(out, llm.Message{Role: "user", Content: text, Images: images})
 		}
 	}
 	return out

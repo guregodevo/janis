@@ -47,13 +47,18 @@ func usesXMLTools(modelDir string) bool {
 	return strings.Contains(string(cfg.ChatTemplate), "<function=")
 }
 
-// renderToolsXML is the tools block the Qwen3.5 template writes.
+// renderToolsXML is the tools block the Qwen3.5 template writes: each tool
+// as the request wrote it, in the template's JSON (tojson).
 func renderToolsXML(tools []chatTool) string {
 	var b strings.Builder
 	b.WriteString("# Tools\n\nYou have access to the following functions:\n\n<tools>")
 	for _, t := range tools {
 		b.WriteByte('\n')
-		b.Write(toolSchema(t))
+		if j, ok := templateJSON(t.raw); ok {
+			b.WriteString(j)
+		} else {
+			b.Write(toolSchema(t))
+		}
 	}
 	b.WriteString("\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>")
 	return b.String()
@@ -158,4 +163,70 @@ func paramTypes(tools []chatTool) map[string]map[string]string {
 		out[t.Function.Name] = m
 	}
 	return out
+}
+
+// templateJSON is raw as a chat template's tojson filter writes it (Python's
+// json.dumps, ensure_ascii off): the keys in the order raw has them, ", "
+// between items and ": " after a key. false when raw is not JSON.
+func templateJSON(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.UseNumber()
+	var b strings.Builder
+	if !writeTemplateJSON(dec, &b) {
+		return "", false
+	}
+	return b.String(), true
+}
+
+func writeTemplateJSON(dec *json.Decoder, b *strings.Builder) bool {
+	t, err := dec.Token()
+	if err != nil {
+		return false
+	}
+	switch v := t.(type) {
+	case json.Delim:
+		closing := map[json.Delim]string{'{': "}", '[': "]"}[v]
+		b.WriteString(v.String())
+		for first := true; dec.More(); first = false {
+			if !first {
+				b.WriteString(", ")
+			}
+			if v == '{' {
+				k, err := dec.Token()
+				ks, ok := k.(string)
+				if err != nil || !ok {
+					return false
+				}
+				b.WriteString(templateString(ks) + ": ")
+			}
+			if !writeTemplateJSON(dec, b) {
+				return false
+			}
+		}
+		if _, err := dec.Token(); err != nil {
+			return false
+		}
+		b.WriteString(closing)
+	case string:
+		b.WriteString(templateString(v))
+	case json.Number:
+		b.WriteString(v.String())
+	case bool:
+		b.WriteString(map[bool]string{true: "true", false: "false"}[v])
+	case nil:
+		b.WriteString("null")
+	}
+	return true
+}
+
+// templateString is s as a JSON string with nothing escaped for HTML.
+func templateString(s string) string {
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(s)
+	return strings.TrimSuffix(b.String(), "\n")
 }
