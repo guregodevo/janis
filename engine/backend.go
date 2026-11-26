@@ -188,6 +188,13 @@ type PoolRowWriter interface {
 	SetRow(j int, k, v Tensor)
 }
 
+// PrefillChunker is a backend with a prefill window of its own: how many
+// prompt tokens it reads in one forward when nothing else says (0: no
+// preference).
+type PrefillChunker interface {
+	PrefillChunk() int
+}
+
 // Step is a recorded decode step.
 type Step interface {
 	// Fits reports whether the step can run at offset (its caches' room).

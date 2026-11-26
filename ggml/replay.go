@@ -124,6 +124,16 @@ func (b *Backend) replayOn() bool {
 	return strings.HasPrefix(b.name, "CUDA")
 }
 
+// PrefillChunk is 1,024 tokens on CUDA (engine.PrefillChunker): a 12k-token
+// prompt of the 27B is read at 1,088 tokens/s for 0.4 GB more than at 256
+// (890 tokens/s); 2,048 gives 1,115 for 0.9 GB (A100, 2026-11-26).
+func (b *Backend) PrefillChunk() int {
+	if strings.HasPrefix(b.name, "CUDA") {
+		return 1024
+	}
+	return 0
+}
+
 func replayOnCPUNow() bool { return replayOnCPU || os.Getenv("JANIS_GGML_REPLAY") == "cpu" }
 
 // recording is the state of a step being recorded.

@@ -58,14 +58,15 @@ func debugLog(format string, a ...any) {
 
 // prefillChunk is the chunked-prefill window: peak activation during prefill is
 // bounded by this many tokens rather than the whole prompt. 256 keeps the spike
-// small while staying efficient; override with MLX_PREFILL_CHUNK.
-var prefillChunk = func() int {
+// small while staying efficient; a backend may name its own
+// (engine.PrefillChunker); override with MLX_PREFILL_CHUNK.
+var prefillChunk, prefillChunkSet = func() (int, bool) {
 	if v := os.Getenv("MLX_PREFILL_CHUNK"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
+			return n, true
 		}
 	}
-	return 256
+	return 256, false
 }()
 
 // Session keeps a conversation's KV cache alive across requests so a follow-up
@@ -325,6 +326,9 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool, 
 	// same mechanism as incremental decode. We MUST eval+sweep each chunk, else
 	// MLX defers every chunk to one eval and the spike returns.
 	chunkSize := prefillChunk
+	if pc, ok := b.(engine.PrefillChunker); ok && !prefillChunkSet && pc.PrefillChunk() > 0 {
+		chunkSize = pc.PrefillChunk()
+	}
 	if s.PrefillChunk > 0 {
 		chunkSize = s.PrefillChunk
 	}
