@@ -44,3 +44,24 @@ func BenchmarkSampleTokenTopK(b *testing.B) {
 		sampleToken(logits, p, rng, nil)
 	}
 }
+
+// BenchmarkSampleTokenFlat: no top-k and logits close together (nothing is
+// small enough to leave out of the softmax's sum), with and without a top-p.
+func BenchmarkSampleTokenFlat(b *testing.B) {
+	src := rand.New(rand.NewSource(1))
+	logits := make([]float32, 248320)
+	for i := range logits {
+		logits[i] = float32(src.NormFloat64() * 3)
+	}
+	logits[1234] = 12
+	for _, topP := range []float32{0.95, 1} {
+		b.Run(map[float32]string{0.95: "top-p 0.95", 1: "no top-p"}[topP], func(b *testing.B) {
+			rng := rand.New(rand.NewSource(2))
+			buf := make([]float32, len(logits))
+			for i := 0; i < b.N; i++ {
+				copy(buf, logits)
+				sampleToken(buf, SampleParams{Temp: 1, TopP: topP}, rng, nil)
+			}
+		})
+	}
+}

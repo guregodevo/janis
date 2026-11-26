@@ -6,6 +6,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"sync"
 
 	"github.com/guregodevo/janis/engine"
 	"github.com/guregodevo/janis/safetensors"
@@ -113,6 +114,10 @@ func sampleToken(logits []float32, p SampleParams, rng *rand.Rand, recent []int3
 		return sampleTopK(logits, p, rng, constrain)
 	}
 
+	if !constrain {
+		return sampleTopP(logits, p, rng)
+	}
+
 	n := len(logits)
 	maxL := logits[0]
 	for _, x := range logits {
@@ -167,6 +172,93 @@ func sampleToken(logits []float32, p SampleParams, rng *rand.Rand, recent []int3
 		}
 	}
 	return int32(idx[cut-1])
+}
+
+// sampleTopP is sampleToken's draw with no top-k and no grammar: the
+// softmax's sum is taken on several cores and only the most likely tokens,
+// enough to hold the top-p share, get a probability of their own. A slice
+// of 248k probabilities a token, sorted from a heap of them, took 1.4 ms.
+func sampleTopP(logits []float32, p SampleParams, rng *rand.Rand) int32 {
+	maxL := float64(logits[argmax(logits)])
+	inv := 1.0 / float64(p.Temp)
+	sum := expSum(logits, maxL, inv)
+	prob := func(id int) float64 { return math.Exp((float64(logits[id])-maxL)*inv) / sum }
+	topP := float64(p.TopP)
+	// With no top-p the draw is over every token: the candidates are taken
+	// as far as the draw reaches, not all 248k sorted.
+	need, all := topP, false
+	var u float64
+	if topP <= 0 || topP >= 1 {
+		u, all = rng.Float64(), true
+		need = u
+	}
+	var idx []int
+	var probs []float64
+	var cum float64
+	cut := 0
+	for k := 64; cut == 0; k *= 8 {
+		k = min(k, len(logits))
+		idx = topProbs(logits, k, nil)
+		probs, cum = probs[:0], 0
+		for rank, id := range idx {
+			probs = append(probs, prob(id))
+			cum += probs[rank]
+			if cum >= need {
+				cut = rank + 1
+				break
+			}
+		}
+		if cut == 0 && k == len(logits) {
+			cut = len(idx)
+		}
+	}
+	r := u
+	if !all {
+		r = rng.Float64() * cum
+	}
+	var acc float64
+	for rank := 0; rank < cut; rank++ {
+		acc += probs[rank]
+		if r <= acc {
+			return int32(idx[rank])
+		}
+	}
+	return int32(idx[cut-1])
+}
+
+// expSum is the sum of exp((x - maxL) * inv) over logits, in sixteen parts
+// on as many goroutines for a vocabulary's worth; the parts are added in
+// order, so the sum is the same on any host. A term under e^-40 is left
+// out: 248k of them are 1e-12 of the largest term.
+func expSum(logits []float32, maxL, inv float64) float64 {
+	part := func(xs []float32) float64 {
+		var s float64
+		for _, x := range xs {
+			if d := (float64(x) - maxL) * inv; d > -40 {
+				s += math.Exp(d)
+			}
+		}
+		return s
+	}
+	const parts = 16
+	if len(logits) < 1<<15 {
+		return part(logits)
+	}
+	var sums [parts]float64
+	var wg sync.WaitGroup
+	for i := 0; i < parts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sums[i] = part(logits[i*len(logits)/parts : (i+1)*len(logits)/parts])
+		}(i)
+	}
+	wg.Wait()
+	var s float64
+	for _, v := range sums {
+		s += v
+	}
+	return s
 }
 
 // argmax is the first index of the largest logit.
