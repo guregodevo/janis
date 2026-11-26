@@ -2,6 +2,7 @@ package qwen
 
 import (
 	"math/rand"
+	"sort"
 	"testing"
 )
 
@@ -35,5 +36,44 @@ func TestTopKKeepsTheKMostLikely(t *testing.T) {
 	}
 	if seen := draw(SampleParams{Temp: 1, TopP: 0.5}); len(seen) != 2 {
 		t.Fatalf("top-p 0.5: drew %v, want tokens 0 and 1", seen)
+	}
+}
+
+// The K kept are the K a full sort keeps, ties to the lower id, at any K.
+func TestTopProbsIsAFullSortsFirstK(t *testing.T) {
+	src := rand.New(rand.NewSource(3))
+	logits := make([]float32, 5000)
+	for i := range logits {
+		logits[i] = float32(src.Intn(400)) / 8 // many ties
+	}
+	order := make([]int, len(logits))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool { return logits[order[a]] > logits[order[b]] })
+	for _, k := range []int{1, 2, 20, 64, 4999, 5000, 6000} {
+		got := topProbs(logits, k, nil)
+		want := order[:min(k, len(order))]
+		if len(got) != len(want) {
+			t.Fatalf("k=%d: %d kept, want %d", k, len(got), len(want))
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("k=%d: rank %d is token %d, want %d", k, i, got[i], want[i])
+			}
+		}
+	}
+	even := func(id int) bool { return id%2 == 0 }
+	for i, id := range topProbs(logits, 20, even) {
+		if id%2 != 0 {
+			t.Fatalf("rank %d is token %d, which the filter refuses", i, id)
+		}
+	}
+}
+
+// A greedy pick is the first of the largest logits.
+func TestGreedyTakesTheFirstLargest(t *testing.T) {
+	if got := sampleToken([]float32{1, 7, 3, 7, 2}, SampleParams{}, nil, nil); got != 1 {
+		t.Fatalf("greedy picked %d, want 1", got)
 	}
 }

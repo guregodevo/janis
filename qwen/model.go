@@ -90,8 +90,11 @@ func sampleToken(logits []float32, p SampleParams, rng *rand.Rand, recent []int3
 
 	if p.Temp <= 0 {
 		best := -1
-		for i := range logits {
-			if constrain && !p.Grammar.Allows(int32(i)) {
+		if !constrain {
+			best = argmax(logits)
+		}
+		for i := 0; constrain && i < len(logits); i++ {
+			if !p.Grammar.Allows(int32(i)) {
 				continue
 			}
 			if best < 0 || logits[i] > logits[best] {
@@ -101,12 +104,7 @@ func sampleToken(logits []float32, p SampleParams, rng *rand.Rand, recent []int3
 		if best < 0 {
 			// The grammar allowed nothing (shouldn't happen for a well-formed
 			// grammar) — fall back to the unconstrained argmax rather than deadlock.
-			best = 0
-			for i := range logits {
-				if logits[i] > logits[best] {
-					best = i
-				}
-			}
+			best = argmax(logits)
 		}
 		return int32(best)
 	}
@@ -169,6 +167,17 @@ func sampleToken(logits []float32, p SampleParams, rng *rand.Rand, recent []int3
 		}
 	}
 	return int32(idx[cut-1])
+}
+
+// argmax is the first index of the largest logit.
+func argmax(logits []float32) int {
+	best, top := 0, logits[0]
+	for i, x := range logits {
+		if x > top {
+			best, top = i, x
+		}
+	}
+	return best
 }
 
 // sampleTopK is sampleToken's draw with a top-k: the K most likely tokens
@@ -537,7 +546,13 @@ func topProbs[T float32 | float64](probs []T, k int, allow func(int) bool) []int
 			i = m
 		}
 	}
-	for id := range probs {
+	var worst T // the least likely kept, once k are
+	for id, v := range probs {
+		if len(h) == k && v <= worst {
+			// ids come in order: one no more likely than the worst kept
+			// is after it.
+			continue
+		}
 		if allow != nil && !allow(id) {
 			continue
 		}
@@ -551,12 +566,11 @@ func topProbs[T float32 | float64](probs []T, k int, allow func(int) bool) []int
 				h[i], h[parent] = h[parent], h[i]
 				i = parent
 			}
-			continue
-		}
-		if before(probs, id, h[0]) {
+		} else {
 			h[0] = id
 			down(0)
 		}
+		worst = probs[h[0]]
 	}
 	sort.Slice(h, func(a, b int) bool { return before(probs, h[a], h[b]) })
 	return h

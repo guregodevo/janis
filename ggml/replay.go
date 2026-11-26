@@ -556,6 +556,7 @@ type step struct {
 	logits *tensor
 	vocab  int
 	held   []*tensor
+	out    []float32 // Run's logits, read into the same slice every step
 }
 
 // EndStep ends the recording and computes the step (engine.StepReplayer).
@@ -634,13 +635,15 @@ func (b *Backend) EndStep(ids, logits engine.Tensor, next []engine.Tensor) (engi
 	return s, s.compute()
 }
 
-func (s *step) compute() []float32 {
+func (s *step) compute() []float32 { return s.computeInto(make([]float32, s.vocab)) }
+
+// computeInto is compute with the logits read into out.
+func (s *step) computeInto(out []float32) []float32 {
 	t0 := time.Now()
 	replayT.t0 = t0
 	if st := C.ggml_backend_graph_compute(s.b.be, s.g); st != C.GGML_STATUS_SUCCESS {
 		panic("ggml: a recorded decode step failed")
 	}
-	out := make([]float32, s.vocab)
 	t1 := time.Now()
 	C.ggml_backend_tensor_get(s.logits.t, unsafe.Pointer(&out[0]), 0, C.size_t(4*s.vocab))
 	if timing {
@@ -732,7 +735,12 @@ func (s *step) Run(tok int32, offset int) []float32 {
 		setFloat32(e.out, dequantRows(e.w, e.s, e.b, []int32{tok}, e.groupSize, e.bits))
 	}
 	s.rs.fill(offset)
-	return s.compute()
+	// One conversation's logits are read and sampled before its next step:
+	// the megabyte they take is the step's, not a new one a token.
+	if s.out == nil {
+		s.out = make([]float32, s.vocab)
+	}
+	return s.computeInto(s.out)
 }
 
 func (s *step) Close() {

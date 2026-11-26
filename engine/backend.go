@@ -192,8 +192,8 @@ type PoolRowWriter interface {
 type Step interface {
 	// Fits reports whether the step can run at offset (its caches' room).
 	Fits(offset int) bool
-	// Run computes the step for tok at offset and returns its logits. The
-	// carried states are updated in place.
+	// Run computes the step for tok at offset and returns its logits, good
+	// until the next Run. The carried states are updated in place.
 	Run(tok int32, offset int) []float32
 	// Close frees the step's graph; the caches and states stay.
 	Close()
