@@ -623,6 +623,10 @@ func (b *Backend) EndStep(ids, logits engine.Tensor, next []engine.Tensor) (engi
 	ctx, pending, extra, extraDeps, nodes := b.rec, b.pending, b.extra, b.extraDeps, b.recCap
 	b.rec, b.pending, b.extra, b.extraDeps = nil, nil, nil, nil
 	b.mu.Unlock()
+	// A result the model dropped is one until the collector has run: the
+	// step would compute it, and keep its memory apart, on every run. Once
+	// a recording.
+	runtime.GC()
 
 	tl := as(logits)
 	// Every result the model still holds is an output, as a flush makes
