@@ -1813,8 +1813,11 @@ func (b *Backend) Slice(x engine.Tensor, axis, start, end int) engine.Tensor {
 		// A slice of what this graph computes stays a view when its values
 		// lie together (q, k and v cut from one projection). A slice of a
 		// leaf is copied: a cache is written in place later in the step.
+		// The reshape gives the view a fresh tensor's strides: a view keeps
+		// its source's on the axes of one element, and a pinned state is
+		// copied tensor to tensor, which wants the same layout.
 		if t.op != C.GGML_OP_NONE && bool(C.ggml_is_contiguous(v)) {
-			return v
+			return C.ggml_reshape_4d(ctx, v, m[0], m[1], m[2], m[3])
 		}
 		return C.ggml_cont(ctx, v)
 	})
