@@ -481,7 +481,7 @@ func TestAn8BitWeightStays8Bits(t *testing.T) {
 		first := gx.(*tensor).sums
 		y2 := g.QuantMatmul(gx, gW2, gS, gB, true, gs, bits)
 		if tc.on && (first == nil || gx.(*tensor).sums != first) {
-			t.Errorf("%s: two weights on one input did not share its group sums", tc.name)
+			t.Errorf("%s: two weights on one input did not share its extended input", tc.name)
 		}
 		relOK(t, "the first of two weights on one input, "+tc.name, tc.tol, g.Floats(y1), c.Floats(c.QuantMatmul(c.FromFloats(x, 1, 3, in), cW, cS, cB, true, gs, bits)))
 		relOK(t, "the second of two weights on one input, "+tc.name, tc.tol, g.Floats(y2), c.Floats(c.QuantMatmul(c.FromFloats(x, 1, 3, in), cW2, cS, cB, true, gs, bits)))
@@ -489,8 +489,8 @@ func TestAn8BitWeightStays8Bits(t *testing.T) {
 		if typ := int(q.t._type); typ != tc.typ {
 			t.Errorf("%s: the weight is type %d, want %d", tc.name, typ, tc.typ)
 		}
-		if (q.off != nil) != tc.on {
-			t.Errorf("%s: offsets kept: %v, want %v", tc.name, q.off != nil, tc.on)
+		if (q.offCols > 0) != tc.on {
+			t.Errorf("%s: %d offset columns, on: %v", tc.name, q.offCols, tc.on)
 		}
 		g.Close()
 		affine8On = was
@@ -531,5 +531,28 @@ func TestAReshapeOfAnEarlierResultIsNotAViewOfIt(t *testing.T) {
 			t.Errorf("%s of a result of the same graph is a copy", name)
 		}
 		diffOK(t, name+" in one graph", 0, g.Floats(v), vals)
+	}
+}
+
+// An 8-bit weight's offset, written as three base-128 digits of its row's
+// scale, is the offset to 2^-21 of the row's largest: for offsets across the
+// range, and a row scale that 127 times reaches the largest.
+func TestAnOffsetsDigitsAreTheOffset(t *testing.T) {
+	for _, most := range []float64{1e-4, 0.03, 0.7531, 2, 41.9} {
+		d := float64(f16tof32(offsetScale(most)))
+		if d*127 < most {
+			t.Fatalf("the scale %g times 127 does not reach %g", d, most)
+		}
+		for i := -1000; i <= 1000; i++ {
+			off := most * float64(i) / 1000
+			var got, unit float64 = 0, d
+			for _, c := range offsetDigits(off / d) {
+				got += float64(c) * unit
+				unit /= 128
+			}
+			if math.Abs(got-off) > most/(1<<21) {
+				t.Fatalf("offset %g of a row reaching %g reads %g from its digits: off by %g", off, most, got, got-off)
+			}
+		}
 	}
 }
