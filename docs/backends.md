@@ -51,13 +51,13 @@ given.
 
 | | janis | llama.cpp (b671865) |
 |---|---|---|
-| Qwen3.8-27B 4-bit, decode, greedy | 54.0, 54.0 tok/s | 51.2, 51.1 tok/s |
-| Qwen3.8-27B 4-bit, decode, the model's sampling (top-k 20, top-p 0.95) | 53.8, 53.7 tok/s | 51.2, 51.1 tok/s |
+| Qwen3.8-27B 4-bit, decode, greedy | 55.3, 55.1 tok/s | 51.2, 51.1 tok/s |
+| Qwen3.8-27B 4-bit, decode, the model's sampling (top-k 20, top-p 0.95) | 53.8, 55.3 tok/s | 51.2, 51.1 tok/s |
 | Qwen3.8-27B 4-bit, prefill | 1,106 tok/s | 1,170 tok/s |
 | Qwen3.8-27B 4-bit, GPU memory | 20.7 GB | 20.2 GB |
 | Qwen3.8-27B 8-bit, decode, greedy | 29.9, 30.0 tok/s | 39.6 tok/s |
-| Qwen3-8B 4-bit, decode, greedy | 133.8, 134.2 tok/s | 139.2, 138.7 tok/s |
-| Qwen3-8B 4-bit, decode, the model's sampling | 126.3, 127.3 tok/s | 138.6, 137.6 tok/s |
+| Qwen3-8B 4-bit, decode, greedy | 145.9, 146.0 tok/s | 139.2, 138.7 tok/s |
+| Qwen3-8B 4-bit, decode, the model's sampling | 138.6, 138.2 tok/s | 138.6, 137.6 tok/s |
 
 janis runs `mlx-community`'s 4-bit and 8-bit weights, llama.cpp unsloth's
 Q4_K_M and Q8_0 GGUF. llama.cpp's prefill is by its own timing, janis's is
