@@ -15,6 +15,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/guregodevo/janis/engine"
@@ -121,6 +122,16 @@ func (b *Backend) replayOn() bool {
 		return true
 	}
 	return strings.HasPrefix(b.name, "CUDA")
+}
+
+// PrefillChunk is 1,024 tokens on CUDA (engine.PrefillChunker): a 12k-token
+// prompt of the 27B is read at 1,088 tokens/s for 0.4 GB more than at 256
+// (890 tokens/s); 2,048 gives 1,115 for 0.9 GB (A100, 2026-11-26).
+func (b *Backend) PrefillChunk() int {
+	if strings.HasPrefix(b.name, "CUDA") {
+		return 1024
+	}
+	return 0
 }
 
 func replayOnCPUNow() bool { return replayOnCPU || os.Getenv("JANIS_GGML_REPLAY") == "cpu" }
@@ -555,6 +566,7 @@ type step struct {
 	logits *tensor
 	vocab  int
 	held   []*tensor
+	out    []float32 // Run's logits, read into the same slice every step
 }
 
 // EndStep ends the recording and computes the step (engine.StepReplayer).
@@ -605,7 +617,7 @@ func (b *Backend) EndStep(ids, logits engine.Tensor, next []engine.Tensor) (engi
 		C.ggml_build_forward_expand(g, e)
 	}
 	for _, t := range live {
-		C.ggml_set_output(t.t)
+		keep(t.t)
 		C.ggml_build_forward_expand(g, t.t)
 	}
 	for i, nx := range next {
@@ -633,14 +645,46 @@ func (b *Backend) EndStep(ids, logits engine.Tensor, next []engine.Tensor) (engi
 	return s, s.compute()
 }
 
-func (s *step) compute() []float32 {
+func (s *step) compute() []float32 { return s.computeInto(make([]float32, s.vocab)) }
+
+// computeInto is compute with the logits read into out.
+func (s *step) computeInto(out []float32) []float32 {
+	t0 := time.Now()
+	replayT.t0 = t0
 	if st := C.ggml_backend_graph_compute(s.b.be, s.g); st != C.GGML_STATUS_SUCCESS {
 		panic("ggml: a recorded decode step failed")
 	}
-	out := make([]float32, s.vocab)
+	t1 := time.Now()
 	C.ggml_backend_tensor_get(s.logits.t, unsafe.Pointer(&out[0]), 0, C.size_t(4*s.vocab))
+	if timing {
+		// JANIS_GGML_TIMING: a replayed step's graph call and its read of
+		// the logits, averaged over a hundred steps, with the time between
+		// steps (everything outside the two).
+		now := time.Now()
+		if !replayT.last.IsZero() {
+			replayT.gap += t0.Sub(replayT.last)
+		}
+		replayT.compute, replayT.read, replayT.n, replayT.last = replayT.compute+t1.Sub(t0), replayT.read+now.Sub(t1), replayT.n+1, now
+		if replayT.n == 100 {
+			fmt.Fprintf(os.Stderr, "ggml replay: 100 steps of %d nodes: graph call %.2f ms, logits read %.2f ms, between steps %.2f ms (inputs %.2f ms)\n",
+				int(C.ggml_graph_n_nodes(s.g)), replayT.compute.Seconds()*10, replayT.read.Seconds()*10, replayT.gap.Seconds()*10, replayT.set.Seconds()*10)
+			if n := int(C.ggml_graph_n_nodes(s.g)); !histSeen[-n] {
+				histSeen[-n] = true
+				fmt.Fprintf(os.Stderr, "ggml replay: %d nodes by op: %s\n", n, opHist(s.g))
+			}
+			replayT = replayTiming{}
+		}
+	}
 	return out
 }
+
+type replayTiming struct {
+	compute, read, gap, set time.Duration
+	n                       int
+	last, t0                time.Time
+}
+
+var replayT replayTiming
 
 func (s *step) Fits(offset int) bool { return offset < s.rs.limit }
 
@@ -685,13 +729,28 @@ func (s *step) RunRows(toks []int32, offs []int) []float32 {
 }
 
 func (s *step) Run(tok int32, offset int) []float32 {
+	if timing {
+		t := time.Now()
+		t0 := &replayT.t0
+		*t0 = time.Time{}
+		defer func() {
+			if !t0.IsZero() {
+				replayT.set += t0.Sub(t)
+			}
+		}()
+	}
 	setInt32(s.ids, []int32{tok})
 	s.ids.host = []int32{tok}
 	for _, e := range s.rs.embeds {
 		setFloat32(e.out, dequantRows(e.w, e.s, e.b, []int32{tok}, e.groupSize, e.bits))
 	}
 	s.rs.fill(offset)
-	return s.compute()
+	// One conversation's logits are read and sampled before its next step:
+	// the megabyte they take is the step's, not a new one a token.
+	if s.out == nil {
+		s.out = make([]float32, s.vocab)
+	}
+	return s.computeInto(s.out)
 }
 
 func (s *step) Close() {

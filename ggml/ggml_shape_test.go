@@ -473,6 +473,18 @@ func TestAn8BitWeightStays8Bits(t *testing.T) {
 				g.Floats(g.QuantMatmul(g.FromFloats(x, 1, m, in), gW, gS, gB, true, gs, bits)),
 				c.Floats(c.QuantMatmul(c.FromFloats(x, 1, m, in), cW, cS, cB, true, gs, bits)))
 		}
+		// A second weight on the same input reads the sums the first made.
+		gW2, cW2 := g.FromRaw(engine.U32, rndPackedU32(out*P, 9), out, P), c.FromRaw(engine.U32, rndPackedU32(out*P, 9), out, P)
+		x := rnd(3*in, 11)
+		gx := g.FromFloats(x, 1, 3, in)
+		y1 := g.QuantMatmul(gx, gW, gS, gB, true, gs, bits)
+		first := gx.(*tensor).sums
+		y2 := g.QuantMatmul(gx, gW2, gS, gB, true, gs, bits)
+		if tc.on && (first == nil || gx.(*tensor).sums != first) {
+			t.Errorf("%s: two weights on one input did not share its group sums", tc.name)
+		}
+		relOK(t, "the first of two weights on one input, "+tc.name, tc.tol, g.Floats(y1), c.Floats(c.QuantMatmul(c.FromFloats(x, 1, 3, in), cW, cS, cB, true, gs, bits)))
+		relOK(t, "the second of two weights on one input, "+tc.name, tc.tol, g.Floats(y2), c.Floats(c.QuantMatmul(c.FromFloats(x, 1, 3, in), cW2, cS, cB, true, gs, bits)))
 		q := gW.(*tensor).q4
 		if typ := int(q.t._type); typ != tc.typ {
 			t.Errorf("%s: the weight is type %d, want %d", tc.name, typ, tc.typ)

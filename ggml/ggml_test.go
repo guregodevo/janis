@@ -250,3 +250,38 @@ func TestValueCacheMatchesConcat(t *testing.T) {
 		g.Close()
 	}
 }
+
+// A prompt's embedding rows: each row is q*scale + bias a group, bit for
+// bit, with rows asked for many times and enough of them to be dequantized
+// on several cores, at 4 and at 8 bits.
+func TestAPromptsEmbeddingRowsAreExact(t *testing.T) {
+	g := New()
+	defer g.Close()
+	for _, bits := range []int{4, 8} {
+		const rowsN, in, gs = 40, 256, 64
+		P, G := in*bits/32, in/gs
+		raw := rndPackedU32(rowsN*P, 31)
+		sc, bi := rnd(rowsN*G, 32), rnd(rowsN*G, 33)
+		w := as(g.FromRaw(engine.U32, raw, rowsN, P))
+		s, b := as(g.FromFloats(sc, rowsN, G)), as(g.FromFloats(bi, rowsN, G))
+		ids := make([]int32, 300)
+		src := rand.New(rand.NewSource(34))
+		for i := range ids {
+			ids[i] = int32(src.Intn(rowsN))
+		}
+		got := dequantRows(w, s, b, ids, gs, bits)
+		if len(got) != len(ids)*in {
+			t.Fatalf("%d bits: %d values, want %d", bits, len(got), len(ids)*in)
+		}
+		for i, r := range ids {
+			for j := 0; j < in; j++ {
+				word := binary.LittleEndian.Uint32(raw[(int(r)*P+j*bits/32)*4:])
+				q := (word >> uint((j%(32/bits))*bits)) & (1<<bits - 1)
+				want := float32(q)*sc[int(r)*G+j/gs] + bi[int(r)*G+j/gs]
+				if got[i*in+j] != want {
+					t.Fatalf("%d bits: row %d (token %d) value %d is %g, want %g", bits, i, r, j, got[i*in+j], want)
+				}
+			}
+		}
+	}
+}

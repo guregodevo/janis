@@ -28,6 +28,7 @@ package ggml
 #cgo linux LDFLAGS: -lstdc++ -lm
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -54,20 +55,71 @@ static ggml_backend_buffer_type_t janis_repack_buft(ggml_backend_t be) {
 static void janis_dequant_q4k(const void * x, float * y, int64_t k) {
 	ggml_get_type_traits(GGML_TYPE_Q4_K)->to_float(x, y, k);
 }
+// janis_op_hist writes the graph's node count per op, most frequent first
+// ("MUL_MAT 520 ADD 410 ..."), for JANIS_GGML_TIMING.
+static void janis_op_hist(struct ggml_cgraph * g, char * out, size_t cap) {
+	int n[GGML_OP_COUNT] = {0};
+	for (int i = 0; i < ggml_graph_n_nodes(g); i++) n[ggml_graph_node(g, i)->op]++;
+	size_t at = 0; out[0] = 0;
+	for (;;) {
+		int best = -1;
+		for (int o = 0; o < GGML_OP_COUNT; o++) if (n[o] > 0 && (best < 0 || n[o] > n[best])) best = o;
+		if (best < 0 || at + 48 > cap) break;
+		at += snprintf(out + at, cap - at, "%s %d ", ggml_op_name((enum ggml_op) best), n[best]);
+		n[best] = 0;
+	}
+}
+// janis_keep marks t as a result that outlives its graph. A view has no
+// memory of its own: the allocator frees its source once the view's last
+// reader in the graph has run, unless the source is marked too.
+static void janis_keep(struct ggml_tensor * t) {
+	for (; t != NULL; t = t->view_src) ggml_set_output(t);
+}
+// janis_copy_hist writes, for the graph's copy nodes (CPY, CONT), how many
+// there are of each kind: the op, the op of what it copies, the two types
+// and the shape ("CONT<PERMUTE f32>f32 128x16x1x1 48; ..."), for
+// JANIS_GGML_TIMING.
+static void janis_copy_hist(struct ggml_cgraph * g, char * out, size_t cap) {
+	enum { K = 96 };
+	static char key[K][96]; int n[K]; int used = 0;
+	for (int i = 0; i < ggml_graph_n_nodes(g); i++) {
+		struct ggml_tensor * t = ggml_graph_node(g, i);
+		if (t->op != GGML_OP_CPY && t->op != GGML_OP_CONT) continue;
+		struct ggml_tensor * s = t->src[0];
+		char k[96];
+		snprintf(k, sizeof k, "%s<%s %s>%s %lldx%lldx%lldx%lld", ggml_op_name(t->op), ggml_op_name(s->op), ggml_type_name(s->type), ggml_type_name(t->type),
+			(long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+		int j = 0;
+		for (; j < used; j++) if (strcmp(key[j], k) == 0) break;
+		if (j == used) { if (used == K) continue; strcpy(key[used], k); n[used++] = 0; }
+		n[j]++;
+	}
+	size_t at = 0; out[0] = 0;
+	for (;;) {
+		int best = -1;
+		for (int j = 0; j < used; j++) if (n[j] > 0 && (best < 0 || n[j] > n[best])) best = j;
+		if (best < 0 || at + 120 > cap) break;
+		at += snprintf(out + at, cap - at, "%s %d; ", key[best], n[best]);
+		n[best] = 0;
+	}
+}
 static struct ggml_tensor * janis_new(struct ggml_context * c, enum ggml_type t, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
 	return ggml_new_tensor_4d(c, t, ne0, ne1, ne2, ne3);
 }
-// janis_affine8_mul is W x for an 8-bit affine weight kept as its codes: q
-// (Q8_0, ne in, out) holds scale * (code - 128) and off (F32, ne groups,
-// out) holds bias + 128 * scale, so W x = q x + off (the sums of x over
-// each group of gs inputs).
-static struct ggml_tensor * janis_affine8_mul(struct ggml_context * c, struct ggml_tensor * q, struct ggml_tensor * off, struct ggml_tensor * x, int64_t gs) {
-	struct ggml_tensor * y = ggml_mul_mat(c, q, x);
+// janis_group_sums is the sums of x (ne in, ...) over each group of gs
+// inputs: ne (in/gs, ...).
+static struct ggml_tensor * janis_group_sums(struct ggml_context * c, struct ggml_tensor * x, int64_t gs) {
 	if (!ggml_is_contiguous(x)) x = ggml_cont(c, x);
 	int64_t in = x->ne[0], rest = ggml_nelements(x) / in;
 	struct ggml_tensor * sums = ggml_sum_rows(c, ggml_reshape_3d(c, x, gs, in / gs, rest));
-	struct ggml_tensor * o = ggml_mul_mat(c, off, ggml_reshape_2d(c, sums, in / gs, rest));
-	return ggml_add(c, y, ggml_reshape(c, o, y));
+	return ggml_reshape_4d(c, sums, in / gs, x->ne[1], x->ne[2], x->ne[3]);
+}
+// janis_affine8_mul is W x for an 8-bit affine weight kept as its codes: q
+// (Q8_0, ne in, out) holds scale * (code - 128) and off (F32, ne groups,
+// out) holds bias + 128 * scale, so W x = q x + off sums, with sums the
+// group sums of x (janis_group_sums).
+static struct ggml_tensor * janis_affine8_mul(struct ggml_context * c, struct ggml_tensor * q, struct ggml_tensor * off, struct ggml_tensor * x, struct ggml_tensor * sums) {
+	return ggml_add(c, ggml_mul_mat(c, q, x), ggml_mul_mat(c, off, sums));
 }
 */
 import "C"
@@ -292,8 +344,14 @@ type tensor struct {
 	quant *quantCall // set on a QuantMatmul result: what a dump needs to replay it
 	q4    *tensor    // the Q4_1 repack of a packed weight, built once
 	off   *tensor    // on an 8-bit weight's Q8_0 codes: its per-group offsets (affine8)
-	pin   bool       // survives Sweep
-	freed bool
+	// sums is this tensor's sums over each group of sumsGS values along its
+	// last axis, made for the first 8-bit weight that multiplies it and
+	// read by the others (q, k and v share an input; so do gate and up).
+	sums   *tensor
+	sumsGS int
+	f32w   *tensor // a small bf16 weight's f32 copy (f32Weight)
+	pin    bool    // survives Sweep
+	freed  bool
 	// gathered: rows of this packed weight were taken (the embedding), so
 	// its words stay after the repack; a weight only ever multiplied keeps
 	// the Q4_1 copy alone.
@@ -458,7 +516,7 @@ func (t *tensor) Shape() []int { return append([]int(nil), t.shape...) }
 func (t *tensor) free() {
 	memMu.Lock()
 	defer memMu.Unlock()
-	if t.freed || t.grp == nil && t.ctx == nil && t.buf == nil && t.q4 == nil && t.off == nil {
+	if t.freed || t.grp == nil && t.ctx == nil && t.buf == nil && t.q4 == nil && t.off == nil && t.f32w == nil {
 		return
 	}
 	t.freed = true
@@ -493,6 +551,14 @@ func (t *tensor) free() {
 		t.off = nil
 		memMu.Unlock()
 		o.free()
+		memMu.Lock()
+	}
+	t.sums = nil
+	if t.f32w != nil {
+		w := t.f32w
+		t.f32w = nil
+		memMu.Unlock()
+		w.free()
 		memMu.Lock()
 	}
 	t.deps, t.via = nil, nil
@@ -641,22 +707,78 @@ func leafRow(src *tensor, r int) []float32 {
 }
 
 // dequantRows is rows of an affine-quantized leaf (words, scales, biases)
-// dequantized on the host, one row after the other.
+// dequantized on the host, one row after the other. A row asked for twice
+// is read from the device once, and the rows of a prompt are dequantized on
+// every core: read and dequantized one at a time, a 1,530-token prompt of
+// the 27B spent 0.3 s here.
 func dequantRows(w, sc, bi *tensor, rows []int32, groupSize, bits int) []float32 {
 	valsPerWord := 32 / bits
-	mask := uint32((1 << bits) - 1)
 	P := w.shape[len(w.shape)-1]
 	in := P * valsPerWord
-	out := make([]float32, 0, len(rows)*in)
-	for _, r := range rows {
-		words, s, bb := leafRow(w, int(r)), leafRow(sc, int(r)), leafRow(bi, int(r))
-		for j := 0; j < in; j++ {
-			q := (math.Float32bits(words[j/valsPerWord]) >> uint((j%valsPerWord)*bits)) & mask
-			g := j / groupSize
-			out = append(out, float32(q)*s[g]+bb[g])
+	out := make([]float32, len(rows)*in)
+	type src struct{ words, s, b []float32 }
+	first := make(map[int32]int, len(rows)) // a row's first place in rows
+	var uniq []int                          // the places read from the device
+	srcs := make([]src, len(rows))
+	for i, r := range rows {
+		if _, ok := first[r]; ok {
+			continue
+		}
+		first[r] = i
+		uniq = append(uniq, i)
+		srcs[i] = src{leafRow(w, int(r)), leafRow(sc, int(r)), leafRow(bi, int(r))}
+	}
+	one := func(i int) {
+		dequantRow(out[i*in:(i+1)*in], srcs[i].words, srcs[i].s, srcs[i].b, groupSize, bits)
+	}
+	if workers := min(runtime.NumCPU(), len(uniq)/8); workers > 1 {
+		var wg sync.WaitGroup
+		for k := 0; k < workers; k++ {
+			wg.Add(1)
+			go func(k int) {
+				defer wg.Done()
+				for u := k; u < len(uniq); u += workers {
+					one(uniq[u])
+				}
+			}(k)
+		}
+		wg.Wait()
+	} else {
+		for _, i := range uniq {
+			one(i)
+		}
+	}
+	for i, r := range rows {
+		if f := first[r]; f != i {
+			copy(out[i*in:(i+1)*in], out[f*in:(f+1)*in])
 		}
 	}
 	return out
+}
+
+// dequantRow is one row's values, q*scale + bias a group: out has a value
+// for each of the words' packed codes.
+func dequantRow(out, words, s, bb []float32, groupSize, bits int) {
+	valsPerWord := 32 / bits
+	mask := uint32((1 << bits) - 1)
+	if groupSize%valsPerWord != 0 {
+		for j := range out {
+			q := (math.Float32bits(words[j/valsPerWord]) >> uint((j%valsPerWord)*bits)) & mask
+			out[j] = float32(q)*s[j/groupSize] + bb[j/groupSize]
+		}
+		return
+	}
+	wordsPerGroup := groupSize / valsPerWord
+	for g := 0; g*groupSize < len(out); g++ {
+		sg, bg := s[g], bb[g]
+		o := out[g*groupSize:]
+		for wi, word := range words[g*wordsPerGroup : min((g+1)*wordsPerGroup, len(words))] {
+			u := math.Float32bits(word)
+			for k := 0; k < valsPerWord; k++ {
+				o[wi*valsPerWord+k] = float32((u>>uint(k*bits))&mask)*sg + bg
+			}
+		}
+	}
 }
 
 func (b *Backend) FromRaw(dt engine.DType, raw []byte, shape ...int) engine.Tensor {
@@ -673,6 +795,11 @@ func (b *Backend) FromRaw(dt engine.DType, raw []byte, shape ...int) engine.Tens
 // the closure referred to stays alive for the compute. The node must not be
 // a view (wrap views in cont).
 func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor) *tensor {
+	for _, in := range inputs {
+		if in != nil {
+			b.f32Weight(in)
+		}
+	}
 	b.mu.Lock()
 	if trace {
 		_, file, line, _ := runtime.Caller(1)
@@ -774,7 +901,7 @@ func (b *Backend) flushLocked() {
 			// writing a fused node's own buffer unless it is flagged an
 			// output; without the flag the 30B MoE read never-written
 			// memory as its activations.
-			C.ggml_set_output(p.node)
+			keep(p.node)
 		}
 	}
 	g := C.ggml_new_graph_custom(ctx, C.size_t(b.recCap), false)
@@ -863,6 +990,10 @@ func (b *Backend) flushLocked() {
 		t3 := time.Now()
 		fmt.Fprintf(os.Stderr, "ggml flush: %d results, %d held, %d nodes, %s build, %s alloc, %s compute\n",
 			len(pending), len(live), int(C.ggml_graph_n_nodes(g)), t1.Sub(t0).Round(10*time.Microsecond), t2.Sub(t1).Round(10*time.Microsecond), t3.Sub(t2).Round(10*time.Microsecond))
+		if n := int(C.ggml_graph_n_nodes(g)); n > 500 && !histSeen[n] {
+			histSeen[n] = true
+			fmt.Fprintf(os.Stderr, "ggml flush: %d nodes by op: %s\n", n, opHist(g))
+		}
 	}
 	grp := &batch{ctx: ctx, galloc: galloc, refs: len(live)}
 	// Results nobody holds any more are freed by their finalizers, and
@@ -1043,6 +1174,8 @@ func jsonInts(v []int) string {
 var (
 	trace  = os.Getenv("JANIS_GGML_TRACE") == "1"
 	timing = os.Getenv("JANIS_GGML_TIMING") == "1"
+	// histSeen is the graph sizes whose op counts timing already printed.
+	histSeen = map[int]bool{}
 	// check (JANIS_GGML_CHECK=1) reads every result back after each flush
 	// and stops at the first NaN or Inf, naming the op that made it.
 	check = os.Getenv("JANIS_GGML_CHECK") == "1"
@@ -1063,7 +1196,22 @@ func f32(ctx *C.struct_ggml_context, x *tensor) *C.struct_ggml_tensor {
 	if x.dt == engine.F32 {
 		return x.t
 	}
+	if x.f32w != nil {
+		return x.f32w.t
+	}
 	return C.ggml_cast(ctx, x.t, C.GGML_TYPE_F32)
+}
+
+// keep marks t, and what it is a view of, as outliving its graph.
+func keep(t *C.struct_ggml_tensor) { C.janis_keep(t) }
+
+// opHist is the graph's node count per op, most frequent first.
+func opHist(g *C.struct_ggml_cgraph) string {
+	var buf [4096]C.char
+	C.janis_op_hist(g, &buf[0], 4096)
+	ops := C.GoString(&buf[0])
+	C.janis_copy_hist(g, &buf[0], 4096)
+	return ops + "\n  copies: " + C.GoString(&buf[0])
 }
 
 // Eval computes everything recorded so far; the engine calls it once per
@@ -1381,8 +1529,10 @@ func (b *Backend) Reshape(x engine.Tensor, shape ...int) engine.Tensor {
 		}
 	}
 	return b.op(tx.dt, shape, []*tensor{tx}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		// A view: a reshape reads the same values in the same order, and a
+		// copy of every one was a fifth of a decode step's nodes.
 		m := ne(shape)
-		return C.ggml_cont(ctx, C.ggml_reshape_4d(ctx, tx.t, m[0], m[1], m[2], m[3]))
+		return C.ggml_reshape_4d(ctx, contig(ctx, tx.t), m[0], m[1], m[2], m[3])
 	})
 }
 
@@ -1410,9 +1560,34 @@ func (b *Backend) Transpose(x engine.Tensor, axes ...int) engine.Tensor {
 	for j, a := range axes {
 		dst[nd-1-a] = C.int(nd - 1 - j)
 	}
+	// Axes of one element may move without the values moving: a token's
+	// [1, heads, dim] and [heads, 1, dim] are the same memory. Then it is a
+	// reshape, a view; else the permuted copy.
+	if sameOrder(tx.shape, axes) {
+		return b.op(tx.dt, shape, []*tensor{tx}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+			m := ne(shape)
+			return C.ggml_reshape_4d(ctx, contig(ctx, tx.t), m[0], m[1], m[2], m[3])
+		})
+	}
 	return b.op(tx.dt, shape, []*tensor{tx}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		return C.ggml_cont(ctx, C.ggml_permute(ctx, tx.t, dst[0], dst[1], dst[2], dst[3]))
 	})
+}
+
+// sameOrder reports whether transposing shape by axes leaves the axes of
+// more than one element in their order: the values then stay where they are.
+func sameOrder(shape []int, axes []int) bool {
+	last := -1
+	for _, a := range axes {
+		if shape[a] == 1 {
+			continue
+		}
+		if a < last {
+			return false
+		}
+		last = a
+	}
+	return true
 }
 
 func (b *Backend) Concat(a, bb engine.Tensor, axis int) engine.Tensor {
@@ -1690,7 +1865,17 @@ func (b *Backend) Slice(x engine.Tensor, axis, start, end int) engine.Tensor {
 			t = C.ggml_cont(ctx, t)
 		}
 		offset := C.size_t(start) * C.size_t(t.nb[g])
-		return C.ggml_cont(ctx, C.ggml_view_4d(ctx, t, m[0], m[1], m[2], m[3], t.nb[1], t.nb[2], t.nb[3], offset))
+		v := C.ggml_view_4d(ctx, t, m[0], m[1], m[2], m[3], t.nb[1], t.nb[2], t.nb[3], offset)
+		// A slice of what this graph computes stays a view when its values
+		// lie together (q, k and v cut from one projection). A slice of a
+		// leaf is copied: a cache is written in place later in the step.
+		// The reshape gives the view a fresh tensor's strides: a view keeps
+		// its source's on the axes of one element, and a pinned state is
+		// copied tensor to tensor, which wants the same layout.
+		if t.op != C.GGML_OP_NONE && bool(C.ggml_is_contiguous(v)) {
+			return C.ggml_reshape_4d(ctx, v, m[0], m[1], m[2], m[3])
+		}
+		return C.ggml_cont(ctx, v)
 	})
 }
 
@@ -1786,6 +1971,26 @@ func (b *Backend) Mean(x engine.Tensor, axis int) engine.Tensor {
 		m := ne(shape)
 		return C.ggml_cont(ctx, C.ggml_reshape_4d(ctx, C.ggml_mean(ctx, f32(ctx, tx)), m[0], m[1], m[2], m[3]))
 	})
+}
+
+// f32Weight gives a small bf16 weight its f32 copy, converted once and kept
+// with it (f32 reads it): each was cast again in every step, a copy node
+// for each of the 27B's 305 (the norms' weights, the scan's). Only bf16:
+// a checkpoint's weights are, and no state or cache is, so what is copied
+// never changes.
+func (b *Backend) f32Weight(w *tensor) {
+	if w.dt != engine.BF16 || w.f32w != nil || w.buf == nil || w.t == nil || numel(w.shape) > 1<<16 {
+		return
+	}
+	n := numel(w.shape)
+	raw := make([]uint16, n)
+	C.ggml_backend_tensor_get(w.t, unsafe.Pointer(&raw[0]), 0, C.size_t(n*2))
+	vals := make([]float32, n)
+	for i, h := range raw {
+		vals[i] = math.Float32frombits(uint32(h) << 16)
+	}
+	w.f32w = b.newFrom(engine.F32, w.shape, unsafe.Pointer(&vals[0]), n*4)
+	w.f32w.pin = true
 }
 
 func (b *Backend) RMSNorm(x, weight engine.Tensor, eps float32) engine.Tensor {
@@ -2662,6 +2867,21 @@ func (b *Backend) deviceF16(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 	return q
 }
 
+// groupSums is x's sums over each group of gs values along its last axis,
+// computed once for every 8-bit weight that multiplies x.
+func (b *Backend) groupSums(x *tensor, gs int) *tensor {
+	if s := x.sums; s != nil && !s.freed && x.sumsGS == gs {
+		return s
+	}
+	shape := append([]int(nil), x.shape...)
+	shape[len(shape)-1] /= gs
+	s := b.op(engine.F32, shape, []*tensor{x}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		return C.janis_group_sums(ctx, f32(ctx, x), C.int64_t(gs))
+	})
+	x.sums, x.sumsGS = s, gs
+	return s
+}
+
 // QuantMatmul: x @ Wᵀ with W [out, in] affine 4-bit, on ggml's Q4_1 kernel.
 func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool, groupSize, bits int) engine.Tensor {
 	if !transpose {
@@ -2677,12 +2897,14 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 	nx := len(tx.shape)
 	shape := append(append([]int(nil), tx.shape[:nx-1]...), q.shape[0])
 	inputs := []*tensor{tx, q, as(w), as(scales), as(biases)}
+	var sums *tensor
 	if q.off != nil {
-		inputs = append(inputs, q.off)
+		sums = b.groupSums(tx, groupSize)
+		inputs = append(inputs, q.off, sums)
 	}
 	out := b.op(engine.F32, shape, inputs, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		if q.off != nil {
-			return C.janis_affine8_mul(ctx, q.t, q.off.t, f32(ctx, tx), C.int64_t(groupSize))
+			return C.janis_affine8_mul(ctx, q.t, q.off.t, f32(ctx, tx), sums.t)
 		}
 		return C.ggml_mul_mat(ctx, q.t, f32(ctx, tx)) // ne (out, M, …)
 	})
@@ -2728,9 +2950,9 @@ func (b *Backend) Conv1dDepthwise(x, w engine.Tensor) engine.Tensor {
 	K := tw.shape[1]
 	shape := []int{B, L - K + 1, Cn}
 	return b.op(engine.F32, shape, []*tensor{tx, tw}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-		xs := C.ggml_reshape_3d(ctx, C.ggml_cont(ctx, f32(ctx, tx)), C.int64_t(Cn), C.int64_t(L), C.int64_t(B))
+		xs := C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, tx)), C.int64_t(Cn), C.int64_t(L), C.int64_t(B))
 		sx := C.ggml_cont(ctx, C.ggml_transpose(ctx, xs))
-		c := C.ggml_reshape_2d(ctx, C.ggml_cont(ctx, f32(ctx, tw)), C.int64_t(K), C.int64_t(Cn))
+		c := C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tw)), C.int64_t(K), C.int64_t(Cn))
 		return C.ggml_ssm_conv(ctx, sx, c)
 	})
 }
