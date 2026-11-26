@@ -1,0 +1,94 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": "bash", "description": "Run a shell command.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command"}, "timeout": {"type": "integer"}}, "required": ["command"]}}}
+{"type": "function", "function": {"name": "read_file", "description": "Read a file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+You are a coding agent. Work in the project directory.<|im_end|>
+<|im_start|>user
+Fix the failing test in pkg/a.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+I'll look at the test first.
+
+<tool_call>
+<function=bash>
+<parameter=command>
+go test ./pkg/a 2>&1 | tail -5
+</parameter>
+<parameter=timeout>
+60
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+--- FAIL: TestA (0.00s)
+    a_test.go:12: got 3, want 4
+FAIL
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=read_file>
+<parameter=path>
+pkg/a/a.go
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=read_file>
+<parameter=path>
+pkg/a/a_test.go
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+package a
+
+func Add(x, y int) int { return x + y - 1 }
+</tool_response>
+<tool_response>
+package a
+</tool_response><|im_end|>
+<|im_start|>user
+Go on.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

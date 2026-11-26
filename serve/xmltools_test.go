@@ -59,7 +59,7 @@ func TestAnXMLToolModelCallsToolsInItsOwnForm(t *testing.T) {
 	eng.reply = "Done."
 	followUp := `{"model":"Qwen3.5-0.8B-MLX-4bit","tools":` + xmlTools + `,"messages":[{"role":"user","content":"create hello.py"},{"role":"assistant","content":"I will write it.","tool_calls":[{"id":"call_1","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"hello.py\",\"content\":\"print(1)\",\"mode\":420}"}}]},{"role":"tool","tool_call_id":"call_1","content":"wrote hello.py"}]}`
 	post(t, srv.URL+"/v1/chat/completions", followUp)
-	want := "I will write it.\n<tool_call>\n<function=write_file>\n<parameter=path>\nhello.py\n</parameter>\n<parameter=content>\nprint(1)\n</parameter>\n<parameter=mode>\n420\n</parameter>\n</function>\n</tool_call>"
+	want := "I will write it.\n\n<tool_call>\n<function=write_file>\n<parameter=path>\nhello.py\n</parameter>\n<parameter=content>\nprint(1)\n</parameter>\n<parameter=mode>\n420\n</parameter>\n</function>\n</tool_call>"
 	if len(eng.got) != 4 || eng.got[2].Content != want || eng.got[3].Content != "<tool_response>\nwrote hello.py\n</tool_response>" {
 		t.Fatalf("the transcript replayed in the XML form:\n%q\nwant\n%q", eng.got[2].Content, want)
 	}
