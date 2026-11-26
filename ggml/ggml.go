@@ -321,7 +321,8 @@ type tensor struct {
 	// read by the others (q, k and v share an input; so do gate and up).
 	sums   *tensor
 	sumsGS int
-	pin    bool // survives Sweep
+	f32w   *tensor // a small f16 weight's f32 copy (f32Weight)
+	pin    bool    // survives Sweep
 	freed  bool
 	// gathered: rows of this packed weight were taken (the embedding), so
 	// its words stay after the repack; a weight only ever multiplied keeps
@@ -487,7 +488,7 @@ func (t *tensor) Shape() []int { return append([]int(nil), t.shape...) }
 func (t *tensor) free() {
 	memMu.Lock()
 	defer memMu.Unlock()
-	if t.freed || t.grp == nil && t.ctx == nil && t.buf == nil && t.q4 == nil && t.off == nil {
+	if t.freed || t.grp == nil && t.ctx == nil && t.buf == nil && t.q4 == nil && t.off == nil && t.f32w == nil {
 		return
 	}
 	t.freed = true
@@ -525,6 +526,13 @@ func (t *tensor) free() {
 		memMu.Lock()
 	}
 	t.sums = nil
+	if t.f32w != nil {
+		w := t.f32w
+		t.f32w = nil
+		memMu.Unlock()
+		w.free()
+		memMu.Lock()
+	}
 	t.deps, t.via = nil, nil
 }
 
@@ -1861,8 +1869,29 @@ func (b *Backend) Mean(x engine.Tensor, axis int) engine.Tensor {
 	})
 }
 
+// f32Weight is a small f16 weight as f32, converted once and kept with it:
+// a norm's weight was cast again in every step, one copy node for each of
+// the 27B's 305 norms. Any other tensor is returned as it is.
+func (b *Backend) f32Weight(w *tensor) *tensor {
+	if w.dt != engine.F16 || w.buf == nil || w.t == nil || numel(w.shape) > 1<<16 {
+		return w
+	}
+	if w.f32w == nil {
+		n := numel(w.shape)
+		raw := make([]uint16, n)
+		C.ggml_backend_tensor_get(w.t, unsafe.Pointer(&raw[0]), 0, C.size_t(n*2))
+		vals := make([]float32, n)
+		for i, h := range raw {
+			vals[i] = f16tof32(h)
+		}
+		w.f32w = b.newFrom(engine.F32, w.shape, unsafe.Pointer(&vals[0]), n*4)
+		w.f32w.pin = true
+	}
+	return w.f32w
+}
+
 func (b *Backend) RMSNorm(x, weight engine.Tensor, eps float32) engine.Tensor {
-	tx, tw := as(x), as(weight)
+	tx, tw := as(x), b.f32Weight(as(weight))
 	return b.op(engine.F32, tx.shape, []*tensor{tx, tw}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		return C.ggml_mul(ctx, C.ggml_rms_norm(ctx, f32(ctx, tx), C.float(eps)), f32(ctx, tw))
 	})
