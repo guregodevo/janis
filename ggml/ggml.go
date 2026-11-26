@@ -349,7 +349,7 @@ type tensor struct {
 	// read by the others (q, k and v share an input; so do gate and up).
 	sums   *tensor
 	sumsGS int
-	f32w   *tensor // a small f16 weight's f32 copy (f32Weight)
+	f32w   *tensor // a small bf16 weight's f32 copy (f32Weight)
 	pin    bool    // survives Sweep
 	freed  bool
 	// gathered: rows of this packed weight were taken (the embedding), so
@@ -739,6 +739,11 @@ func (b *Backend) FromRaw(dt engine.DType, raw []byte, shape ...int) engine.Tens
 // the closure referred to stays alive for the compute. The node must not be
 // a view (wrap views in cont).
 func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor) *tensor {
+	for _, in := range inputs {
+		if in != nil {
+			b.f32Weight(in)
+		}
+	}
 	b.mu.Lock()
 	if trace {
 		_, file, line, _ := runtime.Caller(1)
@@ -1134,6 +1139,9 @@ func contig(ctx *C.struct_ggml_context, x *C.struct_ggml_tensor) *C.struct_ggml_
 func f32(ctx *C.struct_ggml_context, x *tensor) *C.struct_ggml_tensor {
 	if x.dt == engine.F32 {
 		return x.t
+	}
+	if x.f32w != nil {
+		return x.f32w.t
 	}
 	return C.ggml_cast(ctx, x.t, C.GGML_TYPE_F32)
 }
@@ -1801,7 +1809,14 @@ func (b *Backend) Slice(x engine.Tensor, axis, start, end int) engine.Tensor {
 			t = C.ggml_cont(ctx, t)
 		}
 		offset := C.size_t(start) * C.size_t(t.nb[g])
-		return C.ggml_cont(ctx, C.ggml_view_4d(ctx, t, m[0], m[1], m[2], m[3], t.nb[1], t.nb[2], t.nb[3], offset))
+		v := C.ggml_view_4d(ctx, t, m[0], m[1], m[2], m[3], t.nb[1], t.nb[2], t.nb[3], offset)
+		// A slice of what this graph computes stays a view when its values
+		// lie together (q, k and v cut from one projection). A slice of a
+		// leaf is copied: a cache is written in place later in the step.
+		if t.op != C.GGML_OP_NONE && bool(C.ggml_is_contiguous(v)) {
+			return v
+		}
+		return C.ggml_cont(ctx, v)
 	})
 }
 
@@ -1899,29 +1914,28 @@ func (b *Backend) Mean(x engine.Tensor, axis int) engine.Tensor {
 	})
 }
 
-// f32Weight is a small f16 weight as f32, converted once and kept with it:
-// a norm's weight was cast again in every step, one copy node for each of
-// the 27B's 305 norms. Any other tensor is returned as it is.
-func (b *Backend) f32Weight(w *tensor) *tensor {
-	if w.dt != engine.F16 || w.buf == nil || w.t == nil || numel(w.shape) > 1<<16 {
-		return w
+// f32Weight gives a small bf16 weight its f32 copy, converted once and kept
+// with it (f32 reads it): each was cast again in every step, a copy node
+// for each of the 27B's 305 (the norms' weights, the scan's). Only bf16:
+// a checkpoint's weights are, and no state or cache is, so what is copied
+// never changes.
+func (b *Backend) f32Weight(w *tensor) {
+	if w.dt != engine.BF16 || w.f32w != nil || w.buf == nil || w.t == nil || numel(w.shape) > 1<<16 {
+		return
 	}
-	if w.f32w == nil {
-		n := numel(w.shape)
-		raw := make([]uint16, n)
-		C.ggml_backend_tensor_get(w.t, unsafe.Pointer(&raw[0]), 0, C.size_t(n*2))
-		vals := make([]float32, n)
-		for i, h := range raw {
-			vals[i] = f16tof32(h)
-		}
-		w.f32w = b.newFrom(engine.F32, w.shape, unsafe.Pointer(&vals[0]), n*4)
-		w.f32w.pin = true
+	n := numel(w.shape)
+	raw := make([]uint16, n)
+	C.ggml_backend_tensor_get(w.t, unsafe.Pointer(&raw[0]), 0, C.size_t(n*2))
+	vals := make([]float32, n)
+	for i, h := range raw {
+		vals[i] = math.Float32frombits(uint32(h) << 16)
 	}
-	return w.f32w
+	w.f32w = b.newFrom(engine.F32, w.shape, unsafe.Pointer(&vals[0]), n*4)
+	w.f32w.pin = true
 }
 
 func (b *Backend) RMSNorm(x, weight engine.Tensor, eps float32) engine.Tensor {
-	tx, tw := as(x), b.f32Weight(as(weight))
+	tx, tw := as(x), as(weight)
 	return b.op(engine.F32, tx.shape, []*tensor{tx, tw}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		return C.ggml_mul(ctx, C.ggml_rms_norm(ctx, f32(ctx, tx), C.float(eps)), f32(ctx, tw))
 	})
