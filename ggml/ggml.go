@@ -1541,11 +1541,24 @@ func (b *Backend) Reshape(x engine.Tensor, shape ...int) engine.Tensor {
 		}
 	}
 	return b.op(tx.dt, shape, []*tensor{tx}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-		// A view: a reshape reads the same values in the same order, and a
-		// copy of every one was a fifth of a decode step's nodes.
-		m := ne(shape)
-		return C.ggml_reshape_4d(ctx, contig(ctx, tx.t), m[0], m[1], m[2], m[3])
+		return reshaped(ctx, tx.t, shape)
 	})
+}
+
+// reshaped is t read in shape. Of what this graph computes it is a view: the
+// same values in the same order, and a copy of every one was a fifth of a
+// decode step's nodes. Of anything else it is a copy, as a slice is: a
+// result holds what it reads only until it is computed, so a view of an
+// earlier flush's result would read that result's memory after it was given
+// back (Qwen3 on a prompt of 1,500 tokens, 2026-11-26: a CUDA illegal memory
+// access, and other text on the CPU).
+func reshaped(ctx *C.struct_ggml_context, t *C.struct_ggml_tensor, shape []int) *C.struct_ggml_tensor {
+	m := ne(shape)
+	v := C.ggml_reshape_4d(ctx, contig(ctx, t), m[0], m[1], m[2], m[3])
+	if t.op != C.GGML_OP_NONE {
+		return v
+	}
+	return C.ggml_cont(ctx, v)
 }
 
 func (b *Backend) ExpandDims(x engine.Tensor, axis int) engine.Tensor {
@@ -1577,8 +1590,7 @@ func (b *Backend) Transpose(x engine.Tensor, axes ...int) engine.Tensor {
 	// reshape, a view; else the permuted copy.
 	if sameOrder(tx.shape, axes) {
 		return b.op(tx.dt, shape, []*tensor{tx}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-			m := ne(shape)
-			return C.ggml_reshape_4d(ctx, contig(ctx, tx.t), m[0], m[1], m[2], m[3])
+			return reshaped(ctx, tx.t, shape)
 		})
 	}
 	return b.op(tx.dt, shape, []*tensor{tx}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
