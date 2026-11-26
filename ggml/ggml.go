@@ -57,17 +57,20 @@ static void janis_dequant_q4k(const void * x, float * y, int64_t k) {
 static struct ggml_tensor * janis_new(struct ggml_context * c, enum ggml_type t, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
 	return ggml_new_tensor_4d(c, t, ne0, ne1, ne2, ne3);
 }
-// janis_affine8_mul is W x for an 8-bit affine weight kept as its codes: q
-// (Q8_0, ne in, out) holds scale * (code - 128) and off (F32, ne groups,
-// out) holds bias + 128 * scale, so W x = q x + off (the sums of x over
-// each group of gs inputs).
-static struct ggml_tensor * janis_affine8_mul(struct ggml_context * c, struct ggml_tensor * q, struct ggml_tensor * off, struct ggml_tensor * x, int64_t gs) {
-	struct ggml_tensor * y = ggml_mul_mat(c, q, x);
+// janis_group_sums is the sums of x (ne in, ...) over each group of gs
+// inputs: ne (in/gs, ...).
+static struct ggml_tensor * janis_group_sums(struct ggml_context * c, struct ggml_tensor * x, int64_t gs) {
 	if (!ggml_is_contiguous(x)) x = ggml_cont(c, x);
 	int64_t in = x->ne[0], rest = ggml_nelements(x) / in;
 	struct ggml_tensor * sums = ggml_sum_rows(c, ggml_reshape_3d(c, x, gs, in / gs, rest));
-	struct ggml_tensor * o = ggml_mul_mat(c, off, ggml_reshape_2d(c, sums, in / gs, rest));
-	return ggml_add(c, y, ggml_reshape(c, o, y));
+	return ggml_reshape_4d(c, sums, in / gs, x->ne[1], x->ne[2], x->ne[3]);
+}
+// janis_affine8_mul is W x for an 8-bit affine weight kept as its codes: q
+// (Q8_0, ne in, out) holds scale * (code - 128) and off (F32, ne groups,
+// out) holds bias + 128 * scale, so W x = q x + off sums, with sums the
+// group sums of x (janis_group_sums).
+static struct ggml_tensor * janis_affine8_mul(struct ggml_context * c, struct ggml_tensor * q, struct ggml_tensor * off, struct ggml_tensor * x, struct ggml_tensor * sums) {
+	return ggml_add(c, ggml_mul_mat(c, q, x), ggml_mul_mat(c, off, sums));
 }
 */
 import "C"
@@ -292,8 +295,13 @@ type tensor struct {
 	quant *quantCall // set on a QuantMatmul result: what a dump needs to replay it
 	q4    *tensor    // the Q4_1 repack of a packed weight, built once
 	off   *tensor    // on an 8-bit weight's Q8_0 codes: its per-group offsets (affine8)
-	pin   bool       // survives Sweep
-	freed bool
+	// sums is this tensor's sums over each group of sumsGS values along its
+	// last axis, made for the first 8-bit weight that multiplies it and
+	// read by the others (q, k and v share an input; so do gate and up).
+	sums   *tensor
+	sumsGS int
+	pin    bool // survives Sweep
+	freed  bool
 	// gathered: rows of this packed weight were taken (the embedding), so
 	// its words stay after the repack; a weight only ever multiplied keeps
 	// the Q4_1 copy alone.
@@ -495,6 +503,7 @@ func (t *tensor) free() {
 		o.free()
 		memMu.Lock()
 	}
+	t.sums = nil
 	t.deps, t.via = nil, nil
 }
 
@@ -2662,6 +2671,21 @@ func (b *Backend) deviceF16(tw, ts, tb *tensor, groupSize, bits int) *tensor {
 	return q
 }
 
+// groupSums is x's sums over each group of gs values along its last axis,
+// computed once for every 8-bit weight that multiplies x.
+func (b *Backend) groupSums(x *tensor, gs int) *tensor {
+	if s := x.sums; s != nil && !s.freed && x.sumsGS == gs {
+		return s
+	}
+	shape := append([]int(nil), x.shape...)
+	shape[len(shape)-1] /= gs
+	s := b.op(engine.F32, shape, []*tensor{x}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		return C.janis_group_sums(ctx, f32(ctx, x), C.int64_t(gs))
+	})
+	x.sums, x.sumsGS = s, gs
+	return s
+}
+
 // QuantMatmul: x @ Wᵀ with W [out, in] affine 4-bit, on ggml's Q4_1 kernel.
 func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool, groupSize, bits int) engine.Tensor {
 	if !transpose {
@@ -2677,12 +2701,14 @@ func (b *Backend) QuantMatmul(x, w, scales, biases engine.Tensor, transpose bool
 	nx := len(tx.shape)
 	shape := append(append([]int(nil), tx.shape[:nx-1]...), q.shape[0])
 	inputs := []*tensor{tx, q, as(w), as(scales), as(biases)}
+	var sums *tensor
 	if q.off != nil {
-		inputs = append(inputs, q.off)
+		sums = b.groupSums(tx, groupSize)
+		inputs = append(inputs, q.off, sums)
 	}
 	out := b.op(engine.F32, shape, inputs, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		if q.off != nil {
-			return C.janis_affine8_mul(ctx, q.t, q.off.t, f32(ctx, tx), C.int64_t(groupSize))
+			return C.janis_affine8_mul(ctx, q.t, q.off.t, f32(ctx, tx), sums.t)
 		}
 		return C.ggml_mul_mat(ctx, q.t, f32(ctx, tx)) // ne (out, M, …)
 	})
