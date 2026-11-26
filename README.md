@@ -23,6 +23,9 @@ commands in [bench/mlx.md](bench/mlx.md) and [docs/backends.md](docs/backends.md
 | Qwen3.5-9B, M4 Mac 16 GB: decode | 19.9 tok/s | 18.5 tok/s | not measured |
 | Qwen3-8B, GitHub runner, 4 vCPU: prefill / decode | 12 / 5.6 tok/s | not measured | 12.6 / 4.45 tok/s |
 | Qwen3-8B, NVIDIA L4: decode | 38 tok/s steady | 45 to 50 tok/s | not measured |
+| Qwen3.8-27B, NVIDIA A100: decode | 53.4 tok/s | 51.2 tok/s | not measured |
+| Qwen3.8-27B, NVIDIA A100: prefill 1,500 tokens | 1,106 tok/s | 1,170 tok/s | not measured |
+| Qwen3-8B, NVIDIA A100: decode | 131.7 tok/s | 138.5 tok/s | not measured |
 
 On the Mac, janis runs `mlx-community`'s 4-bit weights (4.3 GB for the 8B)
 and llama.cpp and Ollama the Q4_K_M GGUF (5.2 GB). Decode reads every weight

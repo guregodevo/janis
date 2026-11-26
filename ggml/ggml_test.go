@@ -4,6 +4,7 @@ package ggml
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -146,6 +147,35 @@ func TestGGMLMatchesCPU(t *testing.T) {
 		c.FromFloats(dg, 1, 5, 4), c.FromFloats(db, 1, 5, 4), c.FromFloats(ds, 1, 4, 16, 16))
 	diffOK(t, "GatedDeltaScan(y)", tol, g.Floats(dy), c.Floats(cy))
 	diffOK(t, "GatedDeltaScan(state)", tol, g.Floats(dst), c.Floats(cs))
+
+	// The scan read from the conv's output (q, k and v packed per token) is
+	// the separate ops' result: one conversation's decode step, a prompt of
+	// five tokens, and two conversations of three tokens.
+	for _, bt := range [][2]int{{1, 1}, {1, 5}, {2, 3}} {
+		B, T := bt[0], bt[1]
+		const Hk, Hv, D = 2, 4, 16
+		cv := rnd(B*T*(2*Hk*D+Hv*D), 30)
+		lg, bb, st := rnd(B*T*Hv, 31), rnd(B*T*Hv, 32), rnd(B*Hv*D*D, 33)
+		for i := range lg {
+			lg[i] = -float32(math.Abs(float64(lg[i])))
+			bb[i] = 0.5 + 0.5*float32(math.Abs(float64(bb[i])))
+		}
+		conv := g.FromFloats(cv, B, T, 2*Hk*D+Hv*D)
+		logG, beta, state := g.FromFloats(lg, B, T, Hv), g.FromFloats(bb, B, T, Hv), g.FromFloats(st, B, Hv, D, D)
+		fy, fs := g.GatedDeltaConvScan(conv, logG, beta, state, Hk, Hv, D)
+		ones := make([]float32, D)
+		for i := range ones {
+			ones[i] = 1
+		}
+		w := g.FromFloats(ones, D)
+		inv := float32(1 / math.Sqrt(D))
+		q := g.ScalarMul(g.RMSNorm(g.Reshape(g.Slice(conv, 2, 0, Hk*D), B, T, Hk, D), w, 1e-6), inv*inv)
+		k := g.ScalarMul(g.RMSNorm(g.Reshape(g.Slice(conv, 2, Hk*D, 2*Hk*D), B, T, Hk, D), w, 1e-6), inv)
+		v := g.Reshape(g.Slice(conv, 2, 2*Hk*D, 2*Hk*D+Hv*D), B, T, Hv, D)
+		sy, ss := g.GatedDeltaScan(q, k, v, g.Exp(logG), beta, state)
+		diffOK(t, fmt.Sprintf("GatedDeltaConvScan(y, B=%d T=%d)", B, T), 1e-5, g.Floats(fy), g.Floats(sy))
+		diffOK(t, fmt.Sprintf("GatedDeltaConvScan(state, B=%d T=%d)", B, T), 1e-5, g.Floats(fs), g.Floats(ss))
+	}
 
 	q, k, v := rnd(1*4*5*8, 13), rnd(1*2*5*8, 14), rnd(1*2*5*8, 15)
 	scale := float32(1.0 / math.Sqrt(8))

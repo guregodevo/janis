@@ -3024,6 +3024,47 @@ func (b *Backend) GatedDeltaScan(q, k, v, g, beta, state engine.Tensor) (engine.
 	return y, st
 }
 
+// GatedDeltaConvScan is GatedDeltaScan read from the conv's output
+// (engine.DeltaConvScanner). q and k are normalized, scaled and repeated to Hv
+// heads as one tensor: both end up times D^-1/2 (q's D^-1 from the reference
+// times the D^1/2 that undoes ggml's output scale), and the gate arrives as
+// its log, which is what ggml takes. Eight nodes fewer a layer than the
+// separate ops; on a decode step q, k and v are views of the conv's output.
+func (b *Backend) GatedDeltaConvScan(conv, logG, beta, state engine.Tensor, Hk, Hv, D int) (engine.Tensor, engine.Tensor) {
+	tc, tg, tb, ts := as(conv), as(logG), as(beta), as(state)
+	B, T, Cn := tc.shape[0], tc.shape[1], tc.shape[2]
+	keys := 2 * Hk * D
+	if Cn != keys+Hv*D || Hv%Hk != 0 {
+		panic(fmt.Sprintf("ggml: GatedDeltaConvScan: %d channels for %d key heads and %d value heads of %d", Cn, Hk, Hv, D))
+	}
+	rep := Hv / Hk
+	n := C.int64_t(T * B)
+	rows := T*B + D*B
+	res := b.op(engine.F32, []int{rows, Hv * D}, []*tensor{tc, tg, tb, ts}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		x := C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tc)), C.int64_t(Cn), n)
+		qk := contig(ctx, C.ggml_view_2d(ctx, x, C.int64_t(keys), n, x.nb[1], 0))
+		qk = C.ggml_reshape_4d(ctx, qk, C.int64_t(D), 1, C.int64_t(2*Hk), n)
+		qk = C.ggml_scale(ctx, C.ggml_rms_norm(ctx, qk, 1e-6), C.float(1/math.Sqrt(float64(D))))
+		if rep > 1 {
+			qk = C.ggml_repeat_4d(ctx, qk, C.int64_t(D), C.int64_t(rep), C.int64_t(2*Hk), n)
+		}
+		qk = C.ggml_reshape_3d(ctx, qk, C.int64_t(D), C.int64_t(2*Hv), n)
+		half := func(off int) *C.struct_ggml_tensor {
+			h := contig(ctx, C.ggml_view_3d(ctx, qk, C.int64_t(D), C.int64_t(Hv), n, qk.nb[1], qk.nb[2], C.size_t(off)*C.size_t(qk.nb[1])))
+			return C.ggml_reshape_4d(ctx, h, C.int64_t(D), C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
+		}
+		v := contig(ctx, C.ggml_view_2d(ctx, x, C.int64_t(Hv*D), n, x.nb[1], C.size_t(keys)*C.size_t(x.nb[0])))
+		vh := C.ggml_reshape_4d(ctx, v, C.int64_t(D), C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
+		gh := C.ggml_reshape_4d(ctx, contig(ctx, f32(ctx, tg)), 1, C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
+		bh := C.ggml_reshape_4d(ctx, contig(ctx, f32(ctx, tb)), 1, C.int64_t(Hv), C.int64_t(T), C.int64_t(B))
+		sh := C.ggml_reshape_4d(ctx, contig(ctx, f32(ctx, ts)), C.int64_t(D), C.int64_t(D), C.int64_t(Hv), C.int64_t(B))
+		return C.ggml_gated_delta_net(ctx, half(0), half(Hv), vh, gh, bh, sh)
+	})
+	y := b.Reshape(b.Slice(res, 0, 0, T*B), B, T, Hv, D)
+	st := b.Reshape(b.Slice(res, 0, T*B, rows), B, Hv, D, D)
+	return y, st
+}
+
 func f16tof32(h uint16) float32 {
 	sign := uint32(h>>15) << 31
 	exp := int((h >> 10) & 0x1F)

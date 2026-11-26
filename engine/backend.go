@@ -188,6 +188,15 @@ type PoolRowWriter interface {
 	SetRow(j int, k, v Tensor)
 }
 
+// DeltaConvScanner is a backend that runs the Gated DeltaNet recurrence from
+// the conv's output: conv [B, T, 2*Hk*D + Hv*D] packs q, k and v per token,
+// logG [B, T, Hv] is the log of the decay gate. It does the weightless q/k
+// RMSNorm (eps 1e-6), the reference's scale split and GatedDeltaScan in
+// fewer nodes than the separate ops; the results are GatedDeltaScan's.
+type DeltaConvScanner interface {
+	GatedDeltaConvScan(conv, logG, beta, state Tensor, Hk, Hv, D int) (y, newState Tensor)
+}
+
 // PrefillChunker is a backend with a prefill window of its own: how many
 // tokens of a prompt of tokens it reads in one forward when nothing else
 // says (0: no preference).
