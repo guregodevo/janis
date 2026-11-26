@@ -52,6 +52,14 @@ static ggml_backend_buffer_type_t janis_repack_buft(ggml_backend_t be) {
 	}
 	return NULL;
 }
+// janis_dev_free is the free memory of be's device, 0 when it has none to name.
+static int64_t janis_dev_free(ggml_backend_t be) {
+	ggml_backend_dev_t dev = ggml_backend_get_device(be);
+	if (dev == NULL) return 0;
+	size_t free = 0, total = 0;
+	ggml_backend_dev_memory(dev, &free, &total);
+	return (int64_t) free;
+}
 static void janis_dequant_q4k(const void * x, float * y, int64_t k) {
 	ggml_get_type_traits(GGML_TYPE_Q4_K)->to_float(x, y, k);
 }
@@ -1180,6 +1188,10 @@ var (
 	// and stops at the first NaN or Inf, naming the op that made it.
 	check = os.Getenv("JANIS_GGML_CHECK") == "1"
 )
+
+// devFree is the free memory of the backend's device in bytes, 0 when it
+// names none.
+func (b *Backend) devFree() int64 { return int64(C.janis_dev_free(b.be)) }
 
 // f32 is x as an F32 node in ctx (a cast when it is not).
 // contig is x, copied only when it is not contiguous: a cont node copies

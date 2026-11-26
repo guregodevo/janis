@@ -124,14 +124,31 @@ func (b *Backend) replayOn() bool {
 	return strings.HasPrefix(b.name, "CUDA")
 }
 
-// PrefillChunk is 1,024 tokens on CUDA (engine.PrefillChunker): a 12k-token
-// prompt of the 27B is read at 1,088 tokens/s for 0.4 GB more than at 256
-// (890 tokens/s); 2,048 gives 1,115 for 0.9 GB (A100, 2026-11-26).
-func (b *Backend) PrefillChunk() int {
-	if strings.HasPrefix(b.name, "CUDA") {
-		return 1024
+// PrefillChunk is how many tokens of a prompt of tokens are read in one
+// forward on CUDA (engine.PrefillChunker), from the device's free memory:
+// prefillChunkFor.
+func (b *Backend) PrefillChunk(tokens int) int {
+	if !strings.HasPrefix(b.name, "CUDA") {
+		return 0
 	}
-	return 0
+	return prefillChunkFor(b.devFree(), tokens)
+}
+
+// prefillChunkFor is the largest of 256, 512, 1,024 and 2,048 tokens whose
+// forward fits in half of the free memory, counted as 1 MiB a chunk token
+// (its activations) and 256 bytes a chunk token for each token of the
+// context (the attention scores of 64 heads). The other half is left to the
+// caches the prompt fills. The count is generous: the 27B on a 12k-token
+// prompt held 0.4 GB more at 1,024 than at 256 and 0.9 GB more at 2,048
+// (A100, 2026-11-26), where this counts 4 and 8 GB; it read 890, 1,088 and
+// 1,115 tokens a second.
+func prefillChunkFor(free int64, tokens int) int {
+	perToken := int64(1<<20) + 256*int64(tokens)
+	c := 256
+	for c < 2048 && int64(2*c)*perToken <= free/2 {
+		c *= 2
+	}
+	return c
 }
 
 func replayOnCPUNow() bool { return replayOnCPU || os.Getenv("JANIS_GGML_REPLAY") == "cpu" }
