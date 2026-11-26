@@ -301,20 +301,10 @@ func (d *GatedDeltaNet) scan(b engine.Backend, qkv, aProj, bProj engine.Tensor, 
 	newTails := b.Slice(convIn, 1, total-(d.ConvK-1), total)
 	convOut := b.SiLU(d.Conv(b, convIn)) // [B, S, convDim]
 
-	q := b.Reshape(b.Slice(convOut, 2, 0, keyDim), B, S, d.KHeads, d.KDim)
-	k := b.Reshape(b.Slice(convOut, 2, keyDim, 2*keyDim), B, S, d.KHeads, d.KDim)
-	v := b.Reshape(b.Slice(convOut, 2, 2*keyDim, convDim), B, S, d.VHeads, d.VDim)
-
-	// Weightless per-head RMSNorm, then the reference's scale split: q carries
-	// inv_scale^2, k carries inv_scale (inv_scale = Dk^-1/2).
-	invScale := float32(1.0) / sqrtf(float32(d.KDim))
-	q = b.ScalarMul(b.RMSNorm(q, d.QKOnes, 1e-6), invScale*invScale)
-	k = b.ScalarMul(b.RMSNorm(k, d.QKOnes, 1e-6), invScale)
-
 	// Gates, computed in f32 like the reference: beta = sigmoid(b),
 	// g = exp(-exp(A_log) * softplus(a + dt_bias)).
-	beta := b.Sigmoid(b.Cast(bProj, engine.F32))                                      // [B, S, Hv]
-	g := b.Exp(b.Mul(b.Softplus(b.Cast(b.Add(aProj, d.DtBias), engine.F32)), d.NegA)) // [B, S, Hv]
+	beta := b.Sigmoid(b.Cast(bProj, engine.F32))                                  // [B, S, Hv]
+	logG := b.Mul(b.Softplus(b.Cast(b.Add(aProj, d.DtBias), engine.F32)), d.NegA) // [B, S, Hv]
 
 	var state, oldState engine.Tensor
 	if lent != nil {
@@ -333,9 +323,24 @@ func (d *GatedDeltaNet) scan(b engine.Backend, qkv, aProj, bProj engine.Tensor, 
 	// The whole recurrence is one fused op (a metal kernel on MLX, a plain
 	// loop on CPU); k-head → v-head mapping happens inside it.
 	oldState = state
-	ys, state := b.GatedDeltaScan(
-		b.Cast(q, engine.F32), b.Cast(k, engine.F32), b.Cast(v, engine.F32),
-		g, beta, state) // ys [B, S, Hv, Dv]
+	var ys engine.Tensor
+	if cs, ok := b.(engine.DeltaConvScanner); ok && d.KDim == d.VDim {
+		// The backend takes q, k and v as they lie in the conv's output.
+		ys, state = cs.GatedDeltaConvScan(convOut, logG, beta, state, d.KHeads, d.VHeads, d.KDim)
+	} else {
+		q := b.Reshape(b.Slice(convOut, 2, 0, keyDim), B, S, d.KHeads, d.KDim)
+		k := b.Reshape(b.Slice(convOut, 2, keyDim, 2*keyDim), B, S, d.KHeads, d.KDim)
+		v := b.Reshape(b.Slice(convOut, 2, 2*keyDim, convDim), B, S, d.VHeads, d.VDim)
+
+		// Weightless per-head RMSNorm, then the reference's scale split: q
+		// carries inv_scale^2, k carries inv_scale (inv_scale = Dk^-1/2).
+		invScale := float32(1.0) / sqrtf(float32(d.KDim))
+		q = b.ScalarMul(b.RMSNorm(q, d.QKOnes, 1e-6), invScale*invScale)
+		k = b.ScalarMul(b.RMSNorm(k, d.QKOnes, 1e-6), invScale)
+		ys, state = b.GatedDeltaScan(
+			b.Cast(q, engine.F32), b.Cast(k, engine.F32), b.Cast(v, engine.F32),
+			b.Exp(logG), beta, state) // ys [B, S, Hv, Dv]
+	}
 	if held != nil && B > 1 {
 		// A held row's tail and state are the ones it came with.
 		on3, off3 := b.Reshape(held.on, B, 1, 1), b.Reshape(held.off, B, 1, 1)
