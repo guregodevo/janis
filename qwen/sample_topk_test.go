@@ -1,6 +1,7 @@
 package qwen
 
 import (
+	"math"
 	"math/rand"
 	"sort"
 	"testing"
@@ -75,5 +76,15 @@ func TestTopProbsIsAFullSortsFirstK(t *testing.T) {
 func TestGreedyTakesTheFirstLargest(t *testing.T) {
 	if got := sampleToken([]float32{1, 7, 3, 7, 2}, SampleParams{}, nil, nil); got != 1 {
 		t.Fatalf("greedy picked %d, want 1", got)
+	}
+}
+
+// The table's exp is math.Exp's to 1e-8 over the range the sum uses.
+func TestExpNegIsExp(t *testing.T) {
+	for d := 0.0; d > -expFloor; d -= 0.000937 {
+		got, want := expNeg(d), math.Exp(d)
+		if math.Abs(got-want) > 1e-8*want {
+			t.Fatalf("expNeg(%g) = %g, math.Exp gives %g", d, got, want)
+		}
 	}
 }

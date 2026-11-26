@@ -39,7 +39,10 @@ Measured, Qwen3 4-bit, 160 to 512 tokens generated:
 The two CUDA figures per row are the whole run, which includes the one-time
 Q4_1 repack of every weight on the host (about 19 s for the 8B on four
 vCPUs), and the steady rate the per-step compute timings give once that is
-done. llama.cpp runs the same 8B at 45 to 50 tok/s on an L4.
+done. On a vast.ai L4 (2026-11-26, the 1,510-token prompt below, two runs
+each) the 8B's steady decode is 43.3 and 43.2 tok/s on janis and 47.2 and
+46.8 on llama.cpp (e087c6c); with the model's sampling 42.6 and 42.8 against
+46.8 and 46.7.
 
 janis against llama.cpp on one A100 80 GB (vast.ai, 2026-11-26), one stream,
 a 1,510-token prompt. Decode is the steady rate: the time of a 1,100-token
@@ -48,19 +51,21 @@ given.
 
 | | janis | llama.cpp (b671865) |
 |---|---|---|
-| Qwen3.8-27B 4-bit, decode, greedy | 53.4, 53.4 tok/s | 51.2, 51.1 tok/s |
-| Qwen3.8-27B 4-bit, decode, the model's sampling (top-k 20, top-p 0.95) | 53.6, 53.4 tok/s | 51.2, 51.1 tok/s |
+| Qwen3.8-27B 4-bit, decode, greedy | 54.0, 54.0 tok/s | 51.2, 51.1 tok/s |
+| Qwen3.8-27B 4-bit, decode, the model's sampling (top-k 20, top-p 0.95) | 53.8, 53.7 tok/s | 51.2, 51.1 tok/s |
 | Qwen3.8-27B 4-bit, prefill | 1,106 tok/s | 1,170 tok/s |
 | Qwen3.8-27B 4-bit, GPU memory | 20.7 GB | 20.2 GB |
 | Qwen3.8-27B 8-bit, decode, greedy | 29.9, 30.0 tok/s | 39.6 tok/s |
-| Qwen3-8B 4-bit, decode, greedy | 131.6, 131.8 tok/s | 139.2, 138.7 tok/s |
-| Qwen3-8B 4-bit, decode, the model's sampling | 123.5, 123.1 tok/s | 138.6, 137.6 tok/s |
+| Qwen3-8B 4-bit, decode, greedy | 133.8, 134.2 tok/s | 139.2, 138.7 tok/s |
+| Qwen3-8B 4-bit, decode, the model's sampling | 126.3, 127.3 tok/s | 138.6, 137.6 tok/s |
 
 janis runs `mlx-community`'s 4-bit and 8-bit weights, llama.cpp unsloth's
 Q4_K_M and Q8_0 GGUF. llama.cpp's prefill is by its own timing, janis's is
 the prompt over the time of a one-token reply. janis's 8-bit keeps the
 checkpoint's values exactly (Q8_0 codes plus an offset per group), and
-the offsets are a fifth of its step.
+the offsets are a fifth of its step. janis's two Qwen3-8B rows are over a
+2,000-token stretch of a longer reply (the prompt's reply ends at 242
+tokens), llama.cpp's over the 200 tokens its reply runs.
 
 ```sh
 JANIS_PARALLEL=1 MLX_ENABLE_THINKING=0 janis serve --model Qwen3.8-27B-4bit
