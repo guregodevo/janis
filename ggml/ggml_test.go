@@ -123,6 +123,12 @@ func TestGGMLMatchesCPU(t *testing.T) {
 	for i := range fr {
 		fr[i] = float32(math.Pow(10000, float64(2*i)/8))
 	}
+	// One token and one head: the layout rope wants is a reshape of janis's.
+	for name, sh := range map[string][]int{"one token": {1, 4, 1, 8}, "one head": {1, 1, 4, 8}} {
+		diffOK(t, "RoPE("+name+", offset=5)", tol,
+			g.Floats(g.RoPE(g.FromFloats(rp[:32], sh...), 8, false, 10000, 1, 5)),
+			c.Floats(c.RoPE(c.FromFloats(rp[:32], sh...), 8, false, 10000, 1, 5)))
+	}
 	diffOK(t, "RoPEFreqs(offset=3)", tol,
 		g.Floats(g.RoPEFreqs(g.FromFloats(rp, 1, 2, 4, 8), 8, false, 1.0, 3, g.FromFloats(fr, half))),
 		c.Floats(c.RoPEFreqs(c.FromFloats(rp, 1, 2, 4, 8), 8, false, 1.0, 3, c.FromFloats(fr, half))))
