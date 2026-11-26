@@ -326,8 +326,10 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool, 
 	// same mechanism as incremental decode. We MUST eval+sweep each chunk, else
 	// MLX defers every chunk to one eval and the spike returns.
 	chunkSize := prefillChunk
-	if pc, ok := b.(engine.PrefillChunker); ok && !prefillChunkSet && pc.PrefillChunk() > 0 {
-		chunkSize = pc.PrefillChunk()
+	if pc, ok := b.(engine.PrefillChunker); ok && !prefillChunkSet {
+		if n := pc.PrefillChunk(len(newIDs)); n > 0 {
+			chunkSize = n
+		}
 	}
 	if s.PrefillChunk > 0 {
 		chunkSize = s.PrefillChunk

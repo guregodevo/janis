@@ -189,10 +189,10 @@ type PoolRowWriter interface {
 }
 
 // PrefillChunker is a backend with a prefill window of its own: how many
-// prompt tokens it reads in one forward when nothing else says (0: no
-// preference).
+// tokens of a prompt of tokens it reads in one forward when nothing else
+// says (0: no preference).
 type PrefillChunker interface {
-	PrefillChunk() int
+	PrefillChunk(tokens int) int
 }
 
 // Step is a recorded decode step.
