@@ -55,17 +55,18 @@ given.
 | Qwen3.8-27B 4-bit, decode, the model's sampling (top-k 20, top-p 0.95) | 53.8, 55.3 tok/s | 51.2, 51.1 tok/s |
 | Qwen3.8-27B 4-bit, prefill | 1,106 tok/s | 1,170 tok/s |
 | Qwen3.8-27B 4-bit, GPU memory | 20.7 GB | 20.2 GB |
-| Qwen3.8-27B 8-bit, decode, greedy | 29.9, 30.0 tok/s | 39.6 tok/s |
+| Qwen3.8-27B 8-bit, decode, greedy | 33.4, 33.2 tok/s | 39.6 tok/s |
 | Qwen3-8B 4-bit, decode, greedy | 145.9, 146.0 tok/s | 139.2, 138.7 tok/s |
 | Qwen3-8B 4-bit, decode, the model's sampling | 138.6, 138.2 tok/s | 138.6, 137.6 tok/s |
 
 janis runs `mlx-community`'s 4-bit and 8-bit weights, llama.cpp unsloth's
 Q4_K_M and Q8_0 GGUF. llama.cpp's prefill is by its own timing, janis's is
 the prompt over the time of a one-token reply. janis's 8-bit keeps the
-checkpoint's values exactly (Q8_0 codes plus an offset per group), and
-the offsets are a fifth of its step. janis's two Qwen3-8B rows are over a
-2,000-token stretch of a longer reply (the prompt's reply ends at 242
-tokens), llama.cpp's over the 200 tokens its reply runs.
+checkpoint's codes as they are (Q8_0) and writes each group's offset as
+three more columns of the same matrix, to 2^-21 of the row's largest: one
+multiply a weight. janis's two Qwen3-8B rows are over a 2,000-token
+stretch of a longer reply (the prompt's reply ends at 242 tokens),
+llama.cpp's over the 200 tokens its reply runs.
 
 ```sh
 JANIS_PARALLEL=1 MLX_ENABLE_THINKING=0 janis serve --model Qwen3.8-27B-4bit
