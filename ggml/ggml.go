@@ -707,22 +707,78 @@ func leafRow(src *tensor, r int) []float32 {
 }
 
 // dequantRows is rows of an affine-quantized leaf (words, scales, biases)
-// dequantized on the host, one row after the other.
+// dequantized on the host, one row after the other. A row asked for twice
+// is read from the device once, and the rows of a prompt are dequantized on
+// every core: read and dequantized one at a time, a 1,530-token prompt of
+// the 27B spent 0.3 s here.
 func dequantRows(w, sc, bi *tensor, rows []int32, groupSize, bits int) []float32 {
 	valsPerWord := 32 / bits
-	mask := uint32((1 << bits) - 1)
 	P := w.shape[len(w.shape)-1]
 	in := P * valsPerWord
-	out := make([]float32, 0, len(rows)*in)
-	for _, r := range rows {
-		words, s, bb := leafRow(w, int(r)), leafRow(sc, int(r)), leafRow(bi, int(r))
-		for j := 0; j < in; j++ {
-			q := (math.Float32bits(words[j/valsPerWord]) >> uint((j%valsPerWord)*bits)) & mask
-			g := j / groupSize
-			out = append(out, float32(q)*s[g]+bb[g])
+	out := make([]float32, len(rows)*in)
+	type src struct{ words, s, b []float32 }
+	first := make(map[int32]int, len(rows)) // a row's first place in rows
+	var uniq []int                          // the places read from the device
+	srcs := make([]src, len(rows))
+	for i, r := range rows {
+		if _, ok := first[r]; ok {
+			continue
+		}
+		first[r] = i
+		uniq = append(uniq, i)
+		srcs[i] = src{leafRow(w, int(r)), leafRow(sc, int(r)), leafRow(bi, int(r))}
+	}
+	one := func(i int) {
+		dequantRow(out[i*in:(i+1)*in], srcs[i].words, srcs[i].s, srcs[i].b, groupSize, bits)
+	}
+	if workers := min(runtime.NumCPU(), len(uniq)/8); workers > 1 {
+		var wg sync.WaitGroup
+		for k := 0; k < workers; k++ {
+			wg.Add(1)
+			go func(k int) {
+				defer wg.Done()
+				for u := k; u < len(uniq); u += workers {
+					one(uniq[u])
+				}
+			}(k)
+		}
+		wg.Wait()
+	} else {
+		for _, i := range uniq {
+			one(i)
+		}
+	}
+	for i, r := range rows {
+		if f := first[r]; f != i {
+			copy(out[i*in:(i+1)*in], out[f*in:(f+1)*in])
 		}
 	}
 	return out
+}
+
+// dequantRow is one row's values, q*scale + bias a group: out has a value
+// for each of the words' packed codes.
+func dequantRow(out, words, s, bb []float32, groupSize, bits int) {
+	valsPerWord := 32 / bits
+	mask := uint32((1 << bits) - 1)
+	if groupSize%valsPerWord != 0 {
+		for j := range out {
+			q := (math.Float32bits(words[j/valsPerWord]) >> uint((j%valsPerWord)*bits)) & mask
+			out[j] = float32(q)*s[j/groupSize] + bb[j/groupSize]
+		}
+		return
+	}
+	wordsPerGroup := groupSize / valsPerWord
+	for g := 0; g*groupSize < len(out); g++ {
+		sg, bg := s[g], bb[g]
+		o := out[g*groupSize:]
+		for wi, word := range words[g*wordsPerGroup : min((g+1)*wordsPerGroup, len(words))] {
+			u := math.Float32bits(word)
+			for k := 0; k < valsPerWord; k++ {
+				o[wi*valsPerWord+k] = float32((u>>uint(k*bits))&mask)*sg + bg
+			}
+		}
+	}
 }
 
 func (b *Backend) FromRaw(dt engine.DType, raw []byte, shape ...int) engine.Tensor {
