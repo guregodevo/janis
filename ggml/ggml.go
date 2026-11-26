@@ -75,6 +75,34 @@ static void janis_op_hist(struct ggml_cgraph * g, char * out, size_t cap) {
 static void janis_keep(struct ggml_tensor * t) {
 	for (; t != NULL; t = t->view_src) ggml_set_output(t);
 }
+// janis_copy_hist writes, for the graph's copy nodes (CPY, CONT), how many
+// there are of each kind: the op, the op of what it copies, the two types
+// and the shape ("CONT<PERMUTE f32>f32 128x16x1x1 48; ..."), for
+// JANIS_GGML_TIMING.
+static void janis_copy_hist(struct ggml_cgraph * g, char * out, size_t cap) {
+	enum { K = 96 };
+	static char key[K][96]; int n[K]; int used = 0;
+	for (int i = 0; i < ggml_graph_n_nodes(g); i++) {
+		struct ggml_tensor * t = ggml_graph_node(g, i);
+		if (t->op != GGML_OP_CPY && t->op != GGML_OP_CONT) continue;
+		struct ggml_tensor * s = t->src[0];
+		char k[96];
+		snprintf(k, sizeof k, "%s<%s %s>%s %lldx%lldx%lldx%lld", ggml_op_name(t->op), ggml_op_name(s->op), ggml_type_name(s->type), ggml_type_name(t->type),
+			(long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+		int j = 0;
+		for (; j < used; j++) if (strcmp(key[j], k) == 0) break;
+		if (j == used) { if (used == K) continue; strcpy(key[used], k); n[used++] = 0; }
+		n[j]++;
+	}
+	size_t at = 0; out[0] = 0;
+	for (;;) {
+		int best = -1;
+		for (int j = 0; j < used; j++) if (n[j] > 0 && (best < 0 || n[j] > n[best])) best = j;
+		if (best < 0 || at + 120 > cap) break;
+		at += snprintf(out + at, cap - at, "%s %d; ", key[best], n[best]);
+		n[best] = 0;
+	}
+}
 static struct ggml_tensor * janis_new(struct ggml_context * c, enum ggml_type t, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
 	return ggml_new_tensor_4d(c, t, ne0, ne1, ne2, ne3);
 }
@@ -1117,7 +1145,9 @@ func keep(t *C.struct_ggml_tensor) { C.janis_keep(t) }
 func opHist(g *C.struct_ggml_cgraph) string {
 	var buf [4096]C.char
 	C.janis_op_hist(g, &buf[0], 4096)
-	return C.GoString(&buf[0])
+	ops := C.GoString(&buf[0])
+	C.janis_copy_hist(g, &buf[0], 4096)
+	return ops + "\n  copies: " + C.GoString(&buf[0])
 }
 
 // Eval computes everything recorded so far; the engine calls it once per
