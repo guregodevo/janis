@@ -496,3 +496,40 @@ func TestAn8BitWeightStays8Bits(t *testing.T) {
 		affine8On = was
 	}
 }
+
+// A reshape of a result an earlier flush computed has memory of its own: the
+// result is not held once the reshape is computed, and a view would read its
+// memory after it was given back. Qwen3's attention reshapes each projection
+// after the weight's first use flushed it; on a 1,500-token prompt that was a
+// CUDA illegal memory access. Within one graph the reshape stays a view.
+func TestAReshapeOfAnEarlierResultIsNotAViewOfIt(t *testing.T) {
+	g := New()
+	defer g.Close()
+	const n = 1 << 18
+	vals := rnd(n, 40)
+	for name, shape := range map[string]func(x engine.Tensor) engine.Tensor{
+		"Reshape":   func(x engine.Tensor) engine.Tensor { return g.Reshape(x, 8, n/8) },
+		"Transpose": func(x engine.Tensor) engine.Tensor { return g.Transpose(x, 1, 0, 2) },
+	} {
+		x := g.ScalarMul(g.FromFloats(vals, 1, 8, n/8), 1)
+		g.Eval(x)
+		y := shape(x)
+		g.Eval(y)
+		if as(y).t.data == as(x).t.data {
+			t.Errorf("%s of an earlier result reads that result's memory", name)
+		}
+		x = nil
+		for i := 0; i < 3; i++ {
+			runtime.GC()
+			time.Sleep(10 * time.Millisecond)
+			g.Eval(g.ScalarMul(g.FromFloats(rnd(n, int64(41+i)), 1, 8, n/8), 1))
+		}
+		diffOK(t, name+" of an earlier result, after that result is gone", 0, g.Floats(y), vals)
+
+		v := shape(g.ScalarMul(g.FromFloats(vals, 1, 8, n/8), 1))
+		if as(v).t.view_src == nil {
+			t.Errorf("%s of a result of the same graph is a copy", name)
+		}
+		diffOK(t, name+" in one graph", 0, g.Floats(v), vals)
+	}
+}
