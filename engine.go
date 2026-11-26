@@ -270,6 +270,34 @@ func (e *Engine) reply(ids []int32) (text, reasoning string) {
 	return chat.InklingReply(ids, *e.ink, e.tok.Decode)
 }
 
+// tailDecoder is a reply's text as its tokens come, decoding the last few
+// tokens each time and not the whole reply: decoding all of it at every
+// token was 0.3 ms a token by the 1,000th. A token's text depends on the one
+// before it (a leading space, a character's bytes over two tokens), so the
+// new tokens are decoded after the ones last read, and what those give alone
+// is cut off the front. Text that ends inside a character waits for the rest.
+type tailDecoder struct {
+	decode       func([]int32) string
+	ids          []int32
+	prefix, read int // ids[prefix:read] is the context, ids[read:] not yet in text
+	text         string
+}
+
+func (d *tailDecoder) add(tok int32) string {
+	d.ids = append(d.ids, tok)
+	was, now := d.decode(d.ids[d.prefix:d.read]), d.decode(d.ids[d.prefix:])
+	switch {
+	case !strings.HasPrefix(now, was):
+		// The context reads differently with what follows it: all of it again.
+		d.text = d.decode(d.ids)
+		d.prefix, d.read = len(d.ids)-1, len(d.ids)
+	case len(now) > len(was) && !strings.HasSuffix(now, "\uFFFD"):
+		d.text += now[len(was):]
+		d.prefix, d.read = d.read, len(d.ids)
+	}
+	return d.text
+}
+
 // ModelType reports the loaded architecture (qwen2/qwen3/qwen3_5/llama/gemma2/inkling2_loop).
 func (e *Engine) ModelType() string { return e.mtype }
 
@@ -374,9 +402,15 @@ func (e *Engine) sampleParams(opts Options, onDelta func(string)) (qwen.SamplePa
 	if onDelta != nil || opts.OnReasoning != nil {
 		var gen []int32
 		var emitted, thought string
+		tail := tailDecoder{decode: e.tok.Decode}
 		p.OnToken = func(tok int32) {
-			gen = append(gen, tok)
-			full, thinking := e.reply(gen)
+			var full, thinking string
+			if e.ink == nil {
+				full, thinking = chat.SplitThinking(e.mtype, tail.add(tok))
+			} else {
+				gen = append(gen, tok)
+				full, thinking = e.reply(gen)
+			}
 			if onDelta != nil && len(full) > len(emitted) {
 				onDelta(full[len(emitted):])
 				emitted = full

@@ -226,34 +226,24 @@ func sampleTopP(logits []float32, p SampleParams, rng *rand.Rand) int32 {
 	return int32(idx[cut-1])
 }
 
-// expSum is the sum of exp((x - maxL) * inv) over logits, in sixteen parts
-// on as many goroutines for a vocabulary's worth; the parts are added in
-// order, so the sum is the same on any host. A term under e^-40 is left
-// out: 248k of them are 1e-12 of the largest term.
+// expSum is the sum of exp((x - maxL) * inv) over logits, in parts on as
+// many goroutines for a vocabulary's worth; the parts are added in order,
+// so the sum is the same on any host.
 func expSum(logits []float32, maxL, inv float64) float64 {
 	part := func(xs []float32) float64 {
 		var s float64
 		for _, x := range xs {
-			if d := (float64(x) - maxL) * inv; d > -40 {
-				s += math.Exp(d)
+			if d := (float64(x) - maxL) * inv; d > -expFloor {
+				s += expNeg(d)
 			}
 		}
 		return s
 	}
-	const parts = 16
-	if len(logits) < 1<<15 {
+	if len(logits) < scanMin {
 		return part(logits)
 	}
-	var sums [parts]float64
-	var wg sync.WaitGroup
-	for i := 0; i < parts; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			sums[i] = part(logits[i*len(logits)/parts : (i+1)*len(logits)/parts])
-		}(i)
-	}
-	wg.Wait()
+	var sums [scanParts]float64
+	inParts(len(logits), func(i, lo, hi int) { sums[i] = part(logits[lo:hi]) })
 	var s float64
 	for _, v := range sums {
 		s += v
@@ -261,8 +251,43 @@ func expSum(logits []float32, maxL, inv float64) float64 {
 	return s
 }
 
+// expNeg is exp(d) for d in (-expFloor, 0], within 1e-8 of math.Exp's value:
+// a table of exp at every sixteenth and four terms of the series for what is
+// left. math.Exp over a vocabulary was a fifth of the host's time in a
+// sampled decode of Qwen3-8B. A term under e^-expFloor is left out: all of
+// them together are under 1e-8 of the sum, which is at least 1.
+const expFloor = 32
+
+var expSixteenths = func() (t [expFloor*16 + 1]float64) {
+	for i := range t {
+		t[i] = math.Exp(-float64(i) / 16)
+	}
+	return t
+}()
+
+func expNeg(d float64) float64 {
+	k := int(-d * 16)
+	r := d + float64(k)/16 // in (-1/16, 0]
+	return expSixteenths[k] * (1 + r*(1+r*(0.5+r*(1.0/6+r*(1.0/24)))))
+}
+
 // argmax is the first index of the largest logit.
 func argmax(logits []float32) int {
+	if len(logits) < scanMin {
+		return argmaxOf(logits)
+	}
+	var at [scanParts]int
+	inParts(len(logits), func(i, lo, hi int) { at[i] = lo + argmaxOf(logits[lo:hi]) })
+	best := at[0]
+	for _, id := range at[1:] {
+		if logits[id] > logits[best] { // parts in order: the first largest stays
+			best = id
+		}
+	}
+	return best
+}
+
+func argmaxOf(logits []float32) int {
 	best, top := 0, logits[0]
 	for i, x := range logits {
 		if x > top {
@@ -270,6 +295,27 @@ func argmax(logits []float32) int {
 		}
 	}
 	return best
+}
+
+// A scan of the logits (248k for the 27B, 151k for Qwen3) is cut in
+// scanParts parts on as many goroutines from scanMin values: one core took
+// 0.2 to 0.3 ms a token on a 2.1 GHz Xeon, 3% of an 8B's decode step.
+const (
+	scanParts = 8
+	scanMin   = 1 << 15
+)
+
+// inParts runs part on scanParts consecutive ranges of n values and waits.
+func inParts(n int, part func(i, lo, hi int)) {
+	var wg sync.WaitGroup
+	for i := 0; i < scanParts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			part(i, i*n/scanParts, (i+1)*n/scanParts)
+		}(i)
+	}
+	wg.Wait()
 }
 
 // sampleTopK is sampleToken's draw with a top-k: the K most likely tokens
@@ -621,6 +667,36 @@ func before[T float32 | float64](probs []T, a, b int) bool {
 
 // topProbs returns up to k allowed token ids in candidate order.
 func topProbs[T float32 | float64](probs []T, k int, allow func(int) bool) []int {
+	if allow != nil || len(probs) < scanMin || k > len(probs)/(4*scanParts) {
+		return topProbsOf(probs, k, allow)
+	}
+	// Each part's k best, then the k best of those: the candidates keep
+	// their order by id, so ties fall as they do in one scan.
+	var kept [scanParts][]int
+	inParts(len(probs), func(i, lo, hi int) {
+		kept[i] = topProbsOf(probs[lo:hi], k, nil)
+		for j := range kept[i] {
+			kept[i][j] += lo
+		}
+		sort.Ints(kept[i])
+	})
+	var ids []int
+	for _, part := range kept {
+		ids = append(ids, part...)
+	}
+	vals := make([]T, len(ids))
+	for i, id := range ids {
+		vals[i] = probs[id]
+	}
+	out := topProbsOf(vals, k, nil)
+	for i, at := range out {
+		out[i] = ids[at]
+	}
+	return out
+}
+
+// topProbsOf is topProbs in one scan.
+func topProbsOf[T float32 | float64](probs []T, k int, allow func(int) bool) []int {
 	h := make([]int, 0, k) // min-heap by candidate order: h[0] is the worst kept
 	down := func(i int) {
 		for {
