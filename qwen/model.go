@@ -6,7 +6,6 @@ import (
 	"os"
 	"sort"
 	"strconv"
-	"sync"
 
 	"github.com/guregodevo/janis/engine"
 	"github.com/guregodevo/janis/safetensors"
@@ -226,29 +225,29 @@ func sampleTopP(logits []float32, p SampleParams, rng *rand.Rand) int32 {
 	return int32(idx[cut-1])
 }
 
-// expSum is the sum of exp((x - maxL) * inv) over logits, in parts on as
-// many goroutines for a vocabulary's worth; the parts are added in order,
-// so the sum is the same on any host.
+// expSum is the sum of exp((x - maxL) * inv) over logits, on one core in
+// four running sums: sixteen goroutines for it cost a sampled decode of
+// Qwen3-8B 0.9 ms a token on an 80-thread Xeon, where the sum itself is
+// 0.35 ms.
 func expSum(logits []float32, maxL, inv float64) float64 {
-	part := func(xs []float32) float64 {
-		var s float64
-		for _, x := range xs {
-			if d := (float64(x) - maxL) * inv; d > -expFloor {
-				s += expNeg(d)
-			}
+	term := func(x float32) float64 {
+		if d := (float64(x) - maxL) * inv; d > -expFloor {
+			return expNeg(d)
 		}
-		return s
+		return 0
 	}
-	if len(logits) < scanMin {
-		return part(logits)
+	var s0, s1, s2, s3 float64
+	i := 0
+	for ; i+4 <= len(logits); i += 4 {
+		s0 += term(logits[i])
+		s1 += term(logits[i+1])
+		s2 += term(logits[i+2])
+		s3 += term(logits[i+3])
 	}
-	var sums [scanParts]float64
-	inParts(len(logits), func(i, lo, hi int) { sums[i] = part(logits[lo:hi]) })
-	var s float64
-	for _, v := range sums {
-		s += v
+	for ; i < len(logits); i++ {
+		s0 += term(logits[i])
 	}
-	return s
+	return s0 + s1 + s2 + s3
 }
 
 // expNeg is exp(d) for d in (-expFloor, 0], within 1e-8 of math.Exp's value:
@@ -273,21 +272,6 @@ func expNeg(d float64) float64 {
 
 // argmax is the first index of the largest logit.
 func argmax(logits []float32) int {
-	if len(logits) < scanMin {
-		return argmaxOf(logits)
-	}
-	var at [scanParts]int
-	inParts(len(logits), func(i, lo, hi int) { at[i] = lo + argmaxOf(logits[lo:hi]) })
-	best := at[0]
-	for _, id := range at[1:] {
-		if logits[id] > logits[best] { // parts in order: the first largest stays
-			best = id
-		}
-	}
-	return best
-}
-
-func argmaxOf(logits []float32) int {
 	best, top := 0, logits[0]
 	for i, x := range logits {
 		if x > top {
@@ -295,27 +279,6 @@ func argmaxOf(logits []float32) int {
 		}
 	}
 	return best
-}
-
-// A scan of the logits (248k for the 27B, 151k for Qwen3) is cut in
-// scanParts parts on as many goroutines from scanMin values: one core took
-// 0.2 to 0.3 ms a token on a 2.1 GHz Xeon, 3% of an 8B's decode step.
-const (
-	scanParts = 8
-	scanMin   = 1 << 15
-)
-
-// inParts runs part on scanParts consecutive ranges of n values and waits.
-func inParts(n int, part func(i, lo, hi int)) {
-	var wg sync.WaitGroup
-	for i := 0; i < scanParts; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			part(i, i*n/scanParts, (i+1)*n/scanParts)
-		}(i)
-	}
-	wg.Wait()
 }
 
 // sampleTopK is sampleToken's draw with a top-k: the K most likely tokens
@@ -667,36 +630,6 @@ func before[T float32 | float64](probs []T, a, b int) bool {
 
 // topProbs returns up to k allowed token ids in candidate order.
 func topProbs[T float32 | float64](probs []T, k int, allow func(int) bool) []int {
-	if allow != nil || len(probs) < scanMin || k > len(probs)/(4*scanParts) {
-		return topProbsOf(probs, k, allow)
-	}
-	// Each part's k best, then the k best of those: the candidates keep
-	// their order by id, so ties fall as they do in one scan.
-	var kept [scanParts][]int
-	inParts(len(probs), func(i, lo, hi int) {
-		kept[i] = topProbsOf(probs[lo:hi], k, nil)
-		for j := range kept[i] {
-			kept[i][j] += lo
-		}
-		sort.Ints(kept[i])
-	})
-	var ids []int
-	for _, part := range kept {
-		ids = append(ids, part...)
-	}
-	vals := make([]T, len(ids))
-	for i, id := range ids {
-		vals[i] = probs[id]
-	}
-	out := topProbsOf(vals, k, nil)
-	for i, at := range out {
-		out[i] = ids[at]
-	}
-	return out
-}
-
-// topProbsOf is topProbs in one scan.
-func topProbsOf[T float32 | float64](probs []T, k int, allow func(int) bool) []int {
 	h := make([]int, 0, k) // min-heap by candidate order: h[0] is the worst kept
 	down := func(i int) {
 		for {

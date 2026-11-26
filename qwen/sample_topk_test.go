@@ -79,37 +79,6 @@ func TestGreedyTakesTheFirstLargest(t *testing.T) {
 	}
 }
 
-// A vocabulary's worth of logits is scanned in parts: the greedy pick and
-// the K kept are still the ones a single scan and a full sort give, with the
-// ties across the parts' edges.
-func TestAScanInPartsPicksWhatOneScanPicks(t *testing.T) {
-	src := rand.New(rand.NewSource(11))
-	for _, n := range []int{scanMin, 151_936, 248_320} {
-		logits := make([]float32, n)
-		for i := range logits {
-			logits[i] = float32(src.Intn(2000)) / 16 // every value many times
-		}
-		if got, want := argmax(logits), argmaxOf(logits); got != want {
-			t.Fatalf("n=%d: the greedy pick is %d, one scan picks %d", n, got, want)
-		}
-		logits[n-3], logits[n/2+1] = 500, 500
-		if got := argmax(logits); got != n/2+1 {
-			t.Fatalf("n=%d: of two largest the pick is %d, want the first, %d", n, got, n/2+1)
-		}
-		for _, k := range []int{1, 20, 64, 512} {
-			got, want := topProbs(logits, k, nil), topProbsOf(logits, k, nil)
-			if len(got) != len(want) {
-				t.Fatalf("n=%d k=%d: %d kept, one scan keeps %d", n, k, len(got), len(want))
-			}
-			for i := range got {
-				if got[i] != want[i] {
-					t.Fatalf("n=%d k=%d: rank %d is token %d, one scan has %d", n, k, i, got[i], want[i])
-				}
-			}
-		}
-	}
-}
-
 // The table's exp is math.Exp's to 1e-8 over the range the sum uses.
 func TestExpNegIsExp(t *testing.T) {
 	for d := 0.0; d > -expFloor; d -= 0.000937 {
