@@ -2126,14 +2126,22 @@ func (b *Backend) ropeAt(tx *tensor, dims int, traditional bool, base, scale flo
 	}
 	return b.op(engine.F32, tx.shape, []*tensor{tx, tpos, freqs}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		x := f32(ctx, tx)
-		// janis [B,H,L,D] is ne (D,L,H,B); rope wants (D,H,L,B).
-		x = C.ggml_cont(ctx, C.ggml_permute(ctx, x, 0, 2, 1, 3))
+		// janis [B,H,L,D] is ne (D,L,H,B); rope wants (D,H,L,B). With one
+		// token or one head the two are the same memory: a reshape each
+		// way, where the permuted copies were four nodes a layer of a
+		// decode step.
+		swap := func(t *C.struct_ggml_tensor) *C.struct_ggml_tensor {
+			if t.ne[1] == 1 || t.ne[2] == 1 {
+				return C.ggml_reshape_4d(ctx, contig(ctx, t), t.ne[0], t.ne[2], t.ne[1], t.ne[3])
+			}
+			return C.ggml_cont(ctx, C.ggml_permute(ctx, t, 0, 2, 1, 3))
+		}
 		var fr *C.struct_ggml_tensor
 		if freqs != nil {
 			fr = f32(ctx, freqs)
 		}
-		r := C.ggml_rope_ext(ctx, x, tpos.t, fr, C.int(dims), mode, 0, C.float(base), C.float(scale), 0, 1, 32, 1)
-		return C.ggml_cont(ctx, C.ggml_permute(ctx, r, 0, 2, 1, 3))
+		r := C.ggml_rope_ext(ctx, swap(x), tpos.t, fr, C.int(dims), mode, 0, C.float(base), C.float(scale), 0, 1, 32, 1)
+		return swap(r)
 	})
 }
 

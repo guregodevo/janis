@@ -537,6 +537,15 @@ func (b *Backend) recordAppend(grp *batch, tb *tensor, shape []int, axis int) (*
 	}
 	base := grp.base
 	src := tb.t
+	hold := tb
+	if c := src.src[0]; src.op == C.GGML_OP_CPY && c != nil && c._type == C.GGML_TYPE_F32 {
+		// The model's cast of the new keys or values to the cache's f16: the
+		// write below takes f32 and rounds to f16 itself, the same values.
+		// Written from the cast's source, the cast and the cast back are two
+		// nodes a cache the step does not run; the cast's inputs are held in
+		// its place.
+		src, hold = c, &tensor{deps: tb.deps, via: tb.via}
+	}
 	var dst, idx *C.struct_ggml_tensor
 	if grp.vt {
 		// Tokens innermost: element (t, d, h, b) is t + capacity*(d + D*(h + H*b)),
@@ -544,7 +553,7 @@ func (b *Backend) recordAppend(grp *batch, tb *tensor, shape []int, axis int) (*
 		m := numel(tb.shape)
 		dst = C.ggml_view_2d(b.rec, base, 1, C.int64_t(numel(shapeOf(base))), base.nb[0], 0)
 		C.ggml_backend_view_init(dst)
-		src = C.ggml_reshape_2d(b.rec, C.ggml_cont(b.rec, src), 1, C.int64_t(m))
+		src = C.ggml_reshape_2d(b.rec, contig(b.rec, src), 1, C.int64_t(m))
 		idx = b.replayCols(grp.cap, m).t
 	} else {
 		dst = base
@@ -553,11 +562,11 @@ func (b *Backend) recordAppend(grp *batch, tb *tensor, shape []int, axis int) (*
 			idx = rs.rowsB[rs.cur].t
 		}
 	}
-	if tb.dt != engine.F32 {
+	if src._type != C.GGML_TYPE_F32 {
 		src = C.ggml_cast(b.rec, src, C.GGML_TYPE_F32)
 	}
 	b.extra = append(b.extra, C.ggml_set_rows(b.rec, dst, src, idx))
-	b.extraDeps = append(b.extraDeps, tb)
+	b.extraDeps = append(b.extraDeps, hold)
 	padded := append([]int(nil), shape...)
 	padded[axis] = bucket
 	out := &tensor{shape: padded, dt: engine.F16, grp: grp, cacheLen: bucket, replay: true}
@@ -614,6 +623,10 @@ func (b *Backend) EndStep(ids, logits engine.Tensor, next []engine.Tensor) (engi
 	ctx, pending, extra, extraDeps, nodes := b.rec, b.pending, b.extra, b.extraDeps, b.recCap
 	b.rec, b.pending, b.extra, b.extraDeps = nil, nil, nil, nil
 	b.mu.Unlock()
+	// A result the model dropped is one until the collector has run: the
+	// step would compute it, and keep its memory apart, on every run. Once
+	// a recording.
+	runtime.GC()
 
 	tl := as(logits)
 	// Every result the model still holds is an output, as a flush makes
