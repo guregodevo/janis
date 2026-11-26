@@ -445,3 +445,42 @@ func TestAFlushWithNoRoomLeavesTheBackendUsable(t *testing.T) {
 	})
 	usable("a full recording")
 }
+
+// An 8-bit weight stays 8 bits on the device: its codes as Q8_0 and one
+// offset a group, against the CPU backend's affine product. With
+// JANIS_GGML_AFFINE8=0 it is the f16 copy, as before.
+func TestAn8BitWeightStays8Bits(t *testing.T) {
+	const out, in, gs, bits = 2048, 1024, 64, 8
+	P, G := in*bits/32, in/gs
+	raw := rndPackedU32(out*P, 1)
+	sc, bi := rnd(out*G, 2), rnd(out*G, 3)
+	for _, tc := range []struct {
+		name string
+		on   bool
+		typ  int
+		tol  float64
+	}{{"Q8_0 and offsets", true, 8, 1.5e-2}, {"f16", false, 1, 1e-2}} {
+		was := affine8On
+		affine8On = tc.on
+		g, c := New(), cpu.New()
+		gW, cW := g.FromRaw(engine.U32, raw, out, P), c.FromRaw(engine.U32, raw, out, P)
+		gS, gB := g.Cast(g.FromFloats(sc, out, G), engine.F16), g.Cast(g.FromFloats(bi, out, G), engine.F16)
+		// The CPU reads the scales and biases the device holds: f16 values.
+		cS, cB := c.FromFloats(g.Floats(gS), out, G), c.FromFloats(g.Floats(gB), out, G)
+		for _, m := range []int{13, 1} {
+			x := rnd(m*in, int64(4+m))
+			relOK(t, fmt.Sprintf("QuantMatmul(M=%d) on %s", m, tc.name), tc.tol,
+				g.Floats(g.QuantMatmul(g.FromFloats(x, 1, m, in), gW, gS, gB, true, gs, bits)),
+				c.Floats(c.QuantMatmul(c.FromFloats(x, 1, m, in), cW, cS, cB, true, gs, bits)))
+		}
+		q := gW.(*tensor).q4
+		if typ := int(q.t._type); typ != tc.typ {
+			t.Errorf("%s: the weight is type %d, want %d", tc.name, typ, tc.typ)
+		}
+		if (q.off != nil) != tc.on {
+			t.Errorf("%s: offsets kept: %v, want %v", tc.name, q.off != nil, tc.on)
+		}
+		g.Close()
+		affine8On = was
+	}
+}
