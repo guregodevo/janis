@@ -111,6 +111,10 @@ func sampleToken(logits []float32, p SampleParams, rng *rand.Rand, recent []int3
 		return int32(best)
 	}
 
+	if p.TopK > 0 {
+		return sampleTopK(logits, p, rng, constrain)
+	}
+
 	n := len(logits)
 	maxL := logits[0]
 	for _, x := range logits {
@@ -146,23 +150,11 @@ func sampleToken(logits []float32, p SampleParams, rng *rand.Rand, recent []int3
 	if len(idx) == 0 {
 		idx = topPCandidates(probs, topP, nil)
 	}
-	// total is the probability the top-p cut is a share of: all of it, or
-	// what the K most likely tokens hold.
-	total := 1.0
-	if p.TopK > 0 {
-		if idx = topProbs(probs, p.TopK, allow); len(idx) == 0 {
-			idx = topProbs(probs, p.TopK, nil)
-		}
-		total = 0
-		for _, id := range idx {
-			total += probs[id]
-		}
-	}
 	var cum float64
 	cut := len(idx)
 	for rank, id := range idx {
 		cum += probs[id]
-		if cum >= topP*total {
+		if cum >= topP {
 			cut = rank + 1
 			break
 		}
@@ -172,6 +164,51 @@ func sampleToken(logits []float32, p SampleParams, rng *rand.Rand, recent []int3
 	var acc float64
 	for rank := 0; rank < cut; rank++ {
 		acc += probs[idx[rank]]
+		if r <= acc {
+			return int32(idx[rank])
+		}
+	}
+	return int32(idx[cut-1])
+}
+
+// sampleTopK is sampleToken's draw with a top-k: the K most likely tokens
+// are the K largest logits, and top-p is a share of what those K hold, so
+// only K exponentials are taken, where the softmax over a 248k vocabulary
+// took 1.5 ms a token.
+func sampleTopK(logits []float32, p SampleParams, rng *rand.Rand, constrain bool) int32 {
+	var idx []int
+	if constrain {
+		idx = topProbs(logits, p.TopK, func(id int) bool { return p.Grammar.Allows(int32(id)) })
+	}
+	if len(idx) == 0 {
+		// No grammar, or one that allowed nothing (shouldn't happen): the
+		// full set rather than a deadlock.
+		idx = topProbs(logits, p.TopK, nil)
+	}
+	topP := float64(p.TopP)
+	if topP <= 0 || topP > 1 {
+		topP = 1.0
+	}
+	inv := 1.0 / float64(p.Temp)
+	w := make([]float64, len(idx))
+	var total float64
+	for i, id := range idx {
+		w[i] = math.Exp((float64(logits[id]) - float64(logits[idx[0]])) * inv)
+		total += w[i]
+	}
+	var cum float64
+	cut := len(idx)
+	for rank := range idx {
+		cum += w[rank]
+		if cum >= topP*total {
+			cut = rank + 1
+			break
+		}
+	}
+	r := rng.Float64() * cum
+	var acc float64
+	for rank := 0; rank < cut; rank++ {
+		acc += w[rank]
 		if r <= acc {
 			return int32(idx[rank])
 		}
@@ -474,7 +511,7 @@ func topPCandidates(probs []float64, topP float64, allow func(int) bool) []int {
 }
 
 // before is the candidate order: higher probability first, then lower id.
-func before(probs []float64, a, b int) bool {
+func before[T float32 | float64](probs []T, a, b int) bool {
 	if probs[a] != probs[b] {
 		return probs[a] > probs[b]
 	}
@@ -482,7 +519,7 @@ func before(probs []float64, a, b int) bool {
 }
 
 // topProbs returns up to k allowed token ids in candidate order.
-func topProbs(probs []float64, k int, allow func(int) bool) []int {
+func topProbs[T float32 | float64](probs []T, k int, allow func(int) bool) []int {
 	h := make([]int, 0, k) // min-heap by candidate order: h[0] is the worst kept
 	down := func(i int) {
 		for {

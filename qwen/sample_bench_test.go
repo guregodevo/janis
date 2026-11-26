@@ -27,3 +27,20 @@ func BenchmarkSampleToken(b *testing.B) {
 		sampleToken(buf, p, rng, recent)
 	}
 }
+
+// BenchmarkSampleTokenTopK: the same with Qwen3.8's own sampling
+// (temperature 1, top-k 20, top-p 0.95).
+func BenchmarkSampleTokenTopK(b *testing.B) {
+	src := rand.New(rand.NewSource(1))
+	logits := make([]float32, 248320)
+	for i := range logits {
+		logits[i] = float32(src.NormFloat64() * 3)
+	}
+	logits[1234] = 30
+	p := SampleParams{Temp: 1, TopP: 0.95, TopK: 20}
+	rng := rand.New(rand.NewSource(2))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sampleToken(logits, p, rng, nil)
+	}
+}
