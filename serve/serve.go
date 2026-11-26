@@ -67,6 +67,9 @@ type Server struct {
 	// xmlTools is whether the loaded model is asked for tools in its own
 	// XML form instead of the Hermes JSON one (xmltools.go).
 	xmlTools bool
+	// sampling is what a request that names no temperature, top_p, top_k or
+	// repetition penalty is sampled with: the loaded model's own (sampling.go).
+	sampling sampling
 	logf     func(string, ...any)
 
 	// loaded is name for the handlers off the engine thread: GET /v1/models
@@ -290,6 +293,7 @@ func (s *Server) ensure(name string) error {
 	}
 	s.current, s.name = eng, pick.Name
 	s.xmlTools = usesXMLTools(pick.Path)
+	s.sampling = modelSampling(pick.Path)
 	s.setLoaded(pick.Name)
 	s.logf("loaded %s (%s)", pick.Name, eng.ModelType())
 	return nil
@@ -306,6 +310,8 @@ type chatRequest struct {
 	StreamOptions       *streamOptions  `json:"stream_options"`
 	Temperature         *float64        `json:"temperature"`
 	TopP                *float64        `json:"top_p"`
+	TopK                *int            `json:"top_k"`
+	RepetitionPenalty   *float64        `json:"repetition_penalty"`
 	MaxTokens           int             `json:"max_tokens"`
 	MaxCompletionTokens int             `json:"max_completion_tokens"`
 	Seed                *uint64         `json:"seed"`
@@ -409,12 +415,22 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		id := "chatcmpl-" + fmt.Sprint(time.Now().UnixNano())
 		created := time.Now().Unix()
-		opts := llm.Options{Temp: float32(defaultTemp), TopP: float32(defaultTopP), MaxTokens: defaultMaxTokens}
+		sm := s.sampling
+		if sm == (sampling{}) {
+			sm = janisSampling
+		}
+		opts := llm.Options{Temp: sm.temp, TopP: sm.topP, TopK: sm.topK, RepeatPenalty: sm.repeatPenalty, MaxTokens: defaultMaxTokens}
 		if req.Temperature != nil {
 			opts.Temp = float32(*req.Temperature)
 		}
 		if req.TopP != nil {
 			opts.TopP = float32(*req.TopP)
+		}
+		if req.TopK != nil {
+			opts.TopK = *req.TopK
+		}
+		if req.RepetitionPenalty != nil {
+			opts.RepeatPenalty = float32(*req.RepetitionPenalty)
 		}
 		if req.MaxCompletionTokens > 0 {
 			opts.MaxTokens = req.MaxCompletionTokens

@@ -30,6 +30,9 @@ import (
 var (
 	repeatPenalty = envFloat32("JANIS_REPEAT_PENALTY", 1.1)
 	repeatLastN   = envInt("JANIS_REPEAT_LAST_N", 64)
+	// repeatPenaltySet is whether JANIS_REPEAT_PENALTY was given: it then
+	// holds for every reply, over a request's or a model's own value.
+	repeatPenaltySet = os.Getenv("JANIS_REPEAT_PENALTY") != ""
 )
 
 func envFloat32(key string, def float32) float32 {
@@ -55,10 +58,15 @@ type Message = chat.Message
 
 // Options controls a chat request.
 type Options struct {
-	Temp      float32
-	TopP      float32
-	MaxTokens int
-	Seed      uint64
+	Temp float32
+	TopP float32
+	// TopK (>0) keeps the K most likely tokens before the top-p cut.
+	TopK int
+	// RepeatPenalty (>0) is this reply's repetition penalty, 1 for none. 0
+	// leaves the engine's own (JANIS_REPEAT_PENALTY, 1.1 by default).
+	RepeatPenalty float32
+	MaxTokens     int
+	Seed          uint64
 	// Cancel, if set, is polled during generation; returning true stops early and
 	// returns the partial reply. Used to interrupt an in-flight chat.
 	Cancel func() bool
@@ -331,13 +339,18 @@ func (e *Engine) sampleParams(opts Options, onDelta func(string)) (qwen.SamplePa
 	if topP <= 0 {
 		topP = 1.0
 	}
+	penalty := repeatPenalty
+	if opts.RepeatPenalty > 0 && !repeatPenaltySet {
+		penalty = opts.RepeatPenalty
+	}
 	p := qwen.SampleParams{
-		Temp: opts.Temp, TopP: topP, Seed: opts.Seed, Stop: e.stops, Cancel: opts.Cancel,
+		Temp: opts.Temp, TopP: topP, TopK: opts.TopK, Seed: opts.Seed, Stop: e.stops, Cancel: opts.Cancel,
 		// Repetition penalty is on by default so a local model can't lock into a
 		// decode loop on free text (the classic "of of of" / echo-forever failure).
 		// Tunable via env; 1.0 disables. Skipped automatically during grammar-
 		// constrained tool calls (see sampleToken).
-		RepeatPenalty: repeatPenalty,
+		// A request, or the model's own generation config, may name another.
+		RepeatPenalty: penalty,
 		RepeatLastN:   repeatLastN,
 	}
 	if e.ink != nil {
