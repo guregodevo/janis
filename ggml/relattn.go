@@ -155,6 +155,23 @@ func (b *Backend) RMS(x engine.Tensor, eps float32) engine.Tensor {
 	})
 }
 
+// zeroSinks is a sink logit of zero for each of H heads.
+func (b *Backend) zeroSinks(H int) *tensor {
+	b.mu.Lock()
+	z := b.zeros[H]
+	b.mu.Unlock()
+	if z == nil {
+		z = b.kept(as(b.FromFloats(make([]float32, H), H)))
+		b.mu.Lock()
+		if b.zeros == nil {
+			b.zeros = map[int]*tensor{}
+		}
+		b.zeros[H] = z
+		b.mu.Unlock()
+	}
+	return z
+}
+
 // relInputsFor is the distances and the mask of a query at pos over the n
 // cache slots from base: inputs of the step being recorded when the caches are its
 // padded views, tensors made for this call otherwise.
@@ -168,7 +185,7 @@ func (b *Backend) relInputsFor(replay bool, pos, window, extent, base, n int) (i
 		if in != nil {
 			return in.idx, in.hidden
 		}
-		in = &relInputs{idx: b.replayInput(engine.I32, 1, n), hidden: b.replayInput(engine.F32, 1, n+1)}
+		in = &relInputs{idx: b.replayInput(engine.I32, 1, n), hidden: b.replayInput(engine.F32, 1, n)}
 		i, h := relMask(rs.offset, window, extent, base, n)
 		setInt32(in.idx, i)
 		setFloat32(in.hidden, h)
@@ -182,7 +199,7 @@ func (b *Backend) relInputsFor(replay bool, pos, window, extent, base, n int) (i
 		return in.idx, in.hidden
 	}
 	i, h := relMask(pos, window, extent, base, n)
-	return as(b.FromInt32(i, 1, n)), as(b.FromFloats(h, 1, n+1))
+	return as(b.FromInt32(i, 1, n)), as(b.FromFloats(h, 1, n))
 }
 
 // RelAttend is Inkling 2's attention for one query (engine.RelAttention),
@@ -246,9 +263,10 @@ func (b *Backend) RelAttend(q, k, v, rel, relProj, sinks engine.Tensor, pos, win
 	}
 	n -= base
 	idx, hidden := b.relInputsFor(replay, pos, window, extent, base, n)
+	zero := b.zeroSinks(H)
 	per := H / G
 	shape := []int{1, H, 1, D}
-	return b.op(engine.F32, shape, []*tensor{tq, tk, tv, tr, tp, proj, tsk, idx, hidden}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+	return b.op(engine.F32, shape, []*tensor{tq, tk, tv, tr, tp, proj, tsk, idx, hidden, zero}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		cn, cH, cG, cper, cD := C.int64_t(n), C.int64_t(H), C.int64_t(G), C.int64_t(per), C.int64_t(D)
 		// The slots base.. of the caches, where they are: the keys
 		// ne (D, n, G), the values kept tokens innermost ne (n, D, G).
@@ -272,15 +290,18 @@ func (b *Backend) RelAttend(q, k, v, rel, relProj, sinks engine.Tensor, pos, win
 			pT = C.ggml_scale(ctx, C.ggml_cont(ctx, C.ggml_transpose(ctx, f32(ctx, tp))), C.float(relScale))
 		}
 		rows := C.ggml_mul_mat(ctx, C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tr)), C.int64_t(dr), cH), pT)
+		// The sink logit t joins each head's softmax: exp(s - t)/(1 + sum
+		// exp(s - t)) is exp(s)/(exp(t) + sum exp(s)), so t leaves the
+		// table and the softmax takes a sink of zero, as llama.cpp does.
+		rows = C.ggml_sub(ctx, rows, C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tsk)), cH, 1))
 		bias := C.ggml_get_rows(ctx, C.ggml_reshape_3d(ctx, rows, cH, C.int64_t(extent+1), 1), C.ggml_reshape_2d(ctx, idx.t, cn, 1)) // ne (H, n, 1)
 		bias = C.ggml_cont(ctx, C.ggml_permute(ctx, bias, 2, 0, 1, 3))                                                               // ne (n, 1, H)
 		// The scores of head g*per+p are key head g against the query.
 		qq := C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, tq)), cD, cper, cG)
 		kq := C.ggml_reshape_3d(ctx, C.ggml_mul_mat(ctx, kk, qq), cn, 1, cH) // ne (n, per, G) -> (n, 1, H)
 		scores := C.ggml_add(ctx, C.ggml_scale(ctx, kq, C.float(scale)), bias)
-		sink := C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, tsk)), 1, 1, cH)
-		p := C.ggml_soft_max_ext(ctx, C.ggml_concat(ctx, scores, sink, 0), hidden.t, 1, 0) // ne (n+1, 1, H)
-		p = C.ggml_cont(ctx, C.ggml_view_3d(ctx, p, cn, 1, cH, p.nb[1], p.nb[2], 0))
+		p := C.ggml_soft_max_ext(ctx, scores, hidden.t, 1, 0) // ne (n, 1, H)
+		C.ggml_soft_max_add_sinks(p, zero.t)
 		out := C.ggml_mul_mat(ctx, vT, C.ggml_reshape_3d(ctx, p, cn, cper, cG)) // ne (D, per, G)
 		return C.ggml_reshape_4d(ctx, out, cD, 1, cH, 1)
 	})
@@ -305,9 +326,9 @@ type relRows struct {
 }
 
 // relRowsFor is, for the ql queries at qpos.. over the n cache slots that
-// hold positions base..base+n-1 and a sink after them: each slot's bias row
-// for each query (its distance, extent from there on), I32 [ql, n], and the
-// mask [ql, n+1] (-inf where the query does not see the slot). pass names
+// hold positions base..base+n-1: each slot's bias row for each query (its
+// distance, extent from there on), I32 [ql, n], and the mask [ql, n] (-inf
+// where the query does not see the slot). pass names
 // the forward pass, its position and length: the inputs of the pass before
 // are freed when another begins.
 func (b *Backend) relRowsFor(pass [2]int, qpos, ql, window, extent, base, n int) (idx, hidden *tensor) {
@@ -329,7 +350,7 @@ func (b *Backend) relRowsFor(pass [2]int, qpos, ql, window, extent, base, n int)
 	if in != nil {
 		return in.idx, in.hidden
 	}
-	iv, hv := make([]int32, ql*n), make([]float32, ql*(n+1))
+	iv, hv := make([]int32, ql*n), make([]float32, ql*n)
 	ninf := float32(math.Inf(-1))
 	for i := 0; i < ql; i++ {
 		for j := 0; j < n; j++ {
@@ -337,13 +358,13 @@ func (b *Backend) relRowsFor(pass [2]int, qpos, ql, window, extent, base, n int)
 			iv[i*n+j] = int32(extent)
 			switch {
 			case d < 0 || (window > 0 && d >= window):
-				hv[i*(n+1)+j] = ninf
+				hv[i*n+j] = ninf
 			case d < extent:
 				iv[i*n+j] = int32(d)
 			}
 		}
 	}
-	in = &relRows{idx: b.kept(as(b.FromInt32(iv, ql, n))), hidden: b.kept(as(b.FromFloats(hv, ql, n+1)))}
+	in = &relRows{idx: b.kept(as(b.FromInt32(iv, ql, n))), hidden: b.kept(as(b.FromFloats(hv, ql, n)))}
 	b.mu.Lock()
 	b.relRows[key] = in
 	b.mu.Unlock()
@@ -394,6 +415,8 @@ func (b *Backend) relAttendRows(tq, tk, tv, tr, tp, proj, tsk *tensor, pos, wind
 		inputs = append(inputs, pt.idx, pt.hidden)
 	}
 	f32read := os.Getenv("JANIS_GGML_REL_F32") == "1"
+	zero := b.zeroSinks(H)
+	inputs = append(inputs, zero)
 	return b.op(engine.F32, []int{1, H, L, D}, inputs, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		cL, cH, cG, cD, cper := C.int64_t(L), C.int64_t(H), C.int64_t(G), C.int64_t(D), C.int64_t(per)
 		kb, vb := tk.grp.base, tv.grp.base
@@ -406,10 +429,12 @@ func (b *Backend) relAttendRows(tq, tk, tv, tr, tp, proj, tsk *tensor, pos, wind
 		// Each head's bias at each distance for each query, ne (H, L,
 		// extent+1), turned to (H, extent+1, L).
 		rows := C.ggml_mul_mat(ctx, C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tr)), C.int64_t(dr), cH*cL), pT)
+		// Less each query's sink logit, which the softmax then takes as a
+		// sink of zero (RelAttend).
+		rows = C.ggml_sub(ctx, rows, C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tsk)), cH*cL, 1))
 		rows = C.ggml_cont(ctx, C.ggml_permute(ctx, C.ggml_reshape_3d(ctx, rows, cH, cL, C.int64_t(extent+1)), 0, 2, 1, 3))
 		// The queries with the scale in them: one pass over the scores less.
 		q4 := C.ggml_reshape_4d(ctx, C.ggml_scale(ctx, contig(ctx, f32(ctx, tq)), C.float(scale)), cD, cL, cper, cG)
-		sinks := C.ggml_cont(ctx, C.ggml_transpose(ctx, C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tsk)), cH, cL))) // ne (L, H)
 		var out *C.struct_ggml_tensor
 		for _, pt := range parts {
 			cn, ql, o := C.int64_t(pt.n), C.int64_t(pt.ql), C.size_t(pt.l0)
@@ -428,9 +453,8 @@ func (b *Backend) relAttendRows(tq, tk, tv, tr, tp, proj, tsk *tensor, pos, wind
 			qp := C.ggml_view_4d(ctx, q4, cD, ql, cper, cG, q4.nb[1], q4.nb[2], q4.nb[3], o*C.size_t(q4.nb[1]))
 			qp = C.ggml_reshape_3d(ctx, contig(ctx, qp), cD, ql*cper, cG)
 			scores := C.ggml_add(ctx, C.ggml_reshape_3d(ctx, C.ggml_mul_mat(ctx, kk, qp), cn, ql, cH), bias)
-			sp := contig(ctx, C.ggml_view_2d(ctx, sinks, ql, cH, sinks.nb[1], o*C.size_t(sinks.nb[0])))
-			p := C.ggml_soft_max_ext(ctx, C.ggml_concat(ctx, scores, C.ggml_reshape_3d(ctx, sp, 1, ql, cH), 0), pt.hidden.t, 1, 0)
-			p = C.ggml_cont(ctx, C.ggml_view_3d(ctx, p, cn, ql, cH, p.nb[1], p.nb[2], 0))
+			p := C.ggml_soft_max_ext(ctx, scores, pt.hidden.t, 1, 0)
+			C.ggml_soft_max_add_sinks(p, zero.t)
 			op := C.ggml_reshape_4d(ctx, C.ggml_mul_mat(ctx, vT, C.ggml_reshape_3d(ctx, p, cn, ql*cper, cG)), cD, ql, cper, cG)
 			if out == nil {
 				out = op

@@ -207,6 +207,8 @@ type Backend struct {
 	// caps holds, per (width, gate cap, up cap), the inverses of the caps
 	// CappedSwiGLU multiplies both halves by.
 	caps map[[3]float32]*tensor
+	// zeros holds a sink logit of zero per head count (zeroSinks).
+	zeros map[int]*tensor
 	// relRows holds a chunk's attention inputs for the pass that made them.
 	relRows map[[6]int]*relRows
 	relPass [2]int
