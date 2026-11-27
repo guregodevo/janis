@@ -1,10 +1,12 @@
-# Memdoor reviews and triages every pull request on a model inside the job:
-# Qwen3-8B on the runner's CPU, through janis. No key, so a pull request from
-# a fork is read too. Both are advisory: pr-triage's verdict and, on a local
-# model, pr-review's P0s are in the job summary, never a failed check.
+# Memdoor reviews and triages a pull request on a model inside the job:
+# Qwen3-8B on the runner's CPU, through janis. No key. Both are advisory:
+# pr-triage's verdict and, on a local model, pr-review's P0s are in the job
+# summary, never a failed check. Run by hand (Actions, "Run workflow", on
+# the pull request's branch): on every pull request the two jobs were up to
+# 30 minutes of a 4-vCPU runner each, and a pull request waited on them.
+# The tests a pull request runs are in ci.yml.
 name: memdoor
 on:
-  pull_request:
   workflow_dispatch:
 permissions:
   contents: read
