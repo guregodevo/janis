@@ -315,13 +315,14 @@ func (m *Model) NewSession() *qwen.Session {
 
 // chunkBytes is what a prompt chunk's forward holds for each of its tokens:
 // the routed experts' activations at their widest (TopK rows of twice the
-// intermediate size, four such tensors alive through the MLP) and the
-// states the pass keeps (forty of hidden floats). Measured on the published
-// 4-bit model, a batch of a 1,024-token chunk is 361 MiB, 0.35 MiB a token;
-// this counts 0.63.
+// intermediate size, a dozen such tensors through the MLP) and the states
+// the pass keeps to its end (the block outputs and the streams, two
+// hundred of hidden floats): 2.6 MiB on the published model. On an RTX
+// 5000 Ada with 8 GB free a 3.2k-token prompt fit at 1,024 by this count
+// and ran out of room at 2,048 (2026-11-27).
 func (m *Model) chunkBytes() int64 {
 	cfg := m.Cfg
-	return 4 * int64(4*cfg.TopK*2*cfg.Intermediate+40*cfg.Hidden)
+	return 4 * int64(12*cfg.TopK*2*cfg.Intermediate+200*cfg.Hidden)
 }
 
 // chunkContextBytes is what a chunk token holds for each token of the
