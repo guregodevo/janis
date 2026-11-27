@@ -1774,7 +1774,7 @@ func (b *Backend) appendCache(ta, tb *tensor, axis int, vt bool) engine.Tensor {
 	}
 	if grp == nil || grp.base == nil || ta.cacheLen != n || grp.cap < need || grp.vt != vt {
 		// A new buffer with room: the old cache is copied in by the flush.
-		spare := max(cacheSpare(need), b.reserved-need)
+		spare := reservedSpare(need, b.reserved, numel(shape)/need*2, b.devFree())
 		capShape := append([]int(nil), shape...)
 		capShape[axis] = (need + spare + kvPad - 1) / kvPad * kvPad
 		// The buffer's context also holds every prefix view made over its
@@ -1837,6 +1837,29 @@ func (b *Backend) poolBuffer(shape []int, vt bool) *tensor {
 	b.mu.Unlock()
 	b.track(out)
 	return out
+}
+
+// reservedSpare is the spare room, in tokens, of a cache buffer that holds
+// need tokens at perToken bytes each when the request reserved room for
+// reserved tokens: the reservation, unless it is more than a 256th of the
+// device's free memory, then what that holds, and never less than
+// cacheSpare. A model has many caches (Inkling 2 Mini: 96, 196 KB a token
+// between them) and each reserved the whole request: one with max_tokens
+// 120,000 asked for 23 GB and was refused ("no room on the device for the
+// cache", RTX 5000 Ada 32 GB, 2026-11-27) before it had written a token. A
+// cache past its room moves to a larger buffer, as one with no reservation.
+func reservedSpare(need, reserved, perToken int, free int64) int {
+	spare := cacheSpare(need)
+	want := reserved - need
+	if want <= spare {
+		return spare
+	}
+	if perToken > 0 && free > 0 {
+		if fits := int(free / 256 / int64(perToken)); fits < need+want {
+			want = fits - need
+		}
+	}
+	return max(spare, want)
 }
 
 // cacheGrow is the least spare room a cache buffer is made with, in tokens.

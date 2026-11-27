@@ -565,3 +565,27 @@ func TestF16BitsIsGGMLsHalf(t *testing.T) {
 		}
 	}
 }
+
+// A RESERVATION LARGER THAN THE DEVICE HOLDS IS CUT TO WHAT IT HOLDS.
+//
+// A request's max_tokens reserves each cache's room. 8 GB free and a cache
+// of 2 KB a token: 16,384 tokens are a 256th of it, so a reservation of
+// 10,000 tokens stands, one of 120,000 is cut to 16,384, and a cache
+// already past that keeps the spare room of one with no reservation.
+func TestAReservationIsCutToWhatTheDeviceHolds(t *testing.T) {
+	const free, perToken = 8 << 30, 2048
+	for _, c := range []struct{ need, reserved, want int }{
+		{1000, 10000, 9000},
+		{1000, 120000, 16384 - 1000},
+		{1000, 0, cacheSpare(1000)},
+		{30000, 120000, cacheSpare(30000)},
+	} {
+		if got := reservedSpare(c.need, c.reserved, perToken, free); got != c.want {
+			t.Errorf("%d tokens, %d reserved: %d spare, want %d", c.need, c.reserved, got, c.want)
+		}
+	}
+	// A device that does not say what it has free keeps the reservation.
+	if got := reservedSpare(1000, 120000, perToken, 0); got != 119000 {
+		t.Errorf("no free figure: %d spare, want 119000", got)
+	}
+}
