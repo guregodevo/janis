@@ -307,6 +307,10 @@ type RelAttention interface {
 	// It is asked before the stack's first use; false when it is too late
 	// or the backend keeps the rows as they are.
 	PairRows(w Tensor) bool
+	// CappedSwiGLU is tanh(gate/gateCap)*sigmoid(gate)*tanh(up/upCap) for
+	// gu [1, 1, k, 1, 2I] holding gate's I values then up's for each of k
+	// rows (PairRows) -> [1, 1, k, 1, I].
+	CappedSwiGLU(gu Tensor, gateCap, upCap float32) Tensor
 	// GateMix mixes h and message, both [1, 1, D]: with s their two
 	// weightless RMS norms side by side times downT [2D, rank],
 	// h*(1 - tanh(s·forgetT)) + message*tanh(s·admitT), forgetT and admitT

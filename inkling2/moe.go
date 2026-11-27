@@ -376,26 +376,30 @@ func (m *MoE) Forward(c *ctx, x engine.Tensor) engine.Tensor {
 
 	r := m.route(c, idx)
 	xe := c.Reshape(x, 1, L, 1, 1, hidden)
-	var gate, up engine.Tensor
-	switch {
-	case m.GateUp != nil && m.GateUp.paired:
-		gu := m.GateUp.forward(c, xe, r) // [1, L, k, 1, 2I]: gate's rows, then up's
-		gate, up = c.f32(c.Slice(gu, 4, 0, I)), c.f32(c.Slice(gu, 4, I, 2*I))
-	case m.GateUp != nil:
-		gu := c.Reshape(m.GateUp.forward(c, xe, r), 1, L, k, I, 2)
-		gate = c.f32(c.Reshape(c.Slice(gu, 4, 0, 1), 1, L, k, 1, I))
-		up = c.f32(c.Reshape(c.Slice(gu, 4, 1, 2), 1, L, k, 1, I))
-	default:
-		gate, up = c.f32(m.Gate.forward(c, xe, r)), c.f32(m.Up.forward(c, xe, r))
-	}
-	// SwiGLU with both branches softly capped: tanh(x/cap)*cap.
 	var act engine.Tensor
-	if fused {
-		act = c.Mul(c.Tanh(c.ScalarMul(gate, 1/m.GateCap)), c.Sigmoid(gate))
-		act = c.Mul(act, c.Tanh(c.ScalarMul(up, 1/m.UpCap)))
+	if fused && m.GateUp != nil && m.GateUp.paired {
+		act = c.rel.CappedSwiGLU(c.f32(m.GateUp.forward(c, xe, r)), m.GateCap, m.UpCap)
 	} else {
-		act = c.Mul(c.ScalarMul(c.Tanh(c.ScalarMul(gate, 1/m.GateCap)), m.GateCap), c.Sigmoid(gate))
-		act = c.Mul(act, c.ScalarMul(c.Tanh(c.ScalarMul(up, 1/m.UpCap)), m.UpCap))
+		var gate, up engine.Tensor
+		switch {
+		case m.GateUp != nil && m.GateUp.paired:
+			gu := m.GateUp.forward(c, xe, r) // [1, L, k, 1, 2I]: gate's rows, then up's
+			gate, up = c.f32(c.Slice(gu, 4, 0, I)), c.f32(c.Slice(gu, 4, I, 2*I))
+		case m.GateUp != nil:
+			gu := c.Reshape(m.GateUp.forward(c, xe, r), 1, L, k, I, 2)
+			gate = c.f32(c.Reshape(c.Slice(gu, 4, 0, 1), 1, L, k, 1, I))
+			up = c.f32(c.Reshape(c.Slice(gu, 4, 1, 2), 1, L, k, 1, I))
+		default:
+			gate, up = c.f32(m.Gate.forward(c, xe, r)), c.f32(m.Up.forward(c, xe, r))
+		}
+		// SwiGLU with both branches softly capped: tanh(x/cap)*cap.
+		if fused {
+			act = c.Mul(c.Tanh(c.ScalarMul(gate, 1/m.GateCap)), c.Sigmoid(gate))
+			act = c.Mul(act, c.Tanh(c.ScalarMul(up, 1/m.UpCap)))
+		} else {
+			act = c.Mul(c.ScalarMul(c.Tanh(c.ScalarMul(gate, 1/m.GateCap)), m.GateCap), c.Sigmoid(gate))
+			act = c.Mul(act, c.ScalarMul(c.Tanh(c.ScalarMul(up, 1/m.UpCap)), m.UpCap))
+		}
 	}
 
 	out := c.f32(c.Reshape(m.Down.forward(c, c.model(act), r), 1, L, k, hidden))

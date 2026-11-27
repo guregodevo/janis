@@ -75,6 +75,42 @@ func (b *Backend) RouteWeights(scores, idx engine.Tensor, scale float32) engine.
 	})
 }
 
+// CappedSwiGLU is the experts' activation on both halves at once
+// (engine.RelAttention): one multiply by the two caps' inverses, one tanh
+// and one sigmoid over gate and up together, then the halves multiplied
+// as views of those.
+func (b *Backend) CappedSwiGLU(gu engine.Tensor, gateCap, upCap float32) engine.Tensor {
+	tg := as(gu)
+	K, I := tg.shape[2], tg.shape[4]/2
+	key := [3]float32{float32(I), gateCap, upCap}
+	b.mu.Lock()
+	caps := b.caps[key]
+	b.mu.Unlock()
+	if caps == nil {
+		v := make([]float32, 2*I)
+		for i := 0; i < I; i++ {
+			v[i], v[I+i] = 1/gateCap, 1/upCap
+		}
+		caps = b.kept(as(b.FromFloats(v, 2*I)))
+		b.mu.Lock()
+		if b.caps == nil {
+			b.caps = map[[3]float32]*tensor{}
+		}
+		b.caps[key] = caps
+		b.mu.Unlock()
+	}
+	return b.op(engine.F32, []int{1, 1, K, 1, I}, []*tensor{tg, caps}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		cI, cK := C.int64_t(I), C.int64_t(K)
+		g := C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tg)), 2*cI, cK)
+		t := C.ggml_tanh(ctx, C.ggml_mul(ctx, g, caps.t))
+		s := C.ggml_sigmoid(ctx, g)
+		half := C.size_t(I) * C.size_t(t.nb[0])
+		act := C.ggml_mul(ctx, C.ggml_view_2d(ctx, t, cI, cK, t.nb[1], 0), C.ggml_view_2d(ctx, t, cI, cK, t.nb[1], half))
+		act = C.ggml_mul(ctx, act, C.ggml_view_2d(ctx, s, cI, cK, s.nb[1], 0))
+		return C.ggml_reshape_4d(ctx, act, cI, 1, cK, 1)
+	})
+}
+
 // PairRows marks a stack of experts not yet repacked: its repack puts the
 // even output rows first, then the odd ones (engine.RelAttention).
 func (b *Backend) PairRows(w engine.Tensor) bool {

@@ -204,6 +204,9 @@ type Backend struct {
 	// lagOrder holds, per (heads, kernel), the index that puts a dynamic
 	// convolution's taps in the window's order (ConvTapsDyn).
 	lagOrder map[[2]int]*tensor
+	// caps holds, per (width, gate cap, up cap), the inverses of the caps
+	// CappedSwiGLU multiplies both halves by.
+	caps map[[3]float32]*tensor
 	// rec0 is the decode step being recorded (replay.go), nil otherwise.
 	rec0 *recording
 }
