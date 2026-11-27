@@ -250,7 +250,12 @@ func (b *Backend) RelAttend(q, k, v, rel, relProj, sinks engine.Tensor, pos, win
 		return b.relAttendRows(tq, tk, tv, tr, tp, proj, tsk, pos, window, scale, relScale)
 	}
 	replay := tk.replay && tv.replay
-	n := S
+	// The keys' and the values' buffers are sized apart, from the memory
+	// free when each was made (reservedSpare): a recorded step reads no
+	// further than the shorter of the two. Read to the keys' bucket, the
+	// values' view ran past its buffer (an abort at 11,008 tokens of a
+	// reply, RTX 5000 Ada, 2026-11-27).
+	n := min(S, tv.shape[2])
 	if replay {
 		b.mu.Lock()
 		rs := b.rec0
