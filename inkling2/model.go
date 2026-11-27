@@ -103,7 +103,6 @@ func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, erro
 		return nil, err
 	}
 	c := &ctx{Backend: b, ops: ops, ones: map[int]engine.Tensor{}}
-	c.rel, _ = b.(engine.RelAttention)
 	switch dt {
 	case "F32":
 		c.dtype = engine.F32
@@ -113,6 +112,11 @@ func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, erro
 		c.dtype = engine.BF16
 	default:
 		return nil, fmt.Errorf("embed_norm.weight is %s, not a float", dt)
+	}
+	if c.rel, _ = b.(engine.RelAttention); c.rel != nil {
+		// Such a backend computes in float32 whatever the checkpoint holds:
+		// a cast to the checkpoint's dtype and back is two copies a use.
+		c.dtype = engine.F32
 	}
 	c.one = b.FromFloats([]float32{1}, 1)
 	if cfg.StreamExperts {
@@ -162,6 +166,8 @@ func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, erro
 // sees the output of every visit.
 func (m *Model) hidden(ids engine.Tensor, L, pos int, caches []qwen.LayerCache, trace func(visit int, h engine.Tensor)) engine.Tensor {
 	c, cfg := m.c, m.Cfg
+	c.stacks = nil
+	defer func() { c.stacks = nil }()
 	masks := &maskMaker{c: c, cfg: cfg}
 	h := m.EmbedNorm.Forward(c, c.Reshape(m.Embed.Forward(c, ids), 1, L, cfg.Hidden))
 	h = m.splice(h, pos, L)

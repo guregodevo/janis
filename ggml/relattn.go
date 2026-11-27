@@ -44,6 +44,21 @@ func (b *Backend) StepFloats(pos int, f func(pos int) []float32, shape ...int) e
 	return t
 }
 
+// L2Clip is x*min(1, t/|x|) = t*x/max(|x|, t), and ggml's l2_norm(x, eps)
+// is x/max(|x|, eps): two nodes (engine.RelAttention).
+func (b *Backend) L2Clip(x engine.Tensor, threshold float32) engine.Tensor {
+	return b.unary(x, func(c *C.struct_ggml_context, t *C.struct_ggml_tensor) *C.struct_ggml_tensor {
+		return C.ggml_scale(c, C.ggml_l2_norm(c, t, C.float(threshold)), C.float(threshold))
+	})
+}
+
+// RMS is RMSNorm with no weight (engine.RelAttention).
+func (b *Backend) RMS(x engine.Tensor, eps float32) engine.Tensor {
+	return b.unary(x, func(c *C.struct_ggml_context, t *C.struct_ggml_tensor) *C.struct_ggml_tensor {
+		return C.ggml_rms_norm(c, t, C.float(eps))
+	})
+}
+
 // relInputsFor is the distances and the mask of a query at pos over n
 // cache slots: inputs of the step being recorded when the caches are its
 // padded views, tensors made for this call otherwise.

@@ -151,9 +151,19 @@ func (ld *loader) queries(name string) engine.Tensor {
 	return ld.c.Transpose(ld.c.Reshape(q, n, dims), 1, 0)
 }
 
-// dense loads an unquantized linear layer's weight [out, in] as [in, out].
+// dense loads an unquantized linear layer's weight [out, in] as [in, out],
+// in the dtype the stream is computed in.
 func (ld *loader) dense(name string) engine.Tensor {
 	w := ld.tensor(name)
+	if w == nil {
+		return nil
+	}
+	return ld.c.model(ld.c.Transpose(w, 1, 0))
+}
+
+// f32T is dense in float32.
+func (ld *loader) f32T(name string) engine.Tensor {
+	w := ld.f32(name)
 	if w == nil {
 		return nil
 	}
@@ -171,8 +181,8 @@ type MessageGate struct {
 func (ld *loader) gate(prefix string) *MessageGate {
 	return &MessageGate{
 		DownT:   ld.dense(prefix + ".down_proj.weight"),
-		ForgetT: ld.dense(prefix + ".forget_gate_proj.weight"),
-		AdmitT:  ld.dense(prefix + ".message_gate_proj.weight"),
+		ForgetT: ld.f32T(prefix + ".forget_gate_proj.weight"),
+		AdmitT:  ld.f32T(prefix + ".message_gate_proj.weight"),
 	}
 }
 
@@ -181,8 +191,8 @@ func (g *MessageGate) Forward(c *ctx, h, message engine.Tensor) engine.Tensor {
 	h = c.f32(h)
 	s := c.Concat(c.rms(h, defaultEps), c.rms(message, defaultEps), 2)
 	s = c.f32(c.MatMul(c.model(s), g.DownT))
-	forget := c.Tanh(c.MatMul(s, c.f32(g.ForgetT)))
-	admit := c.Tanh(c.MatMul(s, c.f32(g.AdmitT)))
+	forget := c.Tanh(c.MatMul(s, g.ForgetT))
+	admit := c.Tanh(c.MatMul(s, g.AdmitT))
 	keep := c.ScalarAdd(c.ScalarMul(forget, -1), 1)
 	return c.Add(c.Mul(h, keep), c.Mul(message, admit))
 }

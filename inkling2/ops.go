@@ -17,6 +17,35 @@ type ctx struct {
 	ones  map[int]engine.Tensor
 
 	experts *expertCache // nil when the experts are resident
+
+	// stacks holds, for one forward pass, the block outputs already put
+	// side by side for a depth attention: each mix adds its own state to a
+	// stack the mixes before it built.
+	stacks map[stackKey]engine.Tensor
+}
+
+// stackKey names a run of block outputs by its ends and its length.
+type stackKey struct {
+	first, last engine.Tensor
+	n           int
+}
+
+// stack is blocks side by side, [1, L, len(blocks), D], oldest first.
+func (c *ctx) stack(blocks []engine.Tensor) engine.Tensor {
+	n := len(blocks)
+	key := stackKey{blocks[0], blocks[n-1], n}
+	if s, ok := c.stacks[key]; ok {
+		return s
+	}
+	s := c.ExpandDims(blocks[n-1], 2)
+	if n > 1 {
+		s = c.Concat(c.stack(blocks[:n-1]), s, 2)
+	}
+	if c.stacks == nil {
+		c.stacks = map[stackKey]engine.Tensor{}
+	}
+	c.stacks[key] = s
+	return s
 }
 
 func (c *ctx) f32(x engine.Tensor) engine.Tensor   { return c.Cast(x, engine.F32) }
@@ -30,6 +59,9 @@ func (c *ctx) sumLast(x engine.Tensor) engine.Tensor {
 
 // rms is RMS normalization with no weight, in float32.
 func (c *ctx) rms(x engine.Tensor, eps float32) engine.Tensor {
+	if c.rel != nil {
+		return c.rel.RMS(x, eps)
+	}
 	s := x.Shape()
 	return c.RMSNorm(x, c.ones[s[len(s)-1]], eps)
 }
@@ -43,6 +75,9 @@ func (c *ctx) l2clip(x, scale engine.Tensor, threshold float32) engine.Tensor {
 	s := c.f32(x)
 	if scale != nil {
 		s = c.Mul(s, scale)
+	}
+	if c.rel != nil {
+		return c.rel.L2Clip(s, threshold)
 	}
 	norm := c.ops.Sqrt(c.sumLast(c.Mul(s, s)))
 	limit := c.FromFloats([]float32{threshold}, 1)
@@ -63,8 +98,8 @@ func (c *ctx) pick(x engine.Tensor, i int) engine.Tensor {
 // [1, L, Q, D].
 func (c *ctx) depthAttention(blocks []engine.Tensor, current, queryT engine.Tensor) engine.Tensor {
 	stacked := c.ExpandDims(current, 2)
-	for i := len(blocks) - 1; i >= 0; i-- {
-		stacked = c.Concat(c.ExpandDims(blocks[i], 2), stacked, 2)
+	if len(blocks) > 0 {
+		stacked = c.Concat(c.stack(blocks), stacked, 2)
 	}
 	dims := current.Shape()[2]
 	scores := c.ScalarMul(c.MatMul(stacked, queryT), float32(1/math.Sqrt(float64(dims))))

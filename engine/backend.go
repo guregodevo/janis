@@ -268,6 +268,11 @@ type RelAttention interface {
 	// StepFloats is a tensor of shape holding f(pos), which a recorded
 	// step computes again for each position it runs at.
 	StepFloats(pos int, f func(pos int) []float32, shape ...int) Tensor
+	// L2Clip shrinks each row of x (over the last axis) whose L2 norm is
+	// above threshold down to it.
+	L2Clip(x Tensor, threshold float32) Tensor
+	// RMS is RMSNorm with no weight.
+	RMS(x Tensor, eps float32) Tensor
 }
 
 // LoopOps is implemented by backends that carry the operations the looped
