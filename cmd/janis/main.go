@@ -3,8 +3,8 @@
 //
 //	janis pull [NAME]                download a model (none: the one that fits this machine)
 //	janis list                       the installed models
-//	janis serve [--port N] [--model NAME] [--host ADDR] [--detach]
-//	janis start [--port N] [--model NAME] [--host ADDR] [--log FILE]   serve --detach
+//	janis serve [--port N] [--model NAME] [--host ADDR] [--detach] [--edit]
+//	janis start [--port N] [--model NAME] [--host ADDR] [--log FILE] [--edit]   serve --detach
 //	janis stop [--port N]            stop it gracefully (SIGKILL after 10 s)
 //	janis restart [--port N] [flags] stop, then start on the same flags, or the ones given; none running: start
 //	janis status [--port N]          pid, version, model, uptime, and whether /health answers
@@ -60,10 +60,10 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage: janis pull [NAME]
        janis list
-       janis serve   [--port 8090] [--host 127.0.0.1] [--model NAME] [--detach] [--log FILE]
-       janis start   [--port 8090] [--host 127.0.0.1] [--model NAME] [--log FILE]
+       janis serve   [--port 8090] [--host 127.0.0.1] [--model NAME] [--detach] [--log FILE] [--edit]
+       janis start   [--port 8090] [--host 127.0.0.1] [--model NAME] [--log FILE] [--edit]
        janis stop    [--port 8090]
-       janis restart [--port 8090] [--host ADDR] [--model NAME] [--log FILE]
+       janis restart [--port 8090] [--host ADDR] [--model NAME] [--log FILE] [--edit]
        janis status  [--port 8090]
        janis upgrade [--check] [--force] [VERSION]
        janis version`)
@@ -90,7 +90,7 @@ func run(args []string) {
 	detach := f.fs.Bool("detach", false, "pull the model if missing, serve in the background, and return once it has answered (janis start)")
 	_ = f.fs.Parse(args)
 	if *detach {
-		detachServe(*f.host, *f.port, f.modelName(), *f.log)
+		detachServe(*f.host, *f.port, f.modelName(), *f.log, *f.edit)
 		return
 	}
 	serveForeground(f)

@@ -21,7 +21,7 @@ import (
 // model. Its first answer lays the weights out for the CPU's kernels (half a
 // minute for an 8B on four vCPUs): paid here, not by the first client. The
 // server's output goes to logPath; a server that dies prints it and fails.
-func detachServe(host string, port int, model, logPath string) {
+func detachServe(host string, port int, model, logPath string, edit bool) {
 	// Another server already on the port would answer for this one.
 	addr := net.JoinHostPort(host, fmt.Sprint(port))
 	if l, err := net.Listen("tcp", addr); err != nil {
@@ -55,6 +55,9 @@ func detachServe(host string, port int, model, logPath string) {
 		fail(err)
 	}
 	args := []string{"serve", "--host", host, "--port", fmt.Sprint(port), "--model", model}
+	if edit {
+		args = append(args, "--edit")
+	}
 	cmd := exec.Command(self, args...)
 	cmd.Stdout, cmd.Stderr = log, log
 	cmd.Env = append(os.Environ(), logEnv+"="+logPath)

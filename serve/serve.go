@@ -60,6 +60,9 @@ type Server struct {
 	// Version is the build's release tag, answered by GET /health ("" says
 	// nothing).
 	Version string
+	// Edit serves the weight-edit endpoints (weights.go): GET and POST
+	// /v1/weights. Off unless janis serve --edit.
+	Edit bool
 
 	load    Loader
 	work    chan func() // every call into the engine, one at a time, on one OS thread
@@ -182,6 +185,9 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
 	mux.HandleFunc("POST /v1/systemone", s.handleDecide)
+	if s.Edit {
+		s.weightRoutes(mux)
+	}
 	return mux
 }
 

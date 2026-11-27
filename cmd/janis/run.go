@@ -55,6 +55,7 @@ type runState struct {
 	Port    int       `json:"port"`
 	Model   string    `json:"model,omitempty"`
 	Log     string    `json:"log,omitempty"`
+	Edit    bool      `json:"edit,omitempty"`
 	Started time.Time `json:"started"`
 }
 
@@ -112,6 +113,7 @@ type serveFlags struct {
 	fs               *flag.FlagSet
 	port             *int
 	host, model, log *string
+	edit             *bool
 }
 
 func newServeFlags(name string) serveFlags { return newServeFlagSet(name, flag.ExitOnError) }
@@ -124,6 +126,7 @@ func newServeFlagSet(name string, handling flag.ErrorHandling) serveFlags {
 		host:  fs.String("host", defaultHost, "the address to bind (0.0.0.0 for the network)"),
 		model: fs.String("model", "", "the installed model to load now (default: the first a request names; in the background, the model that fits this machine)"),
 		log:   fs.String("log", "", "in the background, the server's output (default: janis-PORT.log in the temp directory)"),
+		edit:  fs.Bool("edit", false, "serve GET and POST /v1/weights, to read and replace the loaded model's weights (loopback hosts only)"),
 	}
 }
 
@@ -132,6 +135,9 @@ func (f serveFlags) modelName() string { return strings.TrimPrefix(*f.model, "ml
 // serveForeground is `janis serve`: it serves until SIGTERM, Ctrl-C or its
 // terminal closing (SIGHUP), then shuts down gracefully (shutdown).
 func serveForeground(f serveFlags) {
+	if *f.edit && !loopback(*f.host) {
+		fail(fmt.Errorf("janis serve --edit: %s is not a loopback address; the weight endpoints serve this machine only", *f.host))
+	}
 	addr := net.JoinHostPort(*f.host, fmt.Sprint(*f.port))
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -142,8 +148,8 @@ func serveForeground(f serveFlags) {
 		l.Close()
 		fail(err)
 	}
-	srv.Version = version
-	st := runState{PID: os.Getpid(), Host: *f.host, Port: *f.port, Model: f.modelName(), Log: os.Getenv(logEnv), Started: time.Now().UTC()}
+	srv.Version, srv.Edit = version, *f.edit
+	st := runState{PID: os.Getpid(), Host: *f.host, Port: *f.port, Model: f.modelName(), Log: os.Getenv(logEnv), Edit: *f.edit, Started: time.Now().UTC()}
 	if err := st.write(); err != nil {
 		fmt.Fprintf(os.Stderr, "janis serve: no state file, janis stop will not find this server: %v\n", err)
 	}
@@ -155,6 +161,9 @@ func serveForeground(f serveFlags) {
 	served := make(chan error, 1)
 	go func() { served <- hs.Serve(l) }()
 	fmt.Printf("janis serving on http://%s/v1 — GET /v1/models, POST /v1/chat/completions, POST /v1/systemone (pid %d)\n", addr, st.PID)
+	if st.Edit {
+		fmt.Printf("janis: weight edits on — GET and POST /v1/weights\n")
+	}
 
 	select {
 	case err := <-served:
@@ -236,7 +245,7 @@ func parseServeArgs(args []string) (runState, bool) {
 	if f.fs.Parse(args) != nil || *detach {
 		return runState{}, false
 	}
-	return runState{Host: *f.host, Port: *f.port, Model: f.modelName(), Log: *f.log}, true
+	return runState{Host: *f.host, Port: *f.port, Model: f.modelName(), Log: *f.log, Edit: *f.edit}, true
 }
 
 // startCmd is `janis start`: `janis serve --detach`.
@@ -246,7 +255,7 @@ func startCmd(args []string) {
 	if st, err := liveState(*f.port); err == nil {
 		fail(fmt.Errorf("janis is serving on port %d already (pid %d): janis restart replaces it", *f.port, st.PID))
 	}
-	detachServe(*f.host, *f.port, f.modelName(), *f.log)
+	detachServe(*f.host, *f.port, f.modelName(), *f.log, *f.edit)
 }
 
 func portFlag(name string, args []string) int {
@@ -353,19 +362,19 @@ func restartCmd(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	host, model, logPath := restartFlags(st, f)
+	host, model, logPath, edit := restartFlags(st, f)
 	if running(st.PID) {
 		stopServer(st)
 	} else {
 		_ = os.Remove(statePath(*f.port))
 	}
-	detachServe(host, *f.port, model, logPath)
+	detachServe(host, *f.port, model, logPath, edit)
 }
 
-// restartFlags are the saved server's host, model and log, each replaced by
-// the flag given on the command line.
-func restartFlags(st runState, f serveFlags) (host, model, logPath string) {
-	host, model, logPath = st.Host, st.Model, st.Log
+// restartFlags are the saved server's host, model, log and --edit, each
+// replaced by the flag given on the command line.
+func restartFlags(st runState, f serveFlags) (host, model, logPath string, edit bool) {
+	host, model, logPath, edit = st.Host, st.Model, st.Log, st.Edit
 	f.fs.Visit(func(fl *flag.Flag) {
 		switch fl.Name {
 		case "host":
@@ -374,9 +383,20 @@ func restartFlags(st runState, f serveFlags) (host, model, logPath string) {
 			model = f.modelName()
 		case "log":
 			logPath = *f.log
+		case "edit":
+			edit = *f.edit
 		}
 	})
-	return host, model, logPath
+	return host, model, logPath, edit
+}
+
+// loopback is whether host names this machine only.
+func loopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // statusCmd is `janis status`: the pid, the version the server reports, the
