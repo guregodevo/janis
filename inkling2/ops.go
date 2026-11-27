@@ -85,6 +85,16 @@ func (c *ctx) l2clip(x, scale engine.Tensor, threshold float32) engine.Tensor {
 	return c.Mul(s, factor)
 }
 
+// l2unit is l2clip divided by threshold, on a backend whose attention takes
+// the threshold with its own scale.
+func (c *ctx) l2unit(x, scale engine.Tensor, threshold float32) engine.Tensor {
+	s := c.f32(x)
+	if scale != nil {
+		s = c.Mul(s, scale)
+	}
+	return c.rel.L2Unit(s, threshold)
+}
+
 // pick takes row i of the queries axis of a depth attention output
 // [1, L, Q, D] -> [1, L, D].
 func (c *ctx) pick(x engine.Tensor, i int) engine.Tensor {
@@ -120,7 +130,7 @@ func (c *ctx) shortConv(x, w engine.Tensor, cache *VisitCache, slot int) engine.
 	k := w.Shape()[1]
 	if window := c.tapWindow(x, cache.Conv[slot]); window != nil {
 		if out := c.rel.ConvTaps(window, w); out != nil {
-			cache.Conv[slot] = c.Slice(window, 2, 1, k)
+			cache.Conv[slot] = window
 			return c.model(out)
 		}
 	}
@@ -132,16 +142,14 @@ func (c *ctx) shortConv(x, w engine.Tensor, cache *VisitCache, slot int) engine.
 }
 
 // tapWindow is one token's convolution input per channel, [1, C, K] with
-// the newest last, on a backend that takes it so (engine.RelAttention):
-// the tail is kept [1, C, K-1] there, and the token joins it with no copy
-// of the tail's rows turned around. Nil for more than one token, at the
-// first one, and on any other backend.
-func (c *ctx) tapWindow(x, tail engine.Tensor) engine.Tensor {
-	s := x.Shape()
-	if c.rel == nil || s[1] != 1 || tail == nil {
+// the newest last, on a backend that keeps the last window so
+// (engine.RelAttention): the token is shifted into it. Nil for more than
+// one token, at the first one, and on any other backend.
+func (c *ctx) tapWindow(x, last engine.Tensor) engine.Tensor {
+	if c.rel == nil || x.Shape()[1] != 1 || last == nil {
 		return nil
 	}
-	return c.Concat(tail, c.Reshape(c.f32(x), 1, s[2], 1), 2)
+	return c.rel.ShiftIn(last, c.f32(x))
 }
 
 func (c *ctx) convWindow(x, tail engine.Tensor, k int) engine.Tensor {

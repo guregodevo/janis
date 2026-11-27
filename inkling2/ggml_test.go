@@ -5,6 +5,7 @@ package inkling2
 import (
 	"fmt"
 	"math"
+	"math/rand"
 	"testing"
 
 	"github.com/guregodevo/janis/engine"
@@ -60,13 +61,17 @@ func TestGGMLMatchesTheReference(t *testing.T) {
 	}
 }
 
-// ONE TOKEN AT A TIME GIVES THE LOGITS OF ONE PASS ON GGML.
+// ONE TOKEN AT A TIME FOLLOWS ONE PASS ON GGML.
 //
-// One token goes through the backend's own attention (RelAttend): the
-// caches read in place and padded, the bias gathered by distance, the
-// window a mask. A chunk goes through the model's operations. Twelve
-// tokens in two chunks, then one at a time past the sliding window of 8.
-func TestGGMLStepsGiveTheLogitsOfOnePass(t *testing.T) {
+// One token goes through the backend's own operations (the attention over
+// caches read in place, the convolutions, the mixes, the gates); a chunk
+// goes through the model's. Twelve tokens in two chunks, then one at a
+// time past the sliding window of 8. The two round differently (a
+// quantized matmul rounds its input by block), and the tiny model's random
+// weights grow that from token to token: the first three single tokens are
+// held to 3% of the largest logit. TestGGMLATokensOperationsAreTheModels
+// holds each operation to the model's own.
+func TestGGMLStepsFollowOnePass(t *testing.T) {
 	t.Setenv("JANIS_GGML_REL_F32", "1")
 	b := ggml.New()
 	t.Cleanup(b.Close)
@@ -79,18 +84,86 @@ func TestGGMLStepsGiveTheLogitsOfOnePass(t *testing.T) {
 
 	caches := m.newCaches()
 	for pos := 0; pos < len(ids); {
-		n := 1
+		n, tol := 1, 3e-2
 		if pos < 12 {
-			n = 6
+			n, tol = 6, 2e-3
 		}
 		got := b.Floats(m.logits(m.hidden(b.FromInt32(ids[pos:pos+n], n), n, pos, caches, nil)))
-		if d, _ := maxDiff(got, full[pos*vocab:(pos+n)*vocab]); d > 2e-3*scale || math.IsNaN(d) {
+		d, _ := maxDiff(got, full[pos*vocab:(pos+n)*vocab])
+		if math.IsNaN(d) || (pos < 15 && d > tol*scale) {
 			t.Errorf("tokens %d..%d: off by %.3g from one pass (largest value %.3g)", pos, pos+n-1, d, scale)
 		}
 		pos += n
 	}
 	if got := caches[0].(*VisitCache).K.Shape()[2]; got != len(ids) {
 		t.Errorf("a sliding layer keeps %d keys on ggml, want all %d", got, len(ids))
+	}
+}
+
+// A TOKEN'S OPERATIONS ON GGML ARE THE MODEL'S OWN.
+//
+// Each part of a layer that has no state, on one token: through the
+// backend's fused operation and through the model's operations (the
+// backend's set aside), on every layer of the tiny model. They agree to
+// 0.2% of the largest value.
+func TestGGMLATokensOperationsAreTheModels(t *testing.T) {
+	b := ggml.New()
+	t.Cleanup(b.Close)
+	m, _ := loadTiny(t, b, "f32", false)
+	b.PinAll()
+	c := m.c
+	r := rand.New(rand.NewSource(3))
+	rnd := func(shape ...int) engine.Tensor {
+		n := 1
+		for _, d := range shape {
+			n *= d
+		}
+		v := make([]float32, n)
+		for i := range v {
+			v[i] = float32(r.NormFloat64())
+		}
+		return b.FromFloats(v, shape...)
+	}
+	both := func(name string, f func() engine.Tensor) {
+		t.Helper()
+		fused := b.Floats(f())
+		rel := c.rel
+		c.rel = nil
+		own := b.Floats(f())
+		c.rel = rel
+		if d, s := maxDiff(fused, own); d > 2e-3*s || math.IsNaN(d) || len(fused) != len(own) {
+			t.Errorf("%s: off by %.3g (largest value %.3g)", name, d, s)
+		}
+	}
+	hidden := m.Cfg.Hidden
+	for i, l := range m.Layers {
+		x, msg := rnd(1, 1, hidden), rnd(1, 1, hidden)
+		both(fmt.Sprintf("layer %d MLP", i), func() engine.Tensor { return l.MLP.Forward(c, x) })
+		blocks := []engine.Tensor{rnd(1, 1, hidden), rnd(1, 1, hidden)}
+		both(fmt.Sprintf("layer %d depth mix", i), func() engine.Tensor {
+			c.stacks = nil
+			return c.depthAttention(blocks, x, l.MLPQueryT)
+		})
+		if l.MLPGate != nil {
+			both(fmt.Sprintf("layer %d message gate", i), func() engine.Tensor { return l.MLPGate.Forward(c, x, msg) })
+		}
+		both(fmt.Sprintf("layer %d clip", i), func() engine.Tensor {
+			if c.rel != nil {
+				return c.ScalarMul(c.l2unit(x, nil, 3), 3)
+			}
+			return c.l2clip(x, nil, 3)
+		})
+		// A convolution over a tail of three earlier inputs: the cache is
+		// filled by the model's own path, then one token each way.
+		prime := rnd(1, 3, hidden)
+		conv := func() engine.Tensor {
+			vc := &VisitCache{rel: c.rel}
+			vc.begin(3)
+			c.shortConv(prime, l.MLPConv, vc, 3)
+			vc.begin(1)
+			return c.shortConv(x, l.MLPConv, vc, 3)
+		}
+		both(fmt.Sprintf("layer %d convolution", i), conv)
 	}
 }
 

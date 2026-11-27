@@ -8,6 +8,7 @@ package ggml
 import "C"
 
 import (
+	"fmt"
 	"github.com/guregodevo/janis/engine"
 	"math"
 	"os"
@@ -51,6 +52,38 @@ func (b *Backend) L2Clip(x engine.Tensor, threshold float32) engine.Tensor {
 	return b.unary(x, func(c *C.struct_ggml_context, t *C.struct_ggml_tensor) *C.struct_ggml_tensor {
 		return C.ggml_scale(c, C.ggml_l2_norm(c, t, C.float(threshold)), C.float(threshold))
 	})
+}
+
+// L2Unit is L2Clip without its last scale (engine.RelAttention): what
+// reads it takes the threshold with a scale of its own.
+func (b *Backend) L2Unit(x engine.Tensor, threshold float32) engine.Tensor {
+	return b.unary(x, func(c *C.struct_ggml_context, t *C.struct_ggml_tensor) *C.struct_ggml_tensor {
+		return C.ggml_l2_norm(c, t, C.float(threshold))
+	})
+}
+
+// RouteWeights is the chosen experts' scores over their sum, scaled
+// (engine.RelAttention).
+func (b *Backend) RouteWeights(scores, idx engine.Tensor, scale float32) engine.Tensor {
+	ts, ti := as(scores), as(idx)
+	E, K := ts.shape[2], ti.shape[2]
+	return b.op(engine.F32, []int{1, 1, K}, []*tensor{ts, ti}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		rows := C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, ts)), 1, C.int64_t(E), 1)
+		w := C.ggml_reshape_2d(ctx, C.ggml_get_rows(ctx, rows, C.ggml_reshape_2d(ctx, contig(ctx, ti.t), C.int64_t(K), 1)), C.int64_t(K), 1)
+		w = C.ggml_scale(ctx, C.ggml_div(ctx, w, C.ggml_sum_rows(ctx, w)), C.float(scale))
+		return C.ggml_reshape_3d(ctx, w, C.int64_t(K), 1, 1)
+	})
+}
+
+// PairRows marks a stack of experts not yet repacked: its repack puts the
+// even output rows first, then the odd ones (engine.RelAttention).
+func (b *Backend) PairRows(w engine.Tensor) bool {
+	tw := as(w)
+	if tw.q4 != nil || len(tw.shape) != 3 || tw.shape[1]%2 != 0 {
+		return false
+	}
+	tw.pairRows = true
+	return true
 }
 
 // RMS is RMSNorm with no weight (engine.RelAttention).
@@ -97,13 +130,21 @@ func (b *Backend) relInputsFor(replay bool, pos, window, extent, n int) (idx, hi
 // column, and the values are read transposed in place. The caches are read
 // padded to the bucket a recorded step reads them at, the slots past the
 // query masked: the graph is the same for every position in the bucket.
-func (b *Backend) RelAttend(q, k, v, rel, relProj, sinks engine.Tensor, pos, window int, scale float32) engine.Tensor {
+func (b *Backend) RelAttend(q, k, v, rel, relProj, sinks engine.Tensor, pos, window int, scale, relScale float32) engine.Tensor {
 	tq, tk, tv, tr, tsk := as(q), as(k), as(v), as(rel), as(sinks)
 	// relProj [d_rel, R+1] as ggml_mul_mat's first operand, [R+1, d_rel]:
 	// made once of a weight, else copied in the graph.
 	tp := as(relProj)
-	proj := b.transposedWeight(tp)
-	dr := tp.shape[0]
+	dr, R1 := tp.shape[0], tp.shape[1]
+	proj := b.madeOf(tp, fmt.Sprintf("T*%g", relScale), func(v []float32) ([]float32, []int) {
+		out := make([]float32, len(v))
+		for k := 0; k < dr; k++ {
+			for n := 0; n < R1; n++ {
+				out[n*dr+k] = v[k*R1+n] * relScale
+			}
+		}
+		return out, []int{R1, dr}
+	})
 	H, D := tq.shape[1], tq.shape[3]
 	G, S := tk.shape[1], tk.shape[2]
 	extent := tp.shape[1] - 1
@@ -149,7 +190,13 @@ func (b *Backend) RelAttend(q, k, v, rel, relProj, sinks engine.Tensor, pos, win
 		cn, cH, cG, cper, cD := C.int64_t(n), C.int64_t(H), C.int64_t(G), C.int64_t(per), C.int64_t(D)
 		// The bias of each head at each distance, ne (H, extent+1), then of
 		// each head for each slot: rows of that table by the slot's distance.
-		rows := C.ggml_mul_mat(ctx, C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tr)), C.int64_t(dr), cH), transposed(ctx, tp, proj))
+		var pT *C.struct_ggml_tensor
+		if proj != nil {
+			pT = proj.t
+		} else {
+			pT = C.ggml_scale(ctx, C.ggml_cont(ctx, C.ggml_transpose(ctx, f32(ctx, tp))), C.float(relScale))
+		}
+		rows := C.ggml_mul_mat(ctx, C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tr)), C.int64_t(dr), cH), pT)
 		bias := C.ggml_get_rows(ctx, C.ggml_reshape_3d(ctx, rows, cH, C.int64_t(extent+1), 1), C.ggml_reshape_2d(ctx, idx.t, cn, 1)) // ne (H, n, 1)
 		bias = C.ggml_cont(ctx, C.ggml_permute(ctx, bias, 2, 0, 1, 3))                                                               // ne (n, 1, H)
 		// The scores of head g*per+p are key head g against the query.
@@ -222,6 +269,18 @@ func (b *Backend) ConvTaps(window, taps engine.Tensor) engine.Tensor {
 	return b.op(engine.F32, []int{1, 1, C_}, []*tensor{tw, w}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		sum := C.ggml_sum_rows(ctx, C.ggml_mul(ctx, f32(ctx, tw), w.t)) // ne (1, C)
 		return C.ggml_reshape_3d(ctx, sum, C.int64_t(C_), 1, 1)
+	})
+}
+
+// ShiftIn is the window of the next position (engine.RelAttention): one
+// concat of the K-1 newest inputs, read where they are, and x.
+func (b *Backend) ShiftIn(window, x engine.Tensor) engine.Tensor {
+	tw, tx := as(window), as(x)
+	C_, K := tw.shape[1], tw.shape[2]
+	return b.op(engine.F32, []int{1, C_, K}, []*tensor{tw, tx}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		w := f32(ctx, tw)
+		newest := C.ggml_view_2d(ctx, w, C.int64_t(K-1), C.int64_t(C_), w.nb[1], w.nb[0])
+		return C.ggml_concat(ctx, newest, C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tx)), 1, C.int64_t(C_)), 0)
 	})
 }
 

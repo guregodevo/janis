@@ -4,6 +4,7 @@ import (
 	"math"
 
 	"github.com/guregodevo/janis/engine"
+	"github.com/guregodevo/janis/qwen"
 	"github.com/guregodevo/janis/safetensors"
 )
 
@@ -58,6 +59,16 @@ func loadAttention(c *ctx, st *safetensors.File, prefix string, cfg Config, slid
 	a.QScale = ld.f32(prefix + ".q_l2_clip.scale")
 	a.RelScale = ld.f32(prefix + ".rel_l2_clip.scale")
 	a.RelProj = ld.tensor(prefix + ".rel_logits_proj.proj")
+	if c.rel != nil {
+		// The clips' scales, one per output of the projection before them,
+		// go into that projection's rows: no multiply a token.
+		if q, ok := scaledRows(c, a.Q, a.QScale); ok {
+			a.Q, a.QScale = q, nil
+		}
+		if r, ok := scaledRows(c, a.R, a.RelScale); ok {
+			a.R, a.RelScale = r, nil
+		}
+	}
 	if c.rel != nil && a.RelProj != nil {
 		rows := a.RelProj.Shape()[0]
 		a.RelProjFar = c.Concat(c.f32(a.RelProj), c.FromFloats(make([]float32, rows), rows, 1), 1)
@@ -81,6 +92,32 @@ func loadAttention(c *ctx, st *safetensors.File, prefix string, cfg Config, slid
 	return a, ld.err
 }
 
+// scaledRows is quantized projection p with its output row i multiplied by
+// scale's i-th value: an affine weight is q*scale + bias a group, so the
+// row's scales and biases take the factor. False when p is not quantized.
+func scaledRows(c *ctx, p projection, scale engine.Tensor) (projection, bool) {
+	l, ok := p.(*qwen.QuantLinear)
+	if !ok || scale == nil || l.Bias != nil {
+		return nil, false
+	}
+	f := c.Floats(scale)
+	sShape := l.Scales.Shape()
+	if len(sShape) != 2 || sShape[0] != len(f) {
+		return nil, false
+	}
+	sc, bi := c.Floats(l.Scales), c.Floats(l.Biases)
+	groups := sShape[1]
+	for r := range f {
+		for g := 0; g < groups; g++ {
+			sc[r*groups+g] *= f[r]
+			bi[r*groups+g] *= f[r]
+		}
+	}
+	out := *l
+	out.Scales, out.Biases = c.FromFloats(sc, sShape...), c.FromFloats(bi, sShape...)
+	return &out, true
+}
+
 // dynamicConv is the full layers' short convolution: the filter of each
 // position is a static weight plus one its own input chooses, per head.
 // x is [1, L, C], in the layer input the projection x was made from.
@@ -89,7 +126,7 @@ func (a *Attention) dynamicConv(c *ctx, x, in, static engine.Tensor, dyn project
 	chosen := c.f32(dyn.Forward(c, in)) // [1, L, H*K]
 	if window := c.tapWindow(x, cache.Conv[slot]); window != nil {
 		if out := c.rel.ConvTapsDyn(window, static, chosen); out != nil {
-			cache.Conv[slot] = c.Slice(window, 2, 1, K)
+			cache.Conv[slot] = window
 			return c.model(out)
 		}
 	}
@@ -129,29 +166,38 @@ func (a *Attention) Forward(c *ctx, qIn, kIn, vIn engine.Tensor, cache *VisitCac
 	gate := a.Gate.Forward(c, qIn)
 	sinks := a.Sink.Forward(c, qIn) // [1, L, H]
 
-	q := c.model(c.l2clip(c.Reshape(a.Q.Forward(c, qIn), 1, L, H, D), a.QScale, masks.cfg.QKClip))
+	qRaw := c.Reshape(a.Q.Forward(c, qIn), 1, L, H, D)
+	relRaw := c.Reshape(a.R.Forward(c, qIn), 1, L, H, masks.cfg.DRel)
 	k := c.model(c.l2clip(c.Reshape(keys, 1, L, G, D), nil, masks.cfg.QKClip))
 	v := c.model(c.rms(c.f32(c.Reshape(values, 1, L, G, D)), eps))
-	rel := c.model(c.l2clip(c.Reshape(a.R.Forward(c, qIn), 1, L, H, masks.cfg.DRel), a.RelScale, masks.cfg.RelClip))
+	k, v = cache.update(c, c.Transpose(k, 0, 2, 1, 3), c.Transpose(v, 0, 2, 1, 3), max(a.Window-1, 0))
+	S := k.Shape()[2]
+	scale := float32(1 / math.Sqrt(float64(D)))
+
+	// One token on a backend that has the attention as an operation: it
+	// reads the caches in place, gathers the bias itself and takes the two
+	// clips' thresholds with its scales.
+	if c.rel != nil && L == 1 && a.RelProjFar != nil {
+		q, rel := c.l2unit(qRaw, a.QScale, masks.cfg.QKClip), c.l2unit(relRaw, a.RelScale, masks.cfg.RelClip)
+		if a.Window == 0 {
+			tau := masks.tau(pos, L)
+			q, rel = c.Mul(q, tau), c.Mul(rel, tau)
+		}
+		q = c.Transpose(q, 0, 2, 1, 3)
+		if out := c.rel.RelAttend(q, k, v, rel, a.RelProjFar, c.f32(sinks), pos, a.Window, scale*masks.cfg.QKClip, masks.cfg.RelClip); out != nil {
+			out = c.Reshape(out, 1, 1, H*D)
+			out = c.Mul(out, c.Sigmoid(c.f32(gate)))
+			return a.O.Forward(c, c.model(out))
+		}
+	}
+	q := c.model(c.l2clip(qRaw, a.QScale, masks.cfg.QKClip))
+	rel := c.model(c.l2clip(relRaw, a.RelScale, masks.cfg.RelClip))
 	if a.Window == 0 {
 		tau := masks.tau(pos, L)
 		q = c.model(c.Mul(c.f32(q), tau))
 		rel = c.model(c.Mul(c.f32(rel), tau))
 	}
 	q = c.Transpose(q, 0, 2, 1, 3)
-	k, v = cache.update(c, c.Transpose(k, 0, 2, 1, 3), c.Transpose(v, 0, 2, 1, 3), max(a.Window-1, 0))
-	S := k.Shape()[2]
-	scale := float32(1 / math.Sqrt(float64(D)))
-
-	// One token on a backend that has the attention as an operation: the
-	// bias table and the sink go to it, and it reads the caches in place.
-	if c.rel != nil && L == 1 && a.RelProjFar != nil {
-		if out := c.rel.RelAttend(c.f32(q), k, v, c.f32(rel), a.RelProjFar, c.f32(sinks), pos, a.Window, scale); out != nil {
-			out = c.Reshape(out, 1, 1, H*D)
-			out = c.Mul(out, c.Sigmoid(c.f32(gate)))
-			return a.O.Forward(c, c.model(out))
-		}
-	}
 	bias := c.MatMul(rel, a.RelProj) // [1, L, H, RelExtent]
 
 	// The bias of each query for each key is the entry at their distance;

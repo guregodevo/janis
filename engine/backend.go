@@ -255,14 +255,14 @@ type RowScatterer interface {
 type RelAttention interface {
 	// RelAttend is the attention of the query at position pos, q
 	// [1, H, 1, D], over the keys and values k, v [1, G, pos+1, D] of
-	// positions 0..pos. rel [1, 1, H, d_rel] times relProj [d_rel, R+1] is
-	// the query's bias for each head at distances 0..R-1, then the bias of
-	// every distance from R on; sinks [1, 1, H] is the logit that joins
-	// each head's softmax and takes its share away. window bounds how far
-	// back the query sees (0: everything). It returns [1, H, 1, D], or nil
-	// when the caches cannot be read this way and the caller computes the
-	// attention itself.
-	RelAttend(q, k, v, rel, relProj, sinks Tensor, pos, window int, scale float32) Tensor
+	// positions 0..pos. relScale times rel [1, 1, H, d_rel] times relProj
+	// [d_rel, R+1] is the query's bias for each head at distances 0..R-1,
+	// then the bias of every distance from R on; sinks [1, 1, H] is the
+	// logit that joins each head's softmax and takes its share away.
+	// window bounds how far back the query sees (0: everything). It
+	// returns [1, H, 1, D], or nil when the caches cannot be read this way
+	// and the caller computes the attention itself.
+	RelAttend(q, k, v, rel, relProj, sinks Tensor, pos, window int, scale, relScale float32) Tensor
 	// AppendValuesT is Concat along the token axis (2) for a value cache
 	// kept in the layout RelAttend reads.
 	AppendValuesT(cache, x Tensor) Tensor
@@ -272,6 +272,9 @@ type RelAttention interface {
 	// L2Clip shrinks each row of x (over the last axis) whose L2 norm is
 	// above threshold down to it.
 	L2Clip(x Tensor, threshold float32) Tensor
+	// L2Unit is L2Clip divided by threshold: a row of norm threshold or
+	// more comes out of norm 1.
+	L2Unit(x Tensor, threshold float32) Tensor
 	// RMS is RMSNorm with no weight.
 	RMS(x Tensor, eps float32) Tensor
 	// DepthMix mixes the states stack [1, 1, S, D] once per query of
@@ -291,7 +294,19 @@ type RelAttention interface {
 	// newest), and the result is divided by sqrt(2K+1). Nil when the
 	// filter is not a weight.
 	ConvTaps(window, taps Tensor) Tensor
+	// ShiftIn is window [1, C, K] with its oldest input dropped and x
+	// [1, 1, C] as its newest.
+	ShiftIn(window, x Tensor) Tensor
 	ConvTapsDyn(window, static, dyn Tensor) Tensor
+	// RouteWeights is scores [1, 1, E] at idx [1, 1, k], divided by their
+	// sum and multiplied by scale -> [1, 1, k].
+	RouteWeights(scores, idx Tensor, scale float32) Tensor
+	// PairRows asks that the stack of experts w [E, 2I, in], whose output
+	// rows alternate between two projections, give the first projection's
+	// I rows and then the second's: a token's halves are then two views.
+	// It is asked before the stack's first use; false when it is too late
+	// or the backend keeps the rows as they are.
+	PairRows(w Tensor) bool
 	// GateMix mixes h and message, both [1, 1, D]: with s their two
 	// weightless RMS norms side by side times downT [2D, rank],
 	// h*(1 - tanh(s·forgetT)) + message*tanh(s·admitT), forgetT and admitT

@@ -370,6 +370,9 @@ type tensor struct {
 	// made holds what was made of a weight once and is kept with it, by
 	// what it is for: its transpose for a matmul, a convolution's taps.
 	made map[string]*tensor
+	// pairRows: a stack of experts whose repack takes the even output rows
+	// first, then the odd ones (PairRows).
+	pairRows bool
 	// input: a recorded step writes it before each run; never a weight.
 	input bool
 	pin   bool // survives Sweep

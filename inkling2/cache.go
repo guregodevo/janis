@@ -14,9 +14,10 @@ const convSlots = 4
 // keys, so the cache returns only to a mark, as a recurrent layer's does.
 type VisitCache struct {
 	K, V engine.Tensor // [1, kv heads, T, head dim], model dtype
-	// Conv is each convolution's tail, float32: [1, kernel-1, channels],
-	// or [1, channels, kernel-1] when rel is set (the layout a token's
-	// input joins without a copy; tail and slide turn it around).
+	// Conv is each convolution's tail, float32 [1, kernel-1, channels].
+	// When rel is set it is the last window instead, [1, channels, kernel]
+	// with the newest input last: a token's input is shifted into it in
+	// one node (tail and kept turn the one into the other).
 	Conv  [convSlots]engine.Tensor
 	steps int
 
@@ -187,20 +188,22 @@ func (c *VisitCache) slide(b engine.Backend, slot int, window engine.Tensor, ker
 	c.Conv[slot] = c.kept(b, b.Slice(window, 1, n-(kernel-1), n))
 }
 
-// kept is a tail [1, kernel-1, channels] in the layout the cache keeps.
+// kept is a tail [1, kernel-1, channels] as the cache keeps it.
 func (c *VisitCache) kept(b engine.Backend, tail engine.Tensor) engine.Tensor {
-	if c.rel != nil {
-		return b.Transpose(tail, 0, 2, 1)
+	if c.rel == nil {
+		return tail
 	}
-	return tail
+	ch := tail.Shape()[2]
+	return b.Concat(b.FromFloats(make([]float32, ch), 1, ch, 1), b.Transpose(tail, 0, 2, 1), 2)
 }
 
 // tail is slot's tail as [1, kernel-1, channels], nil at the start.
 func (c *VisitCache) tail(b engine.Backend, slot int) engine.Tensor {
-	if t := c.Conv[slot]; t != nil && c.rel != nil {
-		return b.Transpose(t, 0, 2, 1)
+	t := c.Conv[slot]
+	if t == nil || c.rel == nil {
+		return t
 	}
-	return c.Conv[slot]
+	return b.Transpose(b.Slice(t, 2, 1, t.Shape()[2]), 0, 2, 1)
 }
 
 // Carry is the state a recorded decode step reads and replaces: the tails

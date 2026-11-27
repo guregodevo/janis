@@ -145,6 +145,19 @@ func (b *Backend) modeStack(tw, ts *tensor, groupSize, bits int, mode string) *t
 	G := in / groupSize
 	shape := append([]int(nil), tw.shape...)
 	shape[len(shape)-1] = in
+	// from is the stack's row that is written as row r: itself, or with
+	// PairRows each expert's even rows first, then its odd ones.
+	out := tw.shape[1]
+	from := func(r int) int {
+		if !tw.pairRows {
+			return r
+		}
+		e, o := r/out, r%out
+		if o < out/2 {
+			return e*out + 2*o
+		}
+		return e*out + 2*(o-out/2) + 1
+	}
 	var typ C.enum_ggml_type
 	var raw []byte
 	var row func(r int)
@@ -152,7 +165,7 @@ func (b *Backend) modeStack(tw, ts *tensor, groupSize, bits int, mode string) *t
 		typ = C.GGML_TYPE_NVFP4
 		raw = make([]byte, rows*(in/64)*36)
 		row = func(r int) {
-			wr, sr := words[r*P*4:], scales[r*G:]
+			wr, sr := words[from(r)*P*4:], scales[from(r)*G:]
 			for blk := 0; blk < in/64; blk++ {
 				o := (r*(in/64) + blk) * 36
 				copy(raw[o:o+4], sr[blk*4:blk*4+4])
@@ -178,8 +191,9 @@ func (b *Backend) modeStack(tw, ts *tensor, groupSize, bits int, mode string) *t
 			}
 		}
 		row = func(r int) {
+			src := from(r)
 			for g := 0; g < G; g++ {
-				sb := scales[r*G+g]
+				sb := scales[src*G+g]
 				var d float32
 				if mode == "nvfp4" {
 					d = e4m3(sb & 0x7F)
@@ -188,9 +202,9 @@ func (b *Backend) modeStack(tw, ts *tensor, groupSize, bits int, mode string) *t
 				}
 				for j := 0; j < groupSize; j++ {
 					i := g*groupSize + j
-					c := words[r*P*4+i]
+					c := words[src*P*4+i]
 					if bits == 4 {
-						c = words[r*P*4+i/2] >> (4 * uint(i%2))
+						c = words[src*P*4+i/2] >> (4 * uint(i%2))
 					}
 					h := f16bits(codes[c] * d)
 					raw[(r*in+i)*2], raw[(r*in+i)*2+1] = byte(h), byte(h>>8)
