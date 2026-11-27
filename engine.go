@@ -228,6 +228,9 @@ func Open(modelDir string) (*Engine, error) {
 		e.indexParams(pl.Params())
 	}
 	pinAll(e.bk) // protect the weights across requests (no-op on GC backends)
+	if w, ok := sm.(interface{ Warm() }); ok {
+		w.Warm()
+	}
 	e.session = sm.NewSession()
 	e.utilSession = sm.NewSession()
 	e.decideSession = sm.NewSession()

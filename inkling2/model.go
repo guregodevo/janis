@@ -295,7 +295,9 @@ func (m *Model) NewSession() *qwen.Session {
 		NewCache:     func(int) qwen.LayerCache { return &VisitCache{rel: m.c.rel} },
 	}
 	if rel := m.c.rel; rel != nil && chunk == 0 {
-		s.ChunkFor = func(tokens int) int { return rel.PrefillFit(m.chunkBytes(), m.chunkContextBytes(), tokens) }
+		s.ChunkFor = func(tokens int) int {
+			return rel.PrefillFit(m.chunkBytes(), m.chunkContextBytes(), m.cachedBytes(), tokens)
+		}
 	}
 	if m.draft != nil {
 		visits := m.Cfg.Visits()
@@ -325,6 +327,31 @@ func (m *Model) chunkBytes() int64 {
 // each token of the context: the gathered bias, the scores and the weights
 // of every head, three tensors of floats alive at once.
 func (m *Model) chunkContextBytes() int64 { return 4 * 3 * int64(m.Cfg.Heads) }
+
+// cachedBytes is what a token of the context keeps in the caches of a
+// backend that keeps every layer's keys and values whole, in f16.
+func (m *Model) cachedBytes() int64 {
+	cfg := m.Cfg
+	return int64(cfg.Visits()) * 2 * 2 * int64(max(cfg.KVHeads*cfg.HeadDim, cfg.SWAKVHeads*cfg.SWAHeadDim))
+}
+
+// Warm runs one token through the model and drops it, once the weights
+// are pinned: a backend that repacks a weight at its first use (ggml: the
+// quantized projections, the experts, what it makes of a weight once) does
+// all of it now, at the load, where the first request paid for it (15 s on
+// the published 4-bit model) and counted its prefill window on memory the
+// repacks then took. Nothing on a backend without those repacks, or with
+// the experts read from disk.
+func (m *Model) Warm() {
+	if m.c.rel == nil || m.Cfg.StreamExperts {
+		return
+	}
+	b := m.c.Backend
+	b.Floats(m.logits(m.hidden(b.FromInt32([]int32{0}, 1), 1, 0, m.newCaches(), nil)))
+	if sw, ok := b.(engine.Sweeper); ok {
+		sw.Sweep()
+	}
+}
 
 // ExpertIO is what reading experts from disk has cost so far: bytes read
 // and the time spent waiting for them. Zero when the experts are resident.

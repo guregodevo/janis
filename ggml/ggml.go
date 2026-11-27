@@ -1083,9 +1083,9 @@ func (b *Backend) flushLocked() {
 		t.deps, t.via = nil, nil
 	}
 	// A batch's buffer is the graph's peak, and it stays whole while one
-	// result in it is held. Where the results held are a small part of it
-	// and the device is short of the room for another like it, they move
-	// to buffers of their own and the batch goes: a prompt chunk of Inkling
+	// result in it is held. Where the results held are under half of it
+	// and what the rest wastes is more than a sixteenth of the device's
+	// free memory, they move to buffers of their own and the batch goes: a prompt chunk of Inkling
 	// 2 is three batches, each a few GB at its peak for under a tenth of
 	// that held, and the three did not fit together (RTX 5000 Ada 32 GB,
 	// 2026-11-27).
@@ -1094,7 +1094,7 @@ func (b *Backend) flushLocked() {
 		for _, t := range live {
 			held += C.ggml_nbytes(t.t)
 		}
-		if 4*held < b.lastBatch.bytes && b.devFree() < 2*int64(b.lastBatch.bytes) {
+		if waste := int64(b.lastBatch.bytes - min(held, b.lastBatch.bytes)); 2*held < b.lastBatch.bytes && 16*waste > b.devFree() {
 			for _, t := range live {
 				b.ownLocked(t)
 			}

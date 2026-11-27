@@ -54,11 +54,11 @@ func (b *Backend) StepFloats(pos int, f func(pos int) []float32, shape ...int) e
 // PrefillFit is the window by the device's free memory
 // (engine.RelAttention), on CUDA; the CPU backend reads a prompt at the
 // global window.
-func (b *Backend) PrefillFit(perToken, perContext int64, tokens int) int {
+func (b *Backend) PrefillFit(perToken, perContext, perCached int64, tokens int) int {
 	if !strings.HasPrefix(b.name, "CUDA") {
 		return 0
 	}
-	return prefillFit(b.devFree(), perToken, perContext, tokens)
+	return prefillFit(b.devFree()-perCached*int64(tokens), perToken, perContext, tokens)
 }
 
 func prefillFit(free, perToken, perContext int64, tokens int) int {
