@@ -513,6 +513,7 @@ type pendingRef struct {
 	wp     weak.Pointer[tensor]
 	strong *tensor
 	bytes  C.size_t
+	site   string // JANIS_GGML_PROF: the backend method that recorded it
 }
 
 // reuseAbove is the batch size, in bytes, from which a flush asks the
@@ -910,8 +911,11 @@ func (b *Backend) op(dt engine.DType, shape []int, inputs []*tensor, fn func(ctx
 	if check {
 		ref.strong = out
 	}
+	if prof {
+		ref.site = profSite()
+	}
 	b.pending = append(b.pending, ref)
-	full := len(b.pending) >= flushEvery && b.rec0 == nil
+	full := (len(b.pending) >= flushEvery || prof) && b.rec0 == nil
 	if full {
 		b.flushHeld()
 	}
@@ -989,6 +993,12 @@ func (b *Backend) flushLocked() {
 	}
 	t2 := time.Now()
 	st := C.ggml_backend_graph_compute(b.be, g)
+	if prof && len(pending) == 1 {
+		C.ggml_backend_synchronize(b.be)
+		e := profAcc[pending[0].site]
+		e.n, e.dur, e.bytes = e.n+1, e.dur+time.Since(t2), e.bytes+int64(pending[0].bytes)
+		profAcc[pending[0].site] = e
+	}
 	runtime.KeepAlive(extraDeps)
 	if check {
 		for _, p := range live {
@@ -1390,6 +1400,9 @@ func (b *Backend) Unpin(ts ...engine.Tensor) {
 // Sweep frees every tracked tensor that is not pinned: a step's temporaries.
 func (b *Backend) Sweep() {
 	b.flush()
+	if prof {
+		profPrint()
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for wp := range b.tracked {
