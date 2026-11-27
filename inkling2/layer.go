@@ -225,6 +225,10 @@ type Layer struct {
 
 	// The gates of a looped layer, nil outside the core.
 	QGate, KGate, VGate, MLPGate *MessageGate
+	// QKVNorm is the three input norms' weights of a full layer side by
+	// side, [3, hidden], for a backend that mixes a token's query, key
+	// and value inputs as one batch (engine.RelAttention).
+	QKVNorm engine.Tensor
 }
 
 func loadLayer(c *ctx, st *safetensors.File, i int, cfg Config) (*Layer, error) {
@@ -254,6 +258,10 @@ func loadLayer(c *ctx, st *safetensors.File, i int, cfg Config) (*Layer, error) 
 	if ld.err != nil {
 		return nil, ld.err
 	}
+	if c.rel != nil && !l.Sliding && l.QGate != nil {
+		rows := func(n *qwen.RMSNorm) engine.Tensor { return c.Reshape(c.f32(n.Weight), 1, cfg.Hidden) }
+		l.QKVNorm = c.Concat(c.Concat(rows(l.QNorm), rows(l.KNorm), 0), rows(l.VNorm), 0)
+	}
 	var err error
 	if l.Attn, err = loadAttention(c, st, p+".self_attn", cfg, l.Sliding); err != nil {
 		return nil, err
@@ -275,20 +283,43 @@ func (l *Layer) Forward(c *ctx, h engine.Tensor, blocks []engine.Tensor, cache *
 	normed := c.rms(hf, defaultEps)
 
 	q, k, v := h, h, h
+	var in engine.Tensor // the mix for the attention: one row, or three on a full layer
 	if l.AttnQueryT != nil {
-		in := c.depthAttention(blocks, normed, l.AttnQueryT)
+		in = c.depthAttention(blocks, normed, l.AttnQueryT)
 		q = c.pick(in, 0)
 		k, v = q, q
 		if !l.Sliding {
 			k, v = c.pick(in, 1), c.pick(in, 2)
 		}
 	}
-	if messages != nil {
+	mixed := false
+	if messages != nil && c.rel != nil && h.Shape()[1] == 1 && in != nil {
+		// One token: the three gates as one batch, then the three norms.
+		if l.Sliding {
+			in = c.f32(q) // one input for the three
+		}
+		three := c.Slice(messages, 2, 0, 3)
+		g := []*MessageGate{l.QGate, l.KGate, l.VGate}
+		downs, forgets, admits := make([]engine.Tensor, 3), make([]engine.Tensor, 3), make([]engine.Tensor, 3)
+		for i := range g {
+			downs[i], forgets[i], admits[i] = g[i].DownT, g[i].ForgetT, g[i].AdmitT
+		}
+		if qkv := c.rel.GateMixRows(in, three, downs, forgets, admits, defaultEps); qkv != nil {
+			if l.Sliding {
+				qkv = l.InputNorm.Forward(c, qkv)
+			} else {
+				qkv = c.RMSNorm(qkv, l.QKVNorm, l.QNorm.Eps)
+			}
+			q, k, v, mixed = c.pick(qkv, 0), c.pick(qkv, 1), c.pick(qkv, 2), true
+		}
+	}
+	if messages != nil && !mixed {
 		q = l.QGate.Forward(c, q, c.pick(messages, 0))
 		k = l.KGate.Forward(c, k, c.pick(messages, 1))
 		v = l.VGate.Forward(c, v, c.pick(messages, 2))
 	}
 	switch {
+	case mixed:
 	case !l.Sliding:
 		q, k, v = c.model(l.QNorm.Forward(c, q)), c.model(l.KNorm.Forward(c, k)), c.model(l.VNorm.Forward(c, v))
 	case messages != nil:

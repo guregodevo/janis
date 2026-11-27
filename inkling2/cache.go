@@ -85,7 +85,9 @@ func (c *VisitCache) Truncate(b engine.Backend, n int) {
 			}
 		}
 		for i, w := range s.windows {
-			c.Conv[i] = c.kept(b, b.Slice(w, 1, kept, kept+s.tail))
+			if w != nil {
+				c.Conv[i] = c.kept(b, b.Slice(w, 1, kept, kept+s.tail))
+			}
 		}
 		c.steps, c.last = n, nil
 		for at := range c.marks {
@@ -207,20 +209,24 @@ func (c *VisitCache) tail(b engine.Backend, slot int) engine.Tensor {
 }
 
 // Carry is the state a recorded decode step reads and replaces: the tails
-// of the four convolutions (qwen's replayCache). The keys and values are
+// of the convolutions (qwen's replayCache; a slot a layer does not use is
+// nil and left out). The keys and values are
 // written in place and are no part of it.
 func (c *VisitCache) Carry() []engine.Tensor {
+	ts := []engine.Tensor{}
 	for _, t := range c.Conv {
-		if t == nil {
-			return []engine.Tensor{}
+		if t != nil {
+			ts = append(ts, t)
 		}
 	}
-	return c.Conv[:]
+	return ts
 }
 
 func (c *VisitCache) SetCarry(ts []engine.Tensor) {
-	if len(ts) == convSlots {
-		copy(c.Conv[:], ts)
+	for i, t := range c.Conv {
+		if t != nil && len(ts) > 0 {
+			c.Conv[i], ts = ts[0], ts[1:]
+		}
 	}
 }
 

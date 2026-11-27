@@ -4,6 +4,9 @@ package ggml
 
 /*
 #include "ggml.h"
+static struct ggml_tensor * janis_new3(struct ggml_context * c, int64_t ne0, int64_t ne1, int64_t ne2) {
+	return ggml_new_tensor_3d(c, GGML_TYPE_F32, ne0, ne1, ne2);
+}
 */
 import "C"
 
@@ -413,6 +416,80 @@ func (b *Backend) GateMix(h, message, downT, forgetT, admitT engine.Tensor, eps 
 		out := C.ggml_add(ctx, hh, C.ggml_view_2d(ctx, prod, cD, 1, prod.nb[1], 0))
 		out = C.ggml_add(ctx, out, C.ggml_view_2d(ctx, prod, cD, 1, prod.nb[1], prod.nb[1]))
 		return C.ggml_reshape_3d(ctx, out, cD, 1, 1)
+	})
+}
+
+// GateMixRows is GateMix for n inputs as one batch (engine.RelAttention):
+// the same eight nodes, the two matmuls batched over the n gates' weights
+// stacked once.
+func (b *Backend) GateMixRows(h, messages engine.Tensor, downT, forgetT, admitT []engine.Tensor, eps float32) engine.Tensor {
+	th, tm := as(h), as(messages)
+	n := len(downT)
+	D := th.shape[len(th.shape)-1]
+	d0 := as(downT[0])
+	if len(d0.shape) != 2 {
+		return nil
+	}
+	rank := d0.shape[1]
+	for i := 0; i < n; i++ {
+		if !isWeight(as(downT[i])) || !isWeight(as(forgetT[i])) || !isWeight(as(admitT[i])) {
+			return nil
+		}
+	}
+	// The n down projections [2D, rank] as [n, rank, 2D], ggml_mul_mat's
+	// first operand, and the n pairs of gates as [n, 2D, rank]: -forget's
+	// columns, then admit's.
+	down := b.madeOf(d0, fmt.Sprintf("down*%d", n), func([]float32) ([]float32, []int) {
+		out := make([]float32, n*rank*2*D)
+		for i := 0; i < n; i++ {
+			v := weightFloats(as(downT[i]))
+			if v == nil {
+				return nil, nil
+			}
+			for r := 0; r < rank; r++ {
+				for k := 0; k < 2*D; k++ {
+					out[(i*rank+r)*2*D+k] = v[k*rank+r]
+				}
+			}
+		}
+		return out, []int{n, rank, 2 * D}
+	})
+	gates := b.madeOf(as(forgetT[0]), fmt.Sprintf("gates*%d", n), func([]float32) ([]float32, []int) {
+		out := make([]float32, n*2*D*rank)
+		for i := 0; i < n; i++ {
+			f, a := weightFloats(as(forgetT[i])), weightFloats(as(admitT[i]))
+			if f == nil || a == nil {
+				return nil, nil
+			}
+			for r := 0; r < rank; r++ {
+				for k := 0; k < D; k++ {
+					out[(i*2*D+k)*rank+r] = -f[r*D+k]
+					out[(i*2*D+D+k)*rank+r] = a[r*D+k]
+				}
+			}
+		}
+		return out, []int{n, 2 * D, rank}
+	})
+	if down == nil || gates == nil {
+		return nil
+	}
+	shared := len(th.shape) == 3
+	return b.op(engine.F32, []int{1, 1, n, D}, []*tensor{th, tm, down, gates}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		cD, cn := C.int64_t(D), C.int64_t(n)
+		var hh *C.struct_ggml_tensor
+		if shared {
+			hh = C.ggml_repeat(ctx, C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, th)), cD, 1, 1), C.janis_new3(ctx, cD, 1, cn))
+		} else {
+			hh = C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, th)), cD, 1, cn)
+		}
+		mm := C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, tm)), cD, 1, cn)
+		both := C.ggml_concat(ctx, hh, mm, 1) // ne (D, 2, n)
+		s := C.ggml_mul_mat(ctx, down.t, C.ggml_reshape_3d(ctx, C.ggml_rms_norm(ctx, both, C.float(eps)), 2*cD, 1, cn))
+		g := C.ggml_reshape_3d(ctx, C.ggml_tanh(ctx, C.ggml_mul_mat(ctx, gates.t, s)), cD, 2, cn) // -forget, admit
+		prod := C.ggml_mul(ctx, g, both)
+		out := C.ggml_add(ctx, hh, C.ggml_view_3d(ctx, prod, cD, 1, cn, prod.nb[1], prod.nb[2], 0))
+		out = C.ggml_add(ctx, out, C.ggml_view_3d(ctx, prod, cD, 1, cn, prod.nb[1], prod.nb[2], prod.nb[1]))
+		return C.ggml_reshape_2d(ctx, out, cD, cn)
 	})
 }
 

@@ -146,6 +146,35 @@ func TestGGMLATokensOperationsAreTheModels(t *testing.T) {
 		})
 		if l.MLPGate != nil {
 			both(fmt.Sprintf("layer %d message gate", i), func() engine.Tensor { return l.MLPGate.Forward(c, x, msg) })
+			// The query, key and value gates as one batch against each alone,
+			// on three inputs and on one shared by the three.
+			gates := []*MessageGate{l.QGate, l.KGate, l.VGate}
+			three, msgs := rnd(1, 1, 3, hidden), rnd(1, 1, 3, hidden)
+			for _, in := range []engine.Tensor{three, x} {
+				both(fmt.Sprintf("layer %d gates in a batch", i), func() engine.Tensor {
+					if c.rel != nil {
+						var d, f, a []engine.Tensor
+						for _, g := range gates {
+							d, f, a = append(d, g.DownT), append(f, g.ForgetT), append(a, g.AdmitT)
+						}
+						return c.rel.GateMixRows(in, msgs, d, f, a, defaultEps)
+					}
+					var out engine.Tensor
+					for j, g := range gates {
+						h := in
+						if len(in.Shape()) == 4 {
+							h = c.pick(in, j)
+						}
+						row := c.ExpandDims(g.Forward(c, h, c.pick(msgs, j)), 2)
+						if out == nil {
+							out = row
+						} else {
+							out = c.Concat(out, row, 2)
+						}
+					}
+					return out
+				})
+			}
 		}
 		both(fmt.Sprintf("layer %d clip", i), func() engine.Tensor {
 			if c.rel != nil {

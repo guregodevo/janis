@@ -316,6 +316,11 @@ type RelAttention interface {
 	// h*(1 - tanh(s·forgetT)) + message*tanh(s·admitT), forgetT and admitT
 	// [rank, D]. Nil when the three are not weights.
 	GateMix(h, message, downT, forgetT, admitT Tensor, eps float32) Tensor
+	// GateMixRows is GateMix for n inputs at once, each with gates of its
+	// own: h is [1, 1, n, D], or [1, 1, D] for one input shared by all;
+	// messages [1, 1, n, D]; downT, forgetT and admitT hold the n gates'
+	// weights -> [1, 1, n, D]. Nil when they are not weights.
+	GateMixRows(h, messages Tensor, downT, forgetT, admitT []Tensor, eps float32) Tensor
 }
 
 // LoopOps is implemented by backends that carry the operations the looped
