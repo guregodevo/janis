@@ -207,6 +207,8 @@ type Backend struct {
 	// caps holds, per (width, gate cap, up cap), the inverses of the caps
 	// CappedSwiGLU multiplies both halves by.
 	caps map[[3]float32]*tensor
+	// relRows holds a chunk's attention inputs for the pass that made them.
+	relRows map[[4]int]*relRows
 	// rec0 is the decode step being recorded (replay.go), nil otherwise.
 	rec0 *recording
 }

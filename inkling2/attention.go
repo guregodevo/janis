@@ -290,10 +290,10 @@ func (a *Attention) Forward(c *ctx, qIn, kIn, vIn engine.Tensor, cache *VisitCac
 	S := k.Shape()[2]
 	scale := float32(1 / math.Sqrt(float64(D)))
 
-	// One token on a backend that has the attention as an operation: it
-	// reads the caches in place, gathers the bias itself and takes the two
-	// clips' thresholds with its scales.
-	if c.rel != nil && L == 1 && a.RelProjFar != nil {
+	// A backend that has the attention as an operation: it reads the caches
+	// in place, gathers the bias itself and takes the two clips' thresholds
+	// with its scales.
+	if c.rel != nil && a.RelProjFar != nil {
 		q, rel := c.l2unit(qRaw, a.QScale, masks.cfg.QKClip), c.l2unit(relRaw, a.RelScale, masks.cfg.RelClip)
 		if a.Window == 0 {
 			tau := masks.tau(pos, L)
@@ -301,7 +301,7 @@ func (a *Attention) Forward(c *ctx, qIn, kIn, vIn engine.Tensor, cache *VisitCac
 		}
 		q = c.Transpose(q, 0, 2, 1, 3)
 		if out := c.rel.RelAttend(q, k, v, rel, a.RelProjFar, c.f32(sinks), pos, a.Window, scale*masks.cfg.QKClip, masks.cfg.RelClip); out != nil {
-			out = c.Reshape(out, 1, 1, H*D)
+			out = c.Reshape(c.Transpose(out, 0, 2, 1, 3), 1, L, H*D)
 			out = c.Mul(out, c.Sigmoid(c.f32(gate)))
 			return a.O.Forward(c, c.model(out))
 		}

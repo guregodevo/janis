@@ -4,6 +4,7 @@ package ggml
 
 /*
 #include "ggml.h"
+#include "ggml-backend.h"
 static struct ggml_tensor * janis_new3(struct ggml_context * c, int64_t ne0, int64_t ne1, int64_t ne2) {
 	return ggml_new_tensor_3d(c, GGML_TYPE_F32, ne0, ne1, ne2);
 }
@@ -187,6 +188,9 @@ func (b *Backend) RelAttend(q, k, v, rel, relProj, sinks engine.Tensor, pos, win
 	H, D := tq.shape[1], tq.shape[3]
 	G, S := tk.shape[1], tk.shape[2]
 	extent := tp.shape[1] - 1
+	if tq.shape[2] > 1 {
+		return b.relAttendRows(tq, tk, tv, tr, tp, proj, tsk, pos, window, scale, relScale)
+	}
 	replay := tk.replay && tv.replay
 	n := S
 	if replay {
@@ -251,6 +255,118 @@ func (b *Backend) RelAttend(q, k, v, rel, relProj, sinks engine.Tensor, pos, win
 		}
 		out := C.ggml_mul_mat(ctx, vT, C.ggml_reshape_3d(ctx, p, cn, cper, cG)) // ne (D, per, G)
 		return C.ggml_reshape_4d(ctx, out, cD, 1, cH, 1)
+	})
+}
+
+// relRows are the inputs of a chunk's attention, kept for the forward pass
+// that made them: every layer of a kind reads the same.
+type relRows struct {
+	pos, L      int
+	idx, hidden *tensor
+}
+
+// relRowsFor is, for the L queries at pos.. over the n cache slots that
+// hold positions base..base+n-1 and a sink after them: each slot's bias row
+// for each query (its distance, extent from there on), I32 [L, n], and the
+// mask [L, n+1] (-inf where the query does not see the slot).
+func (b *Backend) relRowsFor(pos, L, window, extent, base, n int) (idx, hidden *tensor) {
+	key := [4]int{window, extent, base, n}
+	b.mu.Lock()
+	in := b.relRows[key]
+	b.mu.Unlock()
+	if in != nil && in.pos == pos && in.L == L {
+		return in.idx, in.hidden
+	}
+	iv, hv := make([]int32, L*n), make([]float32, L*(n+1))
+	ninf := float32(math.Inf(-1))
+	for i := 0; i < L; i++ {
+		for j := 0; j < n; j++ {
+			d := pos + i - (base + j)
+			iv[i*n+j] = int32(extent)
+			switch {
+			case d < 0 || (window > 0 && d >= window):
+				hv[i*(n+1)+j] = ninf
+			case d < extent:
+				iv[i*n+j] = int32(d)
+			}
+		}
+	}
+	made := &relRows{pos: pos, L: L, idx: b.kept(as(b.FromInt32(iv, L, n))), hidden: b.kept(as(b.FromFloats(hv, L, n+1)))}
+	b.mu.Lock()
+	old := b.relRows
+	b.relRows = map[[4]int]*relRows{key: made}
+	for k, o := range old {
+		if o.pos == pos && o.L == L && k != key {
+			b.relRows[k] = o // the other kind of layer of this pass
+			delete(old, k)
+		}
+	}
+	b.mu.Unlock()
+	if len(old) > 0 {
+		b.flush() // a pass before this one may still be computing with them
+		for _, o := range old {
+			o.idx.free()
+			o.hidden.free()
+		}
+	}
+	return made.idx, made.hidden
+}
+
+// relAttendRows is RelAttend for a chunk of L queries at pos.., the keys
+// and values read in place from their caches: all of them on a full layer,
+// the window's on a sliding one. The whole attention is one operation, so
+// the tensors of L by keys by heads it goes through (the gathered bias, the
+// scores, the weights) are the graph's to reuse, not results held to the
+// end of a flush. Nil when the caches are not buffers it can read in place
+// (the first chunk of a prompt), which the model's own operations compute.
+func (b *Backend) relAttendRows(tq, tk, tv, tr, tp, proj, tsk *tensor, pos, window int, scale, relScale float32) engine.Tensor {
+	H, L, D := tq.shape[1], tq.shape[2], tq.shape[3]
+	G, S := tk.shape[1], tk.shape[2]
+	dr, extent := tp.shape[0], tp.shape[1]-1
+	if tk.replay || tv.replay || tk.grp == nil || tv.grp == nil || tk.grp.base == nil || tv.grp.base == nil ||
+		tk.grp.vt || !tv.grp.vt || tk.cacheLen != S || tv.cacheLen != S || S != pos+L {
+		return nil
+	}
+	base := 0
+	if window > 0 {
+		base = max(0, pos-(window-1))
+	}
+	n := S - base
+	idx, hidden := b.relRowsFor(pos, L, window, extent, base, n)
+	per := H / G
+	return b.op(engine.F32, []int{1, H, L, D}, []*tensor{tq, tk, tv, tr, tp, proj, tsk, idx, hidden}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		cn, cL, cH, cG, cD := C.int64_t(n), C.int64_t(L), C.int64_t(H), C.int64_t(G), C.int64_t(D)
+		// The slots base.. of the caches, where they are: the keys
+		// ne (D, n, G), the values kept tokens innermost ne (n, D, G).
+		kb, vb := tk.grp.base, tv.grp.base
+		kk := C.ggml_view_4d(ctx, kb, cD, cn, cG, 1, kb.nb[1], kb.nb[2], kb.nb[3], C.size_t(base)*C.size_t(kb.nb[1]))
+		C.ggml_backend_view_init(kk)
+		vT := C.ggml_view_4d(ctx, vb, cn, cD, cG, 1, vb.nb[1], vb.nb[2], vb.nb[3], C.size_t(base)*C.size_t(vb.nb[0]))
+		C.ggml_backend_view_init(vT)
+		if os.Getenv("JANIS_GGML_REL_F32") == "1" {
+			kk = C.ggml_cast(ctx, C.ggml_cont(ctx, kk), C.GGML_TYPE_F32)
+			vT = C.ggml_cast(ctx, C.ggml_cont(ctx, vT), C.GGML_TYPE_F32)
+		}
+		var pT *C.struct_ggml_tensor
+		if proj != nil {
+			pT = proj.t
+		} else {
+			pT = C.ggml_scale(ctx, C.ggml_cont(ctx, C.ggml_transpose(ctx, f32(ctx, tp))), C.float(relScale))
+		}
+		// Each head's bias at each distance for each query, ne (H, L,
+		// extent+1), turned to (H, extent+1, L); then for each slot.
+		rows := C.ggml_mul_mat(ctx, C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tr)), C.int64_t(dr), cH*cL), pT)
+		rows = C.ggml_cont(ctx, C.ggml_permute(ctx, C.ggml_reshape_3d(ctx, rows, cH, cL, C.int64_t(extent+1)), 0, 2, 1, 3))
+		bias := C.ggml_get_rows(ctx, rows, idx.t)                      // ne (H, n, L)
+		bias = C.ggml_cont(ctx, C.ggml_permute(ctx, bias, 2, 0, 1, 3)) // ne (n, L, H)
+		qq := C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, tq)), cD, cL*C.int64_t(per), cG)
+		kq := C.ggml_reshape_3d(ctx, C.ggml_mul_mat(ctx, kk, qq), cn, cL, cH)
+		scores := C.ggml_add(ctx, C.ggml_scale(ctx, kq, C.float(scale)), bias)
+		sink := C.ggml_cont(ctx, C.ggml_transpose(ctx, C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tsk)), cH, cL))) // ne (L, H)
+		p := C.ggml_soft_max_ext(ctx, C.ggml_concat(ctx, scores, C.ggml_reshape_3d(ctx, sink, 1, cL, cH), 0), hidden.t, 1, 0)
+		p = C.ggml_cont(ctx, C.ggml_view_3d(ctx, p, cn, cL, cH, p.nb[1], p.nb[2], 0))
+		out := C.ggml_mul_mat(ctx, vT, C.ggml_reshape_3d(ctx, p, cn, cL*C.int64_t(per), cG)) // ne (D, L*per, G)
+		return C.ggml_reshape_4d(ctx, out, cD, cL, cH, 1)
 	})
 }
 

@@ -100,6 +100,34 @@ func TestGGMLStepsFollowOnePass(t *testing.T) {
 	}
 }
 
+// A PROMPT READ IN CHUNKS GIVES THE LOGITS OF ONE PASS ON GGML.
+//
+// The first chunk goes through the model's own attention, the ones after
+// through the backend's (the caches read in place, the bias gathered for
+// the whole chunk in one operation). Chunks of 6, 6, 6 and 2: the third
+// starts past the sliding window of 8, so a sliding layer reads its caches
+// from the middle.
+func TestGGMLChunksGiveTheLogitsOfOnePass(t *testing.T) {
+	t.Setenv("JANIS_GGML_REL_F32", "1")
+	b := ggml.New()
+	t.Cleanup(b.Close)
+	m, want := loadTiny(t, b, "f32", false)
+	b.PinAll()
+	ids := wantTokens(t, want)
+	vocab := m.Cfg.UnpaddedVocab
+	full := b.Floats(m.logits(m.hidden(b.FromInt32(ids, len(ids)), len(ids), 0, m.newCaches(), nil)))
+	_, scale := maxDiff(full, full)
+	caches := m.newCaches()
+	for pos := 0; pos < len(ids); {
+		n := min(6, len(ids)-pos)
+		got := b.Floats(m.logits(m.hidden(b.FromInt32(ids[pos:pos+n], n), n, pos, caches, nil)))
+		if d, _ := maxDiff(got, full[pos*vocab:(pos+n)*vocab]); d > 2e-3*scale || math.IsNaN(d) {
+			t.Errorf("tokens %d..%d: off by %.3g from one pass (largest value %.3g)", pos, pos+n-1, d, scale)
+		}
+		pos += n
+	}
+}
+
 // A TOKEN'S OPERATIONS ON GGML ARE THE MODEL'S OWN.
 //
 // Each part of a layer that has no state, on one token: through the
