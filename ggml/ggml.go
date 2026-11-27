@@ -138,6 +138,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -608,6 +609,8 @@ func ggmlType(dt engine.DType) C.enum_ggml_type {
 		return C.GGML_TYPE_BF16
 	case engine.I32, engine.U32:
 		return C.GGML_TYPE_I32
+	case engine.U8:
+		return C.GGML_TYPE_I8
 	default:
 		return C.GGML_TYPE_F32
 	}
@@ -637,6 +640,31 @@ func (b *Backend) newFrom(dt engine.DType, shape []int, raw unsafe.Pointer, size
 	}
 	b.mu.Unlock()
 	return out
+}
+
+// newWeight is a pinned weight of a ggml type (a repacked quantized one),
+// filled from raw.
+func (b *Backend) newWeight(typ C.enum_ggml_type, shape []int, raw []byte, what string) *tensor {
+	ctx := C.janis_ctx(ctxMem)
+	n := ne(shape)
+	t := C.janis_new(ctx, typ, n[0], n[1], n[2], n[3])
+	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+	if buf == nil {
+		C.ggml_free(ctx)
+		panic(fmt.Sprintf("ggml: no room on the device for the %s %v", what, shape))
+	}
+	logAlloc(what, C.ggml_nbytes(t), shape)
+	C.ggml_backend_tensor_set(t, unsafe.Pointer(&raw[0]), 0, C.size_t(len(raw)))
+	return &tensor{t: t, ctx: ctx, buf: buf, shape: shape, dt: engine.F16, pin: true}
+}
+
+// dropWords frees a weight's packed words once its repack holds them.
+func (b *Backend) dropWords(tw *tensor) {
+	if !tw.gathered && tw.buf != nil {
+		C.ggml_backend_buffer_free(tw.buf)
+		C.ggml_free(tw.ctx)
+		tw.buf, tw.ctx, tw.t, tw.dropped = nil, nil, nil, true
+	}
 }
 
 // track registers a tensor for Sweep (weakly) and for the collector.
@@ -1576,6 +1604,27 @@ func (b *Backend) Transpose(x engine.Tensor, axes ...int) engine.Tensor {
 	shape := make([]int, nd)
 	for j, a := range axes {
 		shape[j] = tx.shape[a]
+	}
+	if nd > 4 {
+		// ggml has four dimensions: the axes of one element are left out,
+		// the others permuted, and the result given its full shape.
+		var dims, at []int
+		for i, d := range tx.shape {
+			if d != 1 {
+				at = append(at, i)
+				dims = append(dims, d)
+			}
+		}
+		if len(dims) > 4 {
+			panic(fmt.Sprintf("ggml: Transpose of %v: more than four axes of several elements", tx.shape))
+		}
+		var order []int
+		for _, a := range axes {
+			if i := slices.Index(at, a); i >= 0 {
+				order = append(order, i)
+			}
+		}
+		return b.Reshape(b.Transpose(b.Reshape(x, dims...), order...), shape...)
 	}
 	// ggml axis of janis axis i is nd-1-i. Source ggml axis s = nd-1-axes[j]
 	// goes to destination ggml axis nd-1-j.
