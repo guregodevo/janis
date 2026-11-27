@@ -111,7 +111,7 @@ func (c *ctx) depthAttention(blocks []engine.Tensor, current, queryT engine.Tens
 	if len(blocks) > 0 {
 		stacked = c.Concat(c.stack(blocks), stacked, 2)
 	}
-	if c.rel != nil && current.Shape()[1] == 1 {
+	if c.rel != nil {
 		if out := c.rel.DepthMix(stacked, queryT); out != nil {
 			return out
 		}

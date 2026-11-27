@@ -174,13 +174,34 @@ func TestGGMLATokensOperationsAreTheModels(t *testing.T) {
 			c.stacks = nil
 			return c.depthAttention(blocks, x, l.MLPQueryT)
 		})
+		// The same on a chunk of three tokens, and a mix of several queries.
+		x3 := rnd(1, 3, hidden)
+		both(fmt.Sprintf("layer %d MLP, three tokens", i), func() engine.Tensor { return l.MLP.Forward(c, x3) })
+		blocks3 := []engine.Tensor{rnd(1, 3, hidden), rnd(1, 3, hidden)}
+		for _, q := range []engine.Tensor{l.MLPQueryT, l.AttnQueryT} {
+			if q == nil {
+				continue
+			}
+			both(fmt.Sprintf("layer %d depth mix, three tokens", i), func() engine.Tensor {
+				c.stacks = nil
+				return c.depthAttention(blocks3, x3, q)
+			})
+		}
 		if l.MLPGate != nil {
 			both(fmt.Sprintf("layer %d message gate", i), func() engine.Tensor { return l.MLPGate.Forward(c, x, msg) })
 			// The query, key and value gates as one batch against each alone,
 			// on three inputs and on one shared by the three.
 			gates := []*MessageGate{l.QGate, l.KGate, l.VGate}
 			three, msgs := rnd(1, 1, 3, hidden), rnd(1, 1, 3, hidden)
-			for _, in := range []engine.Tensor{three, x} {
+			chunk, chunkMsgs, chunkOne := rnd(1, 3, 3, hidden), rnd(1, 3, 3, hidden), rnd(1, 3, hidden)
+			both(fmt.Sprintf("layer %d message gate, three tokens", i), func() engine.Tensor {
+				return l.MLPGate.Forward(c, chunkOne, c.pick(chunkMsgs, 0))
+			})
+			for n, in := range []engine.Tensor{three, x, chunk, chunkOne} {
+				msgs := msgs
+				if n >= 2 {
+					msgs = chunkMsgs
+				}
 				both(fmt.Sprintf("layer %d gates in a batch", i), func() engine.Tensor {
 					if c.rel != nil {
 						var d, f, a []engine.Tensor

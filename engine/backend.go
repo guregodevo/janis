@@ -283,13 +283,12 @@ type RelAttention interface {
 	L2Unit(x Tensor, threshold float32) Tensor
 	// RMS is RMSNorm with no weight.
 	RMS(x Tensor, eps float32) Tensor
-	// DepthMix mixes the states stack [1, 1, S, D] once per query of
-	// queryT [D, Q]: a softmax over the states of their scores against the
-	// query, scaled by 1/sqrt(D), weighs them -> [1, 1, Q, D]. Nil when
-	// queryT is not a weight.
+	// DepthMix mixes each token's states stack [1, L, S, D] once per query
+	// of queryT [D, Q]: a softmax over the states of their scores against
+	// the query, scaled by 1/sqrt(D), weighs them -> [1, L, Q, D].
 	DepthMix(stack, queryT Tensor) Tensor
-	// WeightedSum is the sum over k of y [1, 1, k, D] times w [1, 1, k]
-	// -> [1, 1, D].
+	// WeightedSum is the sum over k of y [1, L, k, D] times w [1, L, k]
+	// -> [1, L, D].
 	WeightedSum(y, w Tensor) Tensor
 	// ConvTaps is one position of a short causal convolution with its
 	// residual: window [1, C, K] holds, per channel, the last K inputs
@@ -304,8 +303,8 @@ type RelAttention interface {
 	// [1, 1, C] as its newest.
 	ShiftIn(window, x Tensor) Tensor
 	ConvTapsDyn(window, static, dyn Tensor) Tensor
-	// RouteWeights is scores [1, 1, E] at idx [1, 1, k], divided by their
-	// sum and multiplied by scale -> [1, 1, k].
+	// RouteWeights is scores [1, L, E] at idx [1, L, k], divided by their
+	// sum and multiplied by scale -> [1, L, k].
 	RouteWeights(scores, idx Tensor, scale float32) Tensor
 	// PairRows asks that the stack of experts w [E, 2I, in], whose output
 	// rows alternate between two projections, give the first projection's
@@ -314,18 +313,18 @@ type RelAttention interface {
 	// or the backend keeps the rows as they are.
 	PairRows(w Tensor) bool
 	// CappedSwiGLU is tanh(gate/gateCap)*sigmoid(gate)*tanh(up/upCap) for
-	// gu [1, 1, k, 1, 2I] holding gate's I values then up's for each of k
-	// rows (PairRows) -> [1, 1, k, 1, I].
+	// gu [1, L, k, 1, 2I] holding gate's I values then up's for each of k
+	// rows (PairRows) -> [1, L, k, 1, I].
 	CappedSwiGLU(gu Tensor, gateCap, upCap float32) Tensor
 	// GateMix mixes h and message, both [1, 1, D]: with s their two
 	// weightless RMS norms side by side times downT [2D, rank],
 	// h*(1 - tanh(s·forgetT)) + message*tanh(s·admitT), forgetT and admitT
 	// [rank, D]. Nil when the three are not weights.
 	GateMix(h, message, downT, forgetT, admitT Tensor, eps float32) Tensor
-	// GateMixRows is GateMix for n inputs at once, each with gates of its
-	// own: h is [1, 1, n, D], or [1, 1, D] for one input shared by all;
-	// messages [1, 1, n, D]; downT, forgetT and admitT hold the n gates'
-	// weights -> [1, 1, n, D]. Nil when they are not weights.
+	// GateMixRows is GateMix for L tokens and n inputs at once, each input
+	// with gates of its own: h is [1, L, n, D], or [1, L, D] for one input
+	// shared by all; messages [1, L, n, D]; downT, forgetT and admitT hold
+	// the n gates' weights -> [1, L, n, D]. Nil when they are not weights.
 	GateMixRows(h, messages Tensor, downT, forgetT, admitT []Tensor, eps float32) Tensor
 }
 

@@ -203,11 +203,11 @@ type stepFloats struct {
 }
 
 // relMask is, for a query at pos over the n cache slots that hold positions
-// base..base+n-1 and one sink after them: the bias row of each slot (its
+// base..base+n-1: the bias row of each slot (its
 // distance, extent from there on) and the mask (-inf on the slots the query
 // does not see: the ones after it, and the ones window or more behind it).
 func relMask(pos, window, extent, base, n int) ([]int32, []float32) {
-	idx, hidden := make([]int32, n), make([]float32, n+1)
+	idx, hidden := make([]int32, n), make([]float32, n)
 	ninf := float32(math.Inf(-1))
 	for j := 0; j < n; j++ {
 		d := pos - (base + j)
