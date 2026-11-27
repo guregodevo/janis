@@ -589,3 +589,28 @@ func TestAReservationIsCutToWhatTheDeviceHolds(t *testing.T) {
 		t.Errorf("no free figure: %d spare, want 119000", got)
 	}
 }
+
+// A LAYER'S KEYS AND VALUES GET THE SAME ROOM.
+//
+// A reservation cut by the free memory is cut once, by the figure read
+// when it was made: the keys' buffer and the values' buffer of a layer,
+// made one after the other, are the same length, and both are cut.
+func TestALayersKeysAndValuesGetTheSameRoom(t *testing.T) {
+	b := New()
+	defer b.Close()
+	b.ReserveCache(100000)
+	b.reservedFree = 256 * 4096 * 2 * 8 * 64 // a 256th holds 4,096 tokens of 8 heads of 64
+	f16 := func(n int) engine.Tensor { return b.Cast(b.FromFloats(make([]float32, 8*n*64), 1, 8, n, 64), engine.F16) }
+	k := b.Concat(f16(10), f16(1), 2)
+	v := b.AppendValues(f16(10), f16(1))
+	kc, vc := as(k).grp, as(v).grp
+	if kc == nil || vc == nil {
+		t.Fatal("the caches are not buffers with room")
+	}
+	if kc.cap != vc.cap {
+		t.Errorf("keys' room %d, values' %d: want the same", kc.cap, vc.cap)
+	}
+	if kc.cap >= 100000 {
+		t.Errorf("room for %d tokens: the reservation was not cut", kc.cap)
+	}
+}

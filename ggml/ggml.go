@@ -169,8 +169,15 @@ type Backend struct {
 	flash bool
 	// reserved is the positions a cache is made for (ReserveCache).
 	reserved int
-	name     string
-	mu       sync.Mutex
+	// reservedFree is the device's free memory when the reservation was
+	// made, which reservedSpare cuts it by: read once, so that the keys'
+	// and the values' buffers of one layer, made one after the other, get
+	// the same room. Read at each buffer, the values' was 32 tokens
+	// shorter; it filled first and moved, and a step read keys and values
+	// of two lengths (an abort at 11,168 tokens, 2026-11-27).
+	reservedFree int64
+	name         string
+	mu           sync.Mutex
 
 	rec     *C.struct_ggml_context // the recording context: nodes not yet computed
 	pending []pendingRef           // their results, in order, held weakly
@@ -1780,7 +1787,7 @@ func (b *Backend) appendCache(ta, tb *tensor, axis int, vt bool) engine.Tensor {
 	}
 	if grp == nil || grp.base == nil || ta.cacheLen != n || grp.cap < need || grp.vt != vt {
 		// A new buffer with room: the old cache is copied in by the flush.
-		spare := reservedSpare(need, b.reserved, numel(shape)/need*2, b.devFree())
+		spare := reservedSpare(need, b.reserved, numel(shape)/need*2, b.reservedFree)
 		capShape := append([]int(nil), shape...)
 		capShape[axis] = (need + spare + kvPad - 1) / kvPad * kvPad
 		// The buffer's context also holds every prefix view made over its
@@ -1876,8 +1883,9 @@ const cacheGrow = 256
 // prompt is read without a cache being copied. Pages a cache never writes
 // are not touched on the CPU.
 func (b *Backend) ReserveCache(tokens int) {
+	free := b.devFree()
 	b.mu.Lock()
-	b.reserved = tokens
+	b.reserved, b.reservedFree = tokens, free
 	b.mu.Unlock()
 }
 
