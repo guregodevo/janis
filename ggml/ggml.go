@@ -235,12 +235,12 @@ var flushEvery = func() int {
 	if n, err := strconv.Atoi(os.Getenv("JANIS_GGML_FLUSH")); err == nil && n > 0 {
 		return n
 	}
-	return maxNodes / 4
+	return 4096
 }()
 
 // maxNodes bounds one recording context (results and intermediates): a
 // result is about two nodes, so flushEvery results leave room to spare.
-const maxNodes = 16384
+const maxNodes = 32768
 
 // batchNodes bounds the context a batched step is recorded in: the whole
 // step is one graph, and 32 rows of the 27B are about 24,000 nodes.

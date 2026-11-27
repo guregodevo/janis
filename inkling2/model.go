@@ -103,6 +103,7 @@ func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, erro
 		return nil, err
 	}
 	c := &ctx{Backend: b, ops: ops, ones: map[int]engine.Tensor{}}
+	c.rel, _ = b.(engine.RelAttention)
 	switch dt {
 	case "F32":
 		c.dtype = engine.F32
@@ -260,7 +261,7 @@ func (m *Model) forwardCachedT(_ engine.Backend, ids engine.Tensor, seqLen, offs
 func (m *Model) newCaches() []qwen.LayerCache {
 	caches := make([]qwen.LayerCache, m.Cfg.Visits())
 	for i := range caches {
-		caches[i] = &VisitCache{}
+		caches[i] = &VisitCache{rel: m.c.rel}
 	}
 	return caches
 }
@@ -279,7 +280,7 @@ func (m *Model) NewSession() *qwen.Session {
 		NLayers:      m.Cfg.Visits(),
 		Vocab:        m.Cfg.UnpaddedVocab,
 		Forward:      m.forwardCachedT,
-		NewCache:     func(int) qwen.LayerCache { return &VisitCache{} },
+		NewCache:     func(int) qwen.LayerCache { return &VisitCache{rel: m.c.rel} },
 	}
 	if m.draft != nil {
 		visits := m.Cfg.Visits()
@@ -288,7 +289,7 @@ func (m *Model) NewSession() *qwen.Session {
 			if i == visits {
 				return &DraftCache{}
 			}
-			return &VisitCache{}
+			return &VisitCache{rel: m.c.rel}
 		}
 		s.Speculator, s.ForwardAll = m.draft, m.forwardAllT
 	}

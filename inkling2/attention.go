@@ -21,6 +21,10 @@ type Attention struct {
 	Q, K, V, R, O, Gate, Sink projection
 	QScale, RelScale          engine.Tensor // float32 [heads, head dim], [heads, d_rel]
 	RelProj                   engine.Tensor // [d_rel, RelExtent]
+	// RelProjFar is RelProj with one more column of zeros, the bias of the
+	// distances past RelExtent, for a backend that gathers the bias itself
+	// (engine.RelAttention).
+	RelProjFar engine.Tensor
 
 	// Sliding layers.
 	KConv, VConv engine.Tensor // [channels, kernel, 1]
@@ -54,6 +58,10 @@ func loadAttention(c *ctx, st *safetensors.File, prefix string, cfg Config, slid
 	a.QScale = ld.f32(prefix + ".q_l2_clip.scale")
 	a.RelScale = ld.f32(prefix + ".rel_l2_clip.scale")
 	a.RelProj = ld.tensor(prefix + ".rel_logits_proj.proj")
+	if c.rel != nil && a.RelProj != nil {
+		rows := a.RelProj.Shape()[0]
+		a.RelProjFar = c.Concat(c.f32(a.RelProj), c.FromFloats(make([]float32, rows), rows, 1), 1)
+	}
 	if sliding {
 		a.KConv = ld.tensor(prefix + ".k_sconv.conv1d.weight")
 		a.VConv = ld.tensor(prefix + ".v_sconv.conv1d.weight")
@@ -125,11 +133,22 @@ func (a *Attention) Forward(c *ctx, qIn, kIn, vIn engine.Tensor, cache *VisitCac
 		q = c.model(c.Mul(c.f32(q), tau))
 		rel = c.model(c.Mul(c.f32(rel), tau))
 	}
-	bias := c.MatMul(rel, a.RelProj) // [1, L, H, RelExtent]
-
 	q = c.Transpose(q, 0, 2, 1, 3)
 	k, v = cache.update(c, c.Transpose(k, 0, 2, 1, 3), c.Transpose(v, 0, 2, 1, 3), max(a.Window-1, 0))
 	S := k.Shape()[2]
+	scale := float32(1 / math.Sqrt(float64(D)))
+
+	// One token on a backend that has the attention as an operation: the
+	// bias table and the sink go to it, and it reads the caches in place.
+	if c.rel != nil && L == 1 && a.RelProjFar != nil {
+		table := c.MatMul(c.f32(rel), a.RelProjFar) // [1, 1, H, RelExtent+1]
+		if out := c.rel.RelAttend(c.f32(q), k, v, table, c.f32(sinks), pos, a.Window, scale); out != nil {
+			out = c.Reshape(out, 1, 1, H*D)
+			out = c.Mul(out, c.Sigmoid(c.f32(gate)))
+			return a.O.Forward(c, c.model(out))
+		}
+	}
+	bias := c.MatMul(rel, a.RelProj) // [1, L, H, RelExtent]
 
 	// The bias of each query for each key is the entry at their distance;
 	// past RelExtent it is zero, and a key the query may not see is -inf.
@@ -142,7 +161,6 @@ func (a *Attention) Forward(c *ctx, qIn, kIn, vIn engine.Tensor, cache *VisitCac
 		c.Reshape(c.f32(q), 1, G, per, L, D),
 		c.Transpose(c.ExpandDims(c.f32(k), 2), 0, 1, 2, 4, 3),
 	) // [1, G, per, L, S]
-	scale := float32(1 / math.Sqrt(float64(D)))
 	scores = c.Add(c.ScalarMul(scores, scale), c.Reshape(bias, 1, G, per, L, S))
 	sink := c.Reshape(c.Transpose(c.f32(sinks), 0, 2, 1), 1, G, per, L, 1)
 	weights := c.Slice(c.Softmax(c.Concat(scores, sink, 4), 4), 4, 0, S)
@@ -210,11 +228,18 @@ func (mm *maskMaker) tau(pos, L int) engine.Tensor {
 	if mm.taus != nil {
 		return mm.taus
 	}
-	t := make([]float32, L)
-	for i := range t {
-		r := float64(pos+i+1) / float64(mm.cfg.NFloor)
-		t[i] = float32(1 + float64(mm.cfg.Alpha)*math.Log(math.Max(r, 1)))
+	at := func(pos int) []float32 {
+		t := make([]float32, L)
+		for i := range t {
+			r := float64(pos+i+1) / float64(mm.cfg.NFloor)
+			t[i] = float32(1 + float64(mm.cfg.Alpha)*math.Log(math.Max(r, 1)))
+		}
+		return t
 	}
-	mm.taus = mm.c.FromFloats(t, 1, L, 1, 1)
+	if mm.c.rel != nil && L == 1 {
+		mm.taus = mm.c.rel.StepFloats(pos, at, 1, L, 1, 1)
+	} else {
+		mm.taus = mm.c.FromFloats(at(pos), 1, L, 1, 1)
+	}
 	return mm.taus
 }

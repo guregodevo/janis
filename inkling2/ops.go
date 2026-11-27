@@ -11,6 +11,7 @@ import (
 type ctx struct {
 	engine.Backend
 	ops   engine.LoopOps
+	rel   engine.RelAttention // nil on a backend without it
 	dtype engine.DType
 	one   engine.Tensor // [1] float32
 	ones  map[int]engine.Tensor

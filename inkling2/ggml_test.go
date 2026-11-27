@@ -59,3 +59,66 @@ func TestGGMLMatchesTheReference(t *testing.T) {
 		t.Errorf("generated %v, want 8 tokens", got)
 	}
 }
+
+// ONE TOKEN AT A TIME GIVES THE LOGITS OF ONE PASS ON GGML.
+//
+// One token goes through the backend's own attention (RelAttend): the
+// caches read in place and padded, the bias gathered by distance, the
+// window a mask. A chunk goes through the model's operations. Twelve
+// tokens in two chunks, then one at a time past the sliding window of 8.
+func TestGGMLStepsGiveTheLogitsOfOnePass(t *testing.T) {
+	t.Setenv("JANIS_GGML_REL_F32", "1")
+	b := ggml.New()
+	t.Cleanup(b.Close)
+	m, want := loadTiny(t, b, "f32", false)
+	b.PinAll()
+	ids := wantTokens(t, want)
+	vocab := m.Cfg.UnpaddedVocab
+	full := b.Floats(m.logits(m.hidden(b.FromInt32(ids, len(ids)), len(ids), 0, m.newCaches(), nil)))
+	_, scale := maxDiff(full, full)
+
+	caches := m.newCaches()
+	for pos := 0; pos < len(ids); {
+		n := 1
+		if pos < 12 {
+			n = 6
+		}
+		got := b.Floats(m.logits(m.hidden(b.FromInt32(ids[pos:pos+n], n), n, pos, caches, nil)))
+		if d, _ := maxDiff(got, full[pos*vocab:(pos+n)*vocab]); d > 2e-3*scale || math.IsNaN(d) {
+			t.Errorf("tokens %d..%d: off by %.3g from one pass (largest value %.3g)", pos, pos+n-1, d, scale)
+		}
+		pos += n
+	}
+	if got := caches[0].(*VisitCache).K.Shape()[2]; got != len(ids) {
+		t.Errorf("a sliding layer keeps %d keys on ggml, want all %d", got, len(ids))
+	}
+}
+
+// A RECORDED STEP GENERATES WHAT A STEP BUILT EVERY TOKEN GENERATES.
+//
+// Greedy from the first 8 tokens: with the decode step recorded once and
+// run again (JANIS_GGML_REPLAY=cpu) and with it built every token, then a
+// second reply on the same session from a prompt that keeps the first 6
+// tokens, which cuts the caches back before decoding again.
+func TestGGMLARecordedStepGeneratesTheSameTokens(t *testing.T) {
+	t.Setenv("JANIS_GGML_REL_F32", "1")
+	run := func(replay string) [][]int32 {
+		t.Setenv("JANIS_GGML_REPLAY", replay)
+		b := ggml.New()
+		defer b.Close()
+		m, want := loadTiny(t, b, "f32", false)
+		b.PinAll()
+		ids := wantTokens(t, want)
+		s := m.NewSession()
+		first := s.Generate(b, ids[:8], 12, qwen.SampleParams{})
+		second := s.Generate(b, append(append([]int32(nil), ids[:6]...), ids[10:14]...), 12, qwen.SampleParams{})
+		return [][]int32{first, second}
+	}
+	built, recorded := run("0"), run("cpu")
+	if fmt.Sprint(built) != fmt.Sprint(recorded) {
+		t.Errorf("recorded steps generated %v, steps built every token %v", recorded, built)
+	}
+	if len(recorded[0]) != 12 || len(recorded[1]) != 12 {
+		t.Errorf("generated %d and %d tokens, want 12 and 12", len(recorded[0]), len(recorded[1]))
+	}
+}

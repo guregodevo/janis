@@ -248,6 +248,28 @@ type RowScatterer interface {
 	ScatterRows(dst Tensor, indices []int32, updates Tensor) Tensor
 }
 
+// RelAttention is a backend that runs a one-token decode step of Inkling 2's
+// attention as one operation over caches it reads in place, so that the
+// step can be recorded once and run again (StepReplayer): what moves with
+// the position is an input the backend writes, not the graph's shape.
+type RelAttention interface {
+	// RelAttend is the attention of the query at position pos, q
+	// [1, H, 1, D], over the keys and values k, v [1, G, pos+1, D] of
+	// positions 0..pos. table [1, 1, H, R+1] is the query's bias for each
+	// head at distances 0..R-1, then the bias of every distance from R on;
+	// sinks [1, 1, H] is the logit that joins each head's softmax and
+	// takes its share away. window bounds how far back the query sees (0:
+	// everything). It returns [1, H, 1, D], or nil when the caches cannot
+	// be read this way and the caller computes the attention itself.
+	RelAttend(q, k, v, table, sinks Tensor, pos, window int, scale float32) Tensor
+	// AppendValuesT is Concat along the token axis (2) for a value cache
+	// kept in the layout RelAttend reads.
+	AppendValuesT(cache, x Tensor) Tensor
+	// StepFloats is a tensor of shape holding f(pos), which a recorded
+	// step computes again for each position it runs at.
+	StepFloats(pos int, f func(pos int) []float32, shape ...int) Tensor
+}
+
 // LoopOps is implemented by backends that carry the operations the looped
 // Inkling 2 decoder needs beyond Backend: the L2 clip of its queries and
 // keys, the lookup of its relative-position bias, and experts stored in
