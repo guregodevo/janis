@@ -106,9 +106,11 @@ func TestGGMLStepsFollowOnePass(t *testing.T) {
 // through the backend's (the caches read in place, the bias gathered for
 // the whole chunk in one operation). Chunks of 6, 6, 6 and 2: the third
 // starts past the sliding window of 8, so a sliding layer reads its caches
-// from the middle.
+// from the middle. The backend takes a chunk's queries in pieces over a
+// long context; here in pieces of 4.
 func TestGGMLChunksGiveTheLogitsOfOnePass(t *testing.T) {
 	t.Setenv("JANIS_GGML_REL_F32", "1")
+	t.Setenv("JANIS_GGML_REL_PIECE", "4") // a chunk's queries in two pieces
 	b := ggml.New()
 	t.Cleanup(b.Close)
 	m, want := loadTiny(t, b, "f32", false)

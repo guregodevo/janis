@@ -16,6 +16,7 @@ import (
 	"github.com/guregodevo/janis/engine"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -153,12 +154,12 @@ func (b *Backend) RMS(x engine.Tensor, eps float32) engine.Tensor {
 	})
 }
 
-// relInputsFor is the distances and the mask of a query at pos over n
-// cache slots: inputs of the step being recorded when the caches are its
+// relInputsFor is the distances and the mask of a query at pos over the n
+// cache slots from base: inputs of the step being recorded when the caches are its
 // padded views, tensors made for this call otherwise.
-func (b *Backend) relInputsFor(replay bool, pos, window, extent, n int) (idx, hidden *tensor) {
+func (b *Backend) relInputsFor(replay bool, pos, window, extent, base, n int) (idx, hidden *tensor) {
 	if replay {
-		key := [3]int{window, extent, n}
+		key := [4]int{window, extent, base, n}
 		b.mu.Lock()
 		rs := b.rec0
 		in := rs.rel[key]
@@ -167,19 +168,19 @@ func (b *Backend) relInputsFor(replay bool, pos, window, extent, n int) (idx, hi
 			return in.idx, in.hidden
 		}
 		in = &relInputs{idx: b.replayInput(engine.I32, 1, n), hidden: b.replayInput(engine.F32, 1, n+1)}
-		i, h := relMask(rs.offset, window, extent, n)
+		i, h := relMask(rs.offset, window, extent, base, n)
 		setInt32(in.idx, i)
 		setFloat32(in.hidden, h)
 		b.mu.Lock()
 		if rs.rel == nil {
-			rs.rel = map[[3]int]*relInputs{}
+			rs.rel = map[[4]int]*relInputs{}
 		}
 		rs.rel[key] = in
-		rs.limit = min(rs.limit, n)
+		rs.limit = min(rs.limit, base+n)
 		b.mu.Unlock()
 		return in.idx, in.hidden
 	}
-	i, h := relMask(pos, window, extent, n)
+	i, h := relMask(pos, window, extent, base, n)
 	return as(b.FromInt32(i, 1, n)), as(b.FromFloats(h, 1, n+1))
 }
 
@@ -232,25 +233,35 @@ func (b *Backend) RelAttend(q, k, v, rel, relProj, sinks engine.Tensor, pos, win
 			return nil
 		}
 	}
-	if tk.grp == nil || tv.grp == nil || !tv.grp.vt || tk.grp.vt {
+	if tk.grp == nil || tv.grp == nil || tk.grp.base == nil || tv.grp.base == nil || !tv.grp.vt || tk.grp.vt {
 		return nil
 	}
-	idx, hidden := b.relInputsFor(replay, pos, window, extent, n)
+	// A sliding layer reads the slots its window reaches from here to the
+	// end of the bucket, not the whole cache: a recorded step runs at this
+	// position and the ones after it.
+	base := 0
+	if window > 0 {
+		base = max(0, pos-(window-1))
+	}
+	n -= base
+	idx, hidden := b.relInputsFor(replay, pos, window, extent, base, n)
 	per := H / G
 	shape := []int{1, H, 1, D}
 	return b.op(engine.F32, shape, []*tensor{tq, tk, tv, tr, tp, proj, tsk, idx, hidden}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-		kk, vv := tk.t, tv.t
-		if !replay {
-			kk = cachePrefix(ctx, tk.grp, padTokens(tk.shape, n))
-			vv = cachePrefix(ctx, tv.grp, padTokens(tv.shape, n))
-		}
+		cn, cH, cG, cper, cD := C.int64_t(n), C.int64_t(H), C.int64_t(G), C.int64_t(per), C.int64_t(D)
+		// The slots base.. of the caches, where they are: the keys
+		// ne (D, n, G), the values kept tokens innermost ne (n, D, G).
+		kb, vb := tk.grp.base, tv.grp.base
+		kk := C.ggml_view_4d(ctx, kb, cD, cn, cG, 1, kb.nb[1], kb.nb[2], kb.nb[3], C.size_t(base)*C.size_t(kb.nb[1]))
+		C.ggml_backend_view_init(kk)
+		vT := C.ggml_view_4d(ctx, vb, cn, cD, cG, 1, vb.nb[1], vb.nb[2], vb.nb[3], C.size_t(base)*C.size_t(vb.nb[0]))
+		C.ggml_backend_view_init(vT)
 		if os.Getenv("JANIS_GGML_REL_F32") == "1" {
 			// For tests: the CPU's f16 matmul rounds the query to f16 too,
 			// which a tiny model of random weights turns into another reply.
 			kk = C.ggml_cast(ctx, C.ggml_cont(ctx, kk), C.GGML_TYPE_F32)
-			vv = C.ggml_cast(ctx, C.ggml_cont(ctx, vv), C.GGML_TYPE_F32)
+			vT = C.ggml_cast(ctx, C.ggml_cont(ctx, vT), C.GGML_TYPE_F32)
 		}
-		cn, cH, cG, cper, cD := C.int64_t(n), C.int64_t(H), C.int64_t(G), C.int64_t(per), C.int64_t(D)
 		// The bias of each head at each distance, ne (H, extent+1), then of
 		// each head for each slot: rows of that table by the slot's distance.
 		var pT *C.struct_ggml_tensor
@@ -269,14 +280,14 @@ func (b *Backend) RelAttend(q, k, v, rel, relProj, sinks engine.Tensor, pos, win
 		sink := C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, tsk)), 1, 1, cH)
 		p := C.ggml_soft_max_ext(ctx, C.ggml_concat(ctx, scores, sink, 0), hidden.t, 1, 0) // ne (n+1, 1, H)
 		p = C.ggml_cont(ctx, C.ggml_view_3d(ctx, p, cn, 1, cH, p.nb[1], p.nb[2], 0))
-		vT := C.ggml_transpose(ctx, vv) // ne (n, D, G)
-		if !C.ggml_is_transposed(vv) {
-			vT = C.ggml_cont(ctx, vT)
-		}
 		out := C.ggml_mul_mat(ctx, vT, C.ggml_reshape_3d(ctx, p, cn, cper, cG)) // ne (D, per, G)
 		return C.ggml_reshape_4d(ctx, out, cD, 1, cH, 1)
 	})
 }
+
+// relPieceBytes bounds what a chunk's attention holds at its peak: the
+// queries are taken in pieces that keep it under this.
+const relPieceBytes = 512 << 20
 
 // relRows are the inputs of a chunk's attention, kept for the forward pass
 // that made them: every layer of a kind reads the same.
@@ -354,8 +365,14 @@ func (b *Backend) relAttendRows(tq, tk, tv, tr, tp, proj, tsk *tensor, pos, wind
 	n := S - base
 	idx, hidden := b.relRowsFor(pos, L, window, extent, base, n)
 	per := H / G
+	// Five tensors of n by queries by heads floats are alive at the peak:
+	// a piece is the queries that keep them under relPieceBytes.
+	piece := max(16, min(L, relPieceBytes/(5*4*H*n)))
+	if v, err := strconv.Atoi(os.Getenv("JANIS_GGML_REL_PIECE")); err == nil && v > 0 {
+		piece = v // for measuring, and for tests
+	}
 	return b.op(engine.F32, []int{1, H, L, D}, []*tensor{tq, tk, tv, tr, tp, proj, tsk, idx, hidden}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-		cn, cL, cH, cG, cD := C.int64_t(n), C.int64_t(L), C.int64_t(H), C.int64_t(G), C.int64_t(D)
+		cn, cL, cH, cG, cD, cper := C.int64_t(n), C.int64_t(L), C.int64_t(H), C.int64_t(G), C.int64_t(D), C.int64_t(per)
 		// The slots base.. of the caches, where they are: the keys
 		// ne (D, n, G), the values kept tokens innermost ne (n, D, G).
 		kb, vb := tk.grp.base, tv.grp.base
@@ -374,18 +391,39 @@ func (b *Backend) relAttendRows(tq, tk, tv, tr, tp, proj, tsk *tensor, pos, wind
 			pT = C.ggml_scale(ctx, C.ggml_cont(ctx, C.ggml_transpose(ctx, f32(ctx, tp))), C.float(relScale))
 		}
 		// Each head's bias at each distance for each query, ne (H, L,
-		// extent+1), turned to (H, extent+1, L); then for each slot.
+		// extent+1), turned to (H, extent+1, L).
 		rows := C.ggml_mul_mat(ctx, C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tr)), C.int64_t(dr), cH*cL), pT)
 		rows = C.ggml_cont(ctx, C.ggml_permute(ctx, C.ggml_reshape_3d(ctx, rows, cH, cL, C.int64_t(extent+1)), 0, 2, 1, 3))
-		bias := C.ggml_get_rows(ctx, rows, idx.t)                      // ne (H, n, L)
-		bias = C.ggml_cont(ctx, C.ggml_permute(ctx, bias, 2, 0, 1, 3)) // ne (n, L, H)
-		qq := C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, tq)), cD, cL*C.int64_t(per), cG)
-		kq := C.ggml_reshape_3d(ctx, C.ggml_mul_mat(ctx, kk, qq), cn, cL, cH)
-		scores := C.ggml_add(ctx, C.ggml_scale(ctx, kq, C.float(scale)), bias)
-		sink := C.ggml_cont(ctx, C.ggml_transpose(ctx, C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tsk)), cH, cL))) // ne (L, H)
-		p := C.ggml_soft_max_ext(ctx, C.ggml_concat(ctx, scores, C.ggml_reshape_3d(ctx, sink, 1, cL, cH), 0), hidden.t, 1, 0)
-		p = C.ggml_cont(ctx, C.ggml_view_3d(ctx, p, cn, cL, cH, p.nb[1], p.nb[2], 0))
-		out := C.ggml_mul_mat(ctx, vT, C.ggml_reshape_3d(ctx, p, cn, cL*C.int64_t(per), cG)) // ne (D, L*per, G)
+		q4 := C.ggml_reshape_4d(ctx, contig(ctx, f32(ctx, tq)), cD, cL, cper, cG)
+		sinks := C.ggml_cont(ctx, C.ggml_transpose(ctx, C.ggml_reshape_2d(ctx, contig(ctx, f32(ctx, tsk)), cH, cL))) // ne (L, H)
+		// The queries a piece at a time: the gathered bias, the scores and
+		// the weights are tensors of slots by queries by heads, several
+		// alive at once, and a whole chunk of them over a long context is
+		// GBs (1,024 queries over 13k slots: 1.2 GB each).
+		var out *C.struct_ggml_tensor
+		for l0 := 0; l0 < L; l0 += piece {
+			ql := C.int64_t(min(piece, L-l0))
+			o := C.size_t(l0)
+			rp := C.ggml_view_3d(ctx, rows, cH, C.int64_t(extent+1), ql, rows.nb[1], rows.nb[2], o*C.size_t(rows.nb[2]))
+			ip := C.ggml_view_2d(ctx, idx.t, cn, ql, idx.t.nb[1], o*C.size_t(idx.t.nb[1]))
+			C.ggml_backend_view_init(ip)
+			hp := C.ggml_view_2d(ctx, hidden.t, cn+1, ql, hidden.t.nb[1], o*C.size_t(hidden.t.nb[1]))
+			C.ggml_backend_view_init(hp)
+			bias := C.ggml_cont(ctx, C.ggml_permute(ctx, C.ggml_get_rows(ctx, rp, ip), 2, 0, 1, 3)) // ne (n, ql, H)
+			qp := C.ggml_view_4d(ctx, q4, cD, ql, cper, cG, q4.nb[1], q4.nb[2], q4.nb[3], o*C.size_t(q4.nb[1]))
+			qp = C.ggml_reshape_3d(ctx, contig(ctx, qp), cD, ql*cper, cG)
+			kq := C.ggml_reshape_3d(ctx, C.ggml_mul_mat(ctx, kk, qp), cn, ql, cH)
+			scores := C.ggml_add(ctx, C.ggml_scale(ctx, kq, C.float(scale)), bias)
+			sp := contig(ctx, C.ggml_view_2d(ctx, sinks, ql, cH, sinks.nb[1], o*C.size_t(sinks.nb[0])))
+			p := C.ggml_soft_max_ext(ctx, C.ggml_concat(ctx, scores, C.ggml_reshape_3d(ctx, sp, 1, ql, cH), 0), hp, 1, 0)
+			p = C.ggml_cont(ctx, C.ggml_view_3d(ctx, p, cn, ql, cH, p.nb[1], p.nb[2], 0))
+			op := C.ggml_reshape_4d(ctx, C.ggml_mul_mat(ctx, vT, C.ggml_reshape_3d(ctx, p, cn, ql*cper, cG)), cD, ql, cper, cG)
+			if out == nil {
+				out = op
+			} else {
+				out = C.ggml_concat(ctx, out, op, 1)
+			}
+		}
 		return C.ggml_reshape_4d(ctx, out, cD, cL, cH, 1)
 	})
 }

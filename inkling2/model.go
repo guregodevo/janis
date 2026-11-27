@@ -313,20 +313,21 @@ func (m *Model) NewSession() *qwen.Session {
 	return s
 }
 
-// chunkBytes is what a prompt chunk's forward holds for each of its tokens,
-// beside the attention: the routed experts' activations at their widest
-// (TopK rows of twice the intermediate size, a dozen such tensors alive
-// through the MLP) and the states the pass keeps to its end (the block
-// outputs and the stream, counted as two hundred of hidden floats).
+// chunkBytes is what a prompt chunk's forward holds for each of its tokens:
+// the routed experts' activations at their widest (TopK rows of twice the
+// intermediate size, four such tensors alive through the MLP) and the
+// states the pass keeps (forty of hidden floats). Measured on the published
+// 4-bit model, a batch of a 1,024-token chunk is 361 MiB, 0.35 MiB a token;
+// this counts 0.63.
 func (m *Model) chunkBytes() int64 {
 	cfg := m.Cfg
-	return 4 * int64(12*cfg.TopK*2*cfg.Intermediate+200*cfg.Hidden)
+	return 4 * int64(4*cfg.TopK*2*cfg.Intermediate+40*cfg.Hidden)
 }
 
-// chunkContextBytes is what the attention holds for each chunk token and
-// each token of the context: the gathered bias, the scores and the weights
-// of every head, three tensors of floats alive at once.
-func (m *Model) chunkContextBytes() int64 { return 4 * 3 * int64(m.Cfg.Heads) }
+// chunkContextBytes is what a chunk token holds for each token of the
+// context: its row of the attention's distances and of its mask. The
+// scores themselves the backend bounds, taking the queries in pieces.
+func (m *Model) chunkContextBytes() int64 { return 8 }
 
 // cachedBytes is what a token of the context keeps in the caches of a
 // backend that keeps every layer's keys and values whole, in f16.

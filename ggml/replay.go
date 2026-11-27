@@ -183,9 +183,10 @@ type recording struct {
 	on        []bool
 
 	// What a step computes from its position: the distances and the mask
-	// of an attention with a relative bias, per (window, extent, bucket),
+	// of an attention with a relative bias, per (window, extent, first slot,
+	// slots),
 	// and the model's own tensors (StepFloats).
-	rel    map[[3]int]*relInputs
+	rel    map[[4]int]*relInputs
 	floats []stepFloats
 }
 
@@ -201,15 +202,15 @@ type stepFloats struct {
 	f func(pos int) []float32
 }
 
-// relMask is, for a query at pos over n cache slots holding positions
-// 0..n-1 and one sink after them: the bias row of each slot (its distance,
-// extent from there on) and the mask (-inf on the slots the query does not
-// see: the ones after it, and the ones window or more behind it).
-func relMask(pos, window, extent, n int) ([]int32, []float32) {
+// relMask is, for a query at pos over the n cache slots that hold positions
+// base..base+n-1 and one sink after them: the bias row of each slot (its
+// distance, extent from there on) and the mask (-inf on the slots the query
+// does not see: the ones after it, and the ones window or more behind it).
+func relMask(pos, window, extent, base, n int) ([]int32, []float32) {
 	idx, hidden := make([]int32, n), make([]float32, n+1)
 	ninf := float32(math.Inf(-1))
 	for j := 0; j < n; j++ {
-		d := pos - j
+		d := pos - (base + j)
 		idx[j] = int32(extent)
 		switch {
 		case d < 0 || (window > 0 && d >= window):
@@ -309,7 +310,7 @@ func (rs *recording) fill(offset int) {
 		setFloat32(t, v)
 	}
 	for k, in := range rs.rel {
-		idx, hidden := relMask(offset, k[0], k[1], k[2])
+		idx, hidden := relMask(offset, k[0], k[1], k[2], k[3])
 		setInt32(in.idx, idx)
 		setFloat32(in.hidden, hidden)
 	}
