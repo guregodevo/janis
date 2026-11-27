@@ -189,9 +189,15 @@ func (ld *loader) gate(prefix string) *MessageGate {
 // Forward mixes h and message, both [1, L, hidden], in float32.
 func (g *MessageGate) Forward(c *ctx, h, message engine.Tensor) engine.Tensor {
 	h = c.f32(h)
-	if c.rel != nil && h.Shape()[1] == 1 {
+	if L := h.Shape()[1]; c.rel != nil && L == 1 {
 		if out := c.rel.GateMix(h, message, g.DownT, g.ForgetT, g.AdmitT, defaultEps); out != nil {
 			return out
+		}
+	} else if c.rel != nil {
+		one := func(t engine.Tensor) []engine.Tensor { return []engine.Tensor{t} }
+		hidden := h.Shape()[2]
+		if out := c.rel.GateMixRows(c.Reshape(h, 1, L, 1, hidden), c.Reshape(message, 1, L, 1, hidden), one(g.DownT), one(g.ForgetT), one(g.AdmitT), defaultEps); out != nil {
+			return c.Reshape(out, 1, L, hidden)
 		}
 	}
 	s := c.Concat(c.rms(h, defaultEps), c.rms(message, defaultEps), 2)
@@ -293,8 +299,8 @@ func (l *Layer) Forward(c *ctx, h engine.Tensor, blocks []engine.Tensor, cache *
 		}
 	}
 	mixed := false
-	if messages != nil && c.rel != nil && h.Shape()[1] == 1 && in != nil {
-		// One token: the three gates as one batch, then the three norms.
+	if messages != nil && c.rel != nil && in != nil {
+		// The three gates as one batch, then the three norms.
 		if l.Sliding {
 			in = c.f32(q) // one input for the three
 		}

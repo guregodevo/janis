@@ -5,8 +5,8 @@ package ggml
 /*
 #include "ggml.h"
 #include "ggml-backend.h"
-static struct ggml_tensor * janis_new3(struct ggml_context * c, int64_t ne0, int64_t ne1, int64_t ne2) {
-	return ggml_new_tensor_3d(c, GGML_TYPE_F32, ne0, ne1, ne2);
+static struct ggml_tensor * janis_new4(struct ggml_context * c, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
+	return ggml_new_tensor_4d(c, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
 }
 */
 import "C"
@@ -464,6 +464,12 @@ func (b *Backend) DepthMix(stack, queryT engine.Tensor) engine.Tensor {
 			}
 			p := C.ggml_soft_max_ext(ctx, scores, nil, C.float(1/math.Sqrt(float64(D))), 0)                  // ne (S, Q, L)
 			stT := C.ggml_cont(ctx, C.ggml_permute(ctx, C.ggml_reshape_3d(ctx, st, cD, cS, cL), 1, 0, 2, 3)) // ne (S, D, L)
+			if Q == 1 {
+				// One query: the states times their weights, summed over the
+				// states. The batched matmul below is a thousand small
+				// products, 1 ms a call on a chunk of 1,024.
+				return C.ggml_reshape_4d(ctx, C.ggml_sum_rows(ctx, C.ggml_mul(ctx, stT, p)), cD, 1, cL, 1)
+			}
 			return C.ggml_reshape_4d(ctx, C.ggml_mul_mat(ctx, stT, p), cD, cQ, cL, 1)
 		})
 	}
@@ -483,8 +489,13 @@ func (b *Backend) WeightedSum(y, w engine.Tensor) engine.Tensor {
 	return b.op(engine.F32, []int{1, L, D}, []*tensor{ty, tw}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		cL, cK, cD := C.int64_t(L), C.int64_t(K), C.int64_t(D)
 		yT := C.ggml_cont(ctx, C.ggml_permute(ctx, C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, ty)), cD, cK, cL), 1, 0, 2, 3)) // ne (K, D, L)
-		out := C.ggml_mul_mat(ctx, yT, C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, tw)), cK, 1, cL))                           // ne (D, 1, L)
-		return C.ggml_reshape_3d(ctx, out, cD, cL, 1)
+		ww := C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, tw)), cK, 1, cL)
+		if L > 1 {
+			// A chunk: the rows times their weights, summed, where one
+			// matmul a token is a thousand small ones.
+			return C.ggml_reshape_3d(ctx, C.ggml_sum_rows(ctx, C.ggml_mul(ctx, yT, ww)), cD, cL, 1)
+		}
+		return C.ggml_reshape_3d(ctx, C.ggml_mul_mat(ctx, yT, ww), cD, cL, 1)
 	})
 }
 
@@ -677,23 +688,36 @@ func (b *Backend) GateMixRows(h, messages engine.Tensor, downT, forgetT, admitT 
 	if down == nil || gates == nil {
 		return nil
 	}
+	// h is [1, L, n, D], or [1, L, D] for one input shared by the n gates.
 	shared := len(th.shape) == 3
-	return b.op(engine.F32, []int{1, 1, n, D}, []*tensor{th, tm, down, gates}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-		cD, cn := C.int64_t(D), C.int64_t(n)
+	L := th.shape[1]
+	return b.op(engine.F32, []int{1, L, n, D}, []*tensor{th, tm, down, gates}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		cD, cL, cn := C.int64_t(D), C.int64_t(L), C.int64_t(n)
+		// Each gate's tokens as columns, the gates the batch: ne (D, 1, L, n).
+		rows := func(t *C.struct_ggml_tensor) *C.struct_ggml_tensor {
+			if L == 1 {
+				return C.ggml_reshape_4d(ctx, t, cD, 1, 1, cn)
+			}
+			return C.ggml_reshape_4d(ctx, C.ggml_cont(ctx, C.ggml_permute(ctx, C.ggml_reshape_3d(ctx, t, cD, cn, cL), 0, 2, 1, 3)), cD, 1, cL, cn)
+		}
 		var hh *C.struct_ggml_tensor
 		if shared {
-			hh = C.ggml_repeat(ctx, C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, th)), cD, 1, 1), C.janis_new3(ctx, cD, 1, cn))
+			hh = C.ggml_repeat(ctx, C.ggml_reshape_4d(ctx, contig(ctx, f32(ctx, th)), cD, 1, cL, 1), C.janis_new4(ctx, cD, 1, cL, cn))
 		} else {
-			hh = C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, th)), cD, 1, cn)
+			hh = rows(contig(ctx, f32(ctx, th)))
 		}
-		mm := C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, tm)), cD, 1, cn)
-		both := C.ggml_concat(ctx, hh, mm, 1) // ne (D, 2, n)
-		s := C.ggml_mul_mat(ctx, down.t, C.ggml_reshape_3d(ctx, C.ggml_rms_norm(ctx, both, C.float(eps)), 2*cD, 1, cn))
-		g := C.ggml_reshape_3d(ctx, C.ggml_tanh(ctx, C.ggml_mul_mat(ctx, gates.t, s)), cD, 2, cn) // -forget, admit
+		mm := rows(contig(ctx, f32(ctx, tm)))
+		both := C.ggml_concat(ctx, hh, mm, 1) // ne (D, 2, L, n)
+		s := C.ggml_mul_mat(ctx, down.t, C.ggml_reshape_3d(ctx, C.ggml_rms_norm(ctx, both, C.float(eps)), 2*cD, cL, cn))
+		g := C.ggml_reshape_4d(ctx, C.ggml_tanh(ctx, C.ggml_mul_mat(ctx, gates.t, s)), cD, 2, cL, cn) // -forget, admit
 		prod := C.ggml_mul(ctx, g, both)
-		out := C.ggml_add(ctx, hh, C.ggml_view_3d(ctx, prod, cD, 1, cn, prod.nb[1], prod.nb[2], 0))
-		out = C.ggml_add(ctx, out, C.ggml_view_3d(ctx, prod, cD, 1, cn, prod.nb[1], prod.nb[2], prod.nb[1]))
-		return C.ggml_reshape_2d(ctx, out, cD, cn)
+		out := C.ggml_add(ctx, hh, C.ggml_view_4d(ctx, prod, cD, 1, cL, cn, prod.nb[1], prod.nb[2], prod.nb[3], 0))
+		out = C.ggml_add(ctx, out, C.ggml_view_4d(ctx, prod, cD, 1, cL, cn, prod.nb[1], prod.nb[2], prod.nb[3], prod.nb[1]))
+		if L == 1 {
+			return C.ggml_reshape_2d(ctx, out, cD, cn)
+		}
+		// Back to each token's n rows together: ne (D, n, L).
+		return C.ggml_cont(ctx, C.ggml_permute(ctx, C.ggml_reshape_3d(ctx, out, cD, cL, cn), 0, 2, 1, 3))
 	})
 }
 

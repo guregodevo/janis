@@ -193,7 +193,15 @@ func TestGGMLATokensOperationsAreTheModels(t *testing.T) {
 			// on three inputs and on one shared by the three.
 			gates := []*MessageGate{l.QGate, l.KGate, l.VGate}
 			three, msgs := rnd(1, 1, 3, hidden), rnd(1, 1, 3, hidden)
-			for _, in := range []engine.Tensor{three, x} {
+			chunk, chunkMsgs, chunkOne := rnd(1, 3, 3, hidden), rnd(1, 3, 3, hidden), rnd(1, 3, hidden)
+			both(fmt.Sprintf("layer %d message gate, three tokens", i), func() engine.Tensor {
+				return l.MLPGate.Forward(c, chunkOne, c.pick(chunkMsgs, 0))
+			})
+			for n, in := range []engine.Tensor{three, x, chunk, chunkOne} {
+				msgs := msgs
+				if n >= 2 {
+					msgs = chunkMsgs
+				}
 				both(fmt.Sprintf("layer %d gates in a batch", i), func() engine.Tensor {
 					if c.rel != nil {
 						var d, f, a []engine.Tensor
