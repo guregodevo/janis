@@ -293,8 +293,10 @@ const relPieceBytes = 512 << 20
 // relSlidingPiece is how many queries of a chunk a sliding layer takes at a
 // time: each piece reads the slots its own queries' windows reach, window-1
 // before its first query and its own. A whole chunk of 1,024 queries reads
-// 2,047 slots for each, half of them masked; pieces of 256 read 1,279.
-const relSlidingPiece = 256
+// 2,047 slots for each, half of them masked; pieces of 128 read 1,151. A
+// 3.2k-token prompt read at 868, 956 and 1,006 tok/s in pieces of 512, 256
+// and 128 (RTX 5000 Ada, 2026-11-27).
+const relSlidingPiece = 128
 
 // relRows are the inputs of one piece of a chunk's attention, kept for the
 // forward pass that made them: every layer of a kind reads the same.
@@ -464,12 +466,6 @@ func (b *Backend) DepthMix(stack, queryT engine.Tensor) engine.Tensor {
 			}
 			p := C.ggml_soft_max_ext(ctx, scores, nil, C.float(1/math.Sqrt(float64(D))), 0)                  // ne (S, Q, L)
 			stT := C.ggml_cont(ctx, C.ggml_permute(ctx, C.ggml_reshape_3d(ctx, st, cD, cS, cL), 1, 0, 2, 3)) // ne (S, D, L)
-			if Q == 1 {
-				// One query: the states times their weights, summed over the
-				// states. The batched matmul below is a thousand small
-				// products, 1 ms a call on a chunk of 1,024.
-				return C.ggml_reshape_4d(ctx, C.ggml_sum_rows(ctx, C.ggml_mul(ctx, stT, p)), cD, 1, cL, 1)
-			}
 			return C.ggml_reshape_4d(ctx, C.ggml_mul_mat(ctx, stT, p), cD, cQ, cL, 1)
 		})
 	}
@@ -490,11 +486,6 @@ func (b *Backend) WeightedSum(y, w engine.Tensor) engine.Tensor {
 		cL, cK, cD := C.int64_t(L), C.int64_t(K), C.int64_t(D)
 		yT := C.ggml_cont(ctx, C.ggml_permute(ctx, C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, ty)), cD, cK, cL), 1, 0, 2, 3)) // ne (K, D, L)
 		ww := C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, tw)), cK, 1, cL)
-		if L > 1 {
-			// A chunk: the rows times their weights, summed, where one
-			// matmul a token is a thousand small ones.
-			return C.ggml_reshape_3d(ctx, C.ggml_sum_rows(ctx, C.ggml_mul(ctx, yT, ww)), cD, cL, 1)
-		}
 		return C.ggml_reshape_3d(ctx, C.ggml_mul_mat(ctx, yT, ww), cD, cL, 1)
 	})
 }
