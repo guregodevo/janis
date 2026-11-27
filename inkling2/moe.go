@@ -362,9 +362,10 @@ func (m *MoE) Forward(c *ctx, x engine.Tensor) engine.Tensor {
 	// of the chosen, normalized to sum to RouteScale.
 	scores := c.Sigmoid(c.MatMul(c.f32(x), m.RouterT)) // [1, L, experts]
 	idx := c.ops.TopK(c.Add(scores, m.RouterBias), k)  // [1, L, k]
-	// One token on a backend with these as operations: the two caps'
-	// factors leave the activation for the weights, which are linear in it.
-	fused := c.rel != nil && L == 1
+	// A backend with these as operations: the two caps' factors leave the
+	// activation for the weights, which are linear in it, and so does the
+	// down experts' own scale.
+	fused := c.rel != nil
 	var weights engine.Tensor
 	if fused {
 		weights = c.rel.RouteWeights(scores, idx, m.RouteScale*m.GateCap*m.UpCap)
@@ -402,8 +403,15 @@ func (m *MoE) Forward(c *ctx, x engine.Tensor) engine.Tensor {
 		}
 	}
 
+	if fused && m.Down.stream == nil {
+		if g := m.Down.Global; g != nil {
+			weights = c.Mul(weights, c.Reshape(c.TakeAxis(g, idx, 0), 1, L, k))
+		}
+		out := c.f32(c.Reshape(m.Down.matmul(c, c.model(act), m.Down.W, m.Down.Scales, m.Down.Biases, idx), 1, L, k, hidden))
+		return c.model(c.rel.WeightedSum(out, weights))
+	}
 	out := c.f32(c.Reshape(m.Down.forward(c, c.model(act), r), 1, L, k, hidden))
-	if c.rel != nil && L == 1 {
+	if fused {
 		return c.model(c.rel.WeightedSum(out, weights))
 	}
 	out = c.Mul(out, c.Reshape(weights, 1, L, k, 1))
