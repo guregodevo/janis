@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
+	"sync"
 
 	"github.com/guregodevo/janis/engine"
 )
@@ -140,10 +142,11 @@ func (b *Backend) modeStack(tw, ts *tensor, groupSize, bits int, mode string) *t
 	shape[len(shape)-1] = in
 	var typ C.enum_ggml_type
 	var raw []byte
+	var row func(r int)
 	if mode == "nvfp4" && in%64 == 0 && os.Getenv("JANIS_GGML_DENSE_EXPERTS") != "1" {
 		typ = C.GGML_TYPE_NVFP4
 		raw = make([]byte, rows*(in/64)*36)
-		for r := 0; r < rows; r++ {
+		row = func(r int) {
 			wr, sr := words[r*P*4:], scales[r*G:]
 			for blk := 0; blk < in/64; blk++ {
 				o := (r*(in/64) + blk) * 36
@@ -161,7 +164,15 @@ func (b *Backend) modeStack(tw, ts *tensor, groupSize, bits int, mode string) *t
 	} else {
 		typ = C.GGML_TYPE_F16
 		raw = make([]byte, rows*in*2)
-		for r := 0; r < rows; r++ {
+		var codes [256]float32 // a weight's code as a number
+		for c := range codes {
+			if bits == 4 {
+				codes[c] = e2m1[c&0xF]
+			} else {
+				codes[c] = e4m3(byte(c))
+			}
+		}
+		row = func(r int) {
 			for g := 0; g < G; g++ {
 				sb := scales[r*G+g]
 				var d float32
@@ -172,27 +183,61 @@ func (b *Backend) modeStack(tw, ts *tensor, groupSize, bits int, mode string) *t
 				}
 				for j := 0; j < groupSize; j++ {
 					i := g*groupSize + j
-					var v float32
+					c := words[r*P*4+i]
 					if bits == 4 {
-						v = e2m1[words[r*P*4+i/2]>>(4*uint(i%2))&0xF]
-					} else {
-						v = e4m3(words[r*P*4+i])
+						c = words[r*P*4+i/2] >> (4 * uint(i%2))
 					}
-					h := f16bits(v * d)
+					h := f16bits(codes[c] * d)
 					raw[(r*in+i)*2], raw[(r*in+i)*2+1] = byte(h), byte(h>>8)
 				}
 			}
 		}
 	}
+	var wg sync.WaitGroup
+	workers := runtime.NumCPU()
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for r := w; r < rows; r += workers {
+				row(r)
+			}
+		}(w)
+	}
+	wg.Wait()
 	q := b.newWeight(typ, shape, raw, mode+" experts")
 	tw.q4 = q
 	b.dropWords(tw)
 	return q
 }
 
-// f16bits is v as IEEE half precision, rounded to nearest.
+// f16bits is v as IEEE half precision, rounded to nearest even; past the
+// largest half it is that half, as a clipped weight.
 func f16bits(v float32) uint16 {
-	return uint16(C.ggml_fp32_to_fp16(C.float(v)))
+	x := math.Float32bits(v)
+	sign := uint16(x>>16) & 0x8000
+	exp := int(x>>23&0xFF) - 127 + 15
+	man := x & 0x7FFFFF
+	switch {
+	case exp >= 31:
+		return sign | 0x7BFF
+	case exp <= 0:
+		if exp < -10 {
+			return sign
+		}
+		man |= 0x800000
+		shift := uint(14 - exp)
+		h := man >> shift
+		if rem, half := man&(1<<shift-1), uint32(1)<<(shift-1); rem > half || rem == half && h&1 == 1 {
+			h++
+		}
+		return sign | uint16(h)
+	}
+	h := uint32(exp)<<10 | man>>13
+	if rem := man & 0x1FFF; rem > 0x1000 || rem == 0x1000 && h&1 == 1 {
+		h++
+	}
+	return sign | uint16(h)
 }
 
 // GatherModeMatmul is GatherQuantMatmul for experts with no zero points.
@@ -214,3 +259,6 @@ func (b *Backend) GatherModeMatmul(x, w, scales, rhsIndices engine.Tensor, group
 }
 
 var _ engine.LoopOps = (*Backend)(nil)
+
+// ggmlHalf is ggml's own conversion, which f16bits is tested against.
+func ggmlHalf(v float32) uint16 { return uint16(C.ggml_fp32_to_fp16(C.float(v))) }
