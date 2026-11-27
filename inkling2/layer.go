@@ -189,6 +189,11 @@ func (ld *loader) gate(prefix string) *MessageGate {
 // Forward mixes h and message, both [1, L, hidden], in float32.
 func (g *MessageGate) Forward(c *ctx, h, message engine.Tensor) engine.Tensor {
 	h = c.f32(h)
+	if c.rel != nil && h.Shape()[1] == 1 {
+		if out := c.rel.GateMix(h, message, g.DownT, g.ForgetT, g.AdmitT, defaultEps); out != nil {
+			return out
+		}
+	}
 	s := c.Concat(c.rms(h, defaultEps), c.rms(message, defaultEps), 2)
 	s = c.f32(c.MatMul(c.model(s), g.DownT))
 	forget := c.Tanh(c.MatMul(s, g.ForgetT))
@@ -293,8 +298,7 @@ func (l *Layer) Forward(c *ctx, h engine.Tensor, blocks []engine.Tensor, cache *
 		k, v = q, q
 	}
 	a := l.Attn.Forward(c, q, k, v, cache, pos, masks, eps)
-	a, win := c.shortConv(a, l.AttnConv, cache.Conv[2])
-	cache.slide(c, 2, win, masks.cfg.ConvKernel)
+	a = c.shortConv(a, l.AttnConv, cache, 2)
 
 	residual := c.f32(a)
 	if l.Boundary {
@@ -308,8 +312,7 @@ func (l *Layer) Forward(c *ctx, h engine.Tensor, blocks []engine.Tensor, cache *
 		x = l.MLPGate.Forward(c, x, c.pick(messages, 3))
 	}
 	x = l.MLP.Forward(c, c.model(l.PostNorm.Forward(c, x)))
-	x, win = c.shortConv(x, l.MLPConv, cache.Conv[3])
-	cache.slide(c, 3, win, masks.cfg.ConvKernel)
+	x = c.shortConv(x, l.MLPConv, cache, 3)
 	cache.steps += h.Shape()[1]
 	return c.model(c.Add(residual, c.f32(x))), blocks
 }

@@ -84,11 +84,18 @@ func loadAttention(c *ctx, st *safetensors.File, prefix string, cfg Config, slid
 // dynamicConv is the full layers' short convolution: the filter of each
 // position is a static weight plus one its own input chooses, per head.
 // x is [1, L, C], in the layer input the projection x was made from.
-func (a *Attention) dynamicConv(c *ctx, x, in, static engine.Tensor, dyn projection, tail engine.Tensor) (engine.Tensor, engine.Tensor) {
+func (a *Attention) dynamicConv(c *ctx, x, in, static engine.Tensor, dyn projection, cache *VisitCache, slot int) engine.Tensor {
 	L, K, H, D := x.Shape()[1], a.Kernel, a.KVHeads, a.HeadDim
-	weights := c.Reshape(c.f32(dyn.Forward(c, in)), 1, L, H, 1, K)
+	chosen := c.f32(dyn.Forward(c, in)) // [1, L, H*K]
+	if window := c.tapWindow(x, cache.Conv[slot]); window != nil {
+		if out := c.rel.ConvTapsDyn(window, static, chosen); out != nil {
+			cache.Conv[slot] = c.Slice(window, 2, 1, K)
+			return c.model(out)
+		}
+	}
+	weights := c.Reshape(chosen, 1, L, H, 1, K)
 	weights = c.Add(weights, static) // [1, L, H, D, K]
-	window := c.convWindow(x, tail, K)
+	window := c.convWindow(x, cache.tail(c, slot), K)
 	var out engine.Tensor
 	for lag := 0; lag < K; lag++ {
 		at := K - 1 - lag
@@ -102,7 +109,8 @@ func (a *Attention) dynamicConv(c *ctx, x, in, static engine.Tensor, dyn project
 	}
 	out = c.Add(c.Reshape(out, 1, L, H*D), c.f32(x))
 	out = c.ScalarMul(out, float32(1/math.Sqrt(float64(2*K+1))))
-	return c.model(out), window
+	cache.slide(c, slot, window, K)
+	return c.model(out)
 }
 
 // Forward runs attention for L new tokens at positions pos.. on the query,
@@ -111,16 +119,13 @@ func (a *Attention) dynamicConv(c *ctx, x, in, static engine.Tensor, dyn project
 func (a *Attention) Forward(c *ctx, qIn, kIn, vIn engine.Tensor, cache *VisitCache, pos int, masks *maskMaker, eps float32) engine.Tensor {
 	L, H, G, D := qIn.Shape()[1], a.Heads, a.KVHeads, a.HeadDim
 	var keys, values engine.Tensor
-	var kWin, vWin engine.Tensor
 	if a.Window > 0 {
-		keys, kWin = c.shortConv(a.K.Forward(c, kIn), a.KConv, cache.Conv[0])
-		values, vWin = c.shortConv(a.V.Forward(c, vIn), a.VConv, cache.Conv[1])
+		keys = c.shortConv(a.K.Forward(c, kIn), a.KConv, cache, 0)
+		values = c.shortConv(a.V.Forward(c, vIn), a.VConv, cache, 1)
 	} else {
-		keys, kWin = a.dynamicConv(c, a.K.Forward(c, kIn), kIn, a.KStatic, a.KDyn, cache.Conv[0])
-		values, vWin = a.dynamicConv(c, a.V.Forward(c, vIn), vIn, a.VStatic, a.VDyn, cache.Conv[1])
+		keys = a.dynamicConv(c, a.K.Forward(c, kIn), kIn, a.KStatic, a.KDyn, cache, 0)
+		values = a.dynamicConv(c, a.V.Forward(c, vIn), vIn, a.VStatic, a.VDyn, cache, 1)
 	}
-	cache.slide(c, 0, kWin, a.Kernel)
-	cache.slide(c, 1, vWin, a.Kernel)
 	gate := a.Gate.Forward(c, qIn)
 	sinks := a.Sink.Forward(c, qIn) // [1, L, H]
 
@@ -141,8 +146,7 @@ func (a *Attention) Forward(c *ctx, qIn, kIn, vIn engine.Tensor, cache *VisitCac
 	// One token on a backend that has the attention as an operation: the
 	// bias table and the sink go to it, and it reads the caches in place.
 	if c.rel != nil && L == 1 && a.RelProjFar != nil {
-		table := c.MatMul(c.f32(rel), a.RelProjFar) // [1, 1, H, RelExtent+1]
-		if out := c.rel.RelAttend(c.f32(q), k, v, table, c.f32(sinks), pos, a.Window, scale); out != nil {
+		if out := c.rel.RelAttend(c.f32(q), k, v, c.f32(rel), a.RelProjFar, c.f32(sinks), pos, a.Window, scale); out != nil {
 			out = c.Reshape(out, 1, 1, H*D)
 			out = c.Mul(out, c.Sigmoid(c.f32(gate)))
 			return a.O.Forward(c, c.model(out))

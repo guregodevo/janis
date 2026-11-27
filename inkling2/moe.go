@@ -375,6 +375,9 @@ func (m *MoE) Forward(c *ctx, x engine.Tensor) engine.Tensor {
 	act = c.Mul(act, c.ScalarMul(c.Tanh(c.ScalarMul(up, 1/m.UpCap)), m.UpCap))
 
 	out := c.f32(c.Reshape(m.Down.forward(c, c.model(act), r), 1, L, k, hidden))
+	if c.rel != nil && L == 1 {
+		return c.model(c.rel.WeightedSum(out, weights))
+	}
 	out = c.Mul(out, c.Reshape(weights, 1, L, k, 1))
 	return c.model(c.ScalarMul(c.Mean(out, 2), float32(k)))
 }

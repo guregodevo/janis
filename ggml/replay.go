@@ -253,7 +253,7 @@ func (b *Backend) recordEmbed(out *tensor, gw, gs, gb *gatherRef, groupSize, bit
 // replayInput is a pinned leaf the step writes before each run.
 func (b *Backend) replayInput(dt engine.DType, shape ...int) *tensor {
 	t := b.newFrom(dt, shape, nil, 0)
-	t.pin = true
+	t.pin, t.input = true, true
 	return t
 }
 

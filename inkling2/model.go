@@ -157,6 +157,12 @@ func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, erro
 			return nil, err
 		}
 	}
+	if c.rel != nil {
+		// The weights the load computed (a transpose, a cast) are computed
+		// now: the backend makes what it needs of a weight once, from its
+		// values.
+		b.Eval()
+	}
 	return m, nil
 }
 

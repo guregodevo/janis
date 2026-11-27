@@ -201,6 +201,9 @@ type Backend struct {
 	// nominally free. A batch that does not fit, or finds every arena busy,
 	// gets a buffer of its own as before.
 	arenas []*arena
+	// lagOrder holds, per (heads, kernel), the index that puts a dynamic
+	// convolution's taps in the window's order (ConvTapsDyn).
+	lagOrder map[[2]int]*tensor
 	// rec0 is the decode step being recorded (replay.go), nil otherwise.
 	rec0 *recording
 }
@@ -364,8 +367,13 @@ type tensor struct {
 	sums   *tensor
 	sumsGS int
 	f32w   *tensor // a small bf16 weight's f32 copy (f32Weight)
-	pin    bool    // survives Sweep
-	freed  bool
+	// made holds what was made of a weight once and is kept with it, by
+	// what it is for: its transpose for a matmul, a convolution's taps.
+	made map[string]*tensor
+	// input: a recorded step writes it before each run; never a weight.
+	input bool
+	pin   bool // survives Sweep
+	freed bool
 	// gathered: rows of this packed weight were taken (the embedding), so
 	// its words stay after the repack; a weight only ever multiplied keeps
 	// the Q4_1 copy alone.
@@ -561,6 +569,12 @@ func (t *tensor) free() {
 		memMu.Lock()
 	}
 	t.sums = nil
+	for k, w := range t.made {
+		delete(t.made, k)
+		memMu.Unlock()
+		w.free()
+		memMu.Lock()
+	}
 	if t.f32w != nil {
 		w := t.f32w
 		t.f32w = nil
@@ -2108,6 +2122,12 @@ func (b *Backend) MatMul(a, bb engine.Tensor) engine.Tensor {
 	na, nb := len(ta.shape), len(tb.shape)
 	shape := append([]int(nil), broadcastShape(ta.shape[:na-2], tb.shape[:nb-2])...)
 	shape = append(shape, ta.shape[na-2], tb.shape[nb-1])
+	if wT := b.transposedWeight(tb); wT != nil {
+		// A weight: its transpose was made once, not copied every step.
+		return b.op(engine.F32, shape, []*tensor{ta, tb, wT}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+			return C.ggml_mul_mat(ctx, wT.t, f32(ctx, ta))
+		})
+	}
 	return b.op(engine.F32, shape, []*tensor{ta, tb}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		wT := C.ggml_cont(ctx, C.ggml_transpose(ctx, f32(ctx, tb)))
 		return C.ggml_mul_mat(ctx, wT, f32(ctx, ta))

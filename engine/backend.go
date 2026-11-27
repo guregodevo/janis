@@ -255,13 +255,14 @@ type RowScatterer interface {
 type RelAttention interface {
 	// RelAttend is the attention of the query at position pos, q
 	// [1, H, 1, D], over the keys and values k, v [1, G, pos+1, D] of
-	// positions 0..pos. table [1, 1, H, R+1] is the query's bias for each
-	// head at distances 0..R-1, then the bias of every distance from R on;
-	// sinks [1, 1, H] is the logit that joins each head's softmax and
-	// takes its share away. window bounds how far back the query sees (0:
-	// everything). It returns [1, H, 1, D], or nil when the caches cannot
-	// be read this way and the caller computes the attention itself.
-	RelAttend(q, k, v, table, sinks Tensor, pos, window int, scale float32) Tensor
+	// positions 0..pos. rel [1, 1, H, d_rel] times relProj [d_rel, R+1] is
+	// the query's bias for each head at distances 0..R-1, then the bias of
+	// every distance from R on; sinks [1, 1, H] is the logit that joins
+	// each head's softmax and takes its share away. window bounds how far
+	// back the query sees (0: everything). It returns [1, H, 1, D], or nil
+	// when the caches cannot be read this way and the caller computes the
+	// attention itself.
+	RelAttend(q, k, v, rel, relProj, sinks Tensor, pos, window int, scale float32) Tensor
 	// AppendValuesT is Concat along the token axis (2) for a value cache
 	// kept in the layout RelAttend reads.
 	AppendValuesT(cache, x Tensor) Tensor
@@ -273,6 +274,29 @@ type RelAttention interface {
 	L2Clip(x Tensor, threshold float32) Tensor
 	// RMS is RMSNorm with no weight.
 	RMS(x Tensor, eps float32) Tensor
+	// DepthMix mixes the states stack [1, 1, S, D] once per query of
+	// queryT [D, Q]: a softmax over the states of their scores against the
+	// query, scaled by 1/sqrt(D), weighs them -> [1, 1, Q, D]. Nil when
+	// queryT is not a weight.
+	DepthMix(stack, queryT Tensor) Tensor
+	// WeightedSum is the sum over k of y [1, 1, k, D] times w [1, 1, k]
+	// -> [1, 1, D].
+	WeightedSum(y, w Tensor) Tensor
+	// ConvTaps is one position of a short causal convolution with its
+	// residual: window [1, C, K] holds, per channel, the last K inputs
+	// (the newest last), taps [C, K, 1] the filter. The result is
+	// (input + sum over the taps) / sqrt(K+1), [1, 1, C]. With dyn
+	// [1, 1, H*K] and static [H, C/H, K], the filter of head h's channels
+	// is static plus dyn's K values for h, both indexed by lag (0 the
+	// newest), and the result is divided by sqrt(2K+1). Nil when the
+	// filter is not a weight.
+	ConvTaps(window, taps Tensor) Tensor
+	ConvTapsDyn(window, static, dyn Tensor) Tensor
+	// GateMix mixes h and message, both [1, 1, D]: with s their two
+	// weightless RMS norms side by side times downT [2D, rank],
+	// h*(1 - tanh(s·forgetT)) + message*tanh(s·admitT), forgetT and admitT
+	// [rank, D]. Nil when the three are not weights.
+	GateMix(h, message, downT, forgetT, admitT Tensor, eps float32) Tensor
 }
 
 // LoopOps is implemented by backends that carry the operations the looped

@@ -101,6 +101,11 @@ func (c *ctx) depthAttention(blocks []engine.Tensor, current, queryT engine.Tens
 	if len(blocks) > 0 {
 		stacked = c.Concat(c.stack(blocks), stacked, 2)
 	}
+	if c.rel != nil && current.Shape()[1] == 1 {
+		if out := c.rel.DepthMix(stacked, queryT); out != nil {
+			return out
+		}
+	}
 	dims := current.Shape()[2]
 	scores := c.ScalarMul(c.MatMul(stacked, queryT), float32(1/math.Sqrt(float64(dims))))
 	weights := c.Softmax(scores, 2)
@@ -109,15 +114,34 @@ func (c *ctx) depthAttention(blocks []engine.Tensor, current, queryT engine.Tens
 
 // shortConv is the static short convolution: a causal depthwise filter over
 // the last kernel inputs, added to the input. x is [1, L, C] in the model
-// dtype, w [C, K, 1], tail the last K-1 inputs of the steps before (nil at
-// the start). It returns the output and the whole input it read, tail
-// first.
-func (c *ctx) shortConv(x, w, tail engine.Tensor) (engine.Tensor, engine.Tensor) {
+// dtype, w [C, K, 1]; the last K-1 inputs of the steps before are slot's
+// tail in cache, which is slid on to this forward's.
+func (c *ctx) shortConv(x, w engine.Tensor, cache *VisitCache, slot int) engine.Tensor {
 	k := w.Shape()[1]
-	window := c.convWindow(x, tail, k)
+	if window := c.tapWindow(x, cache.Conv[slot]); window != nil {
+		if out := c.rel.ConvTaps(window, w); out != nil {
+			cache.Conv[slot] = c.Slice(window, 2, 1, k)
+			return c.model(out)
+		}
+	}
+	window := c.convWindow(x, cache.tail(c, slot), k)
 	out := c.f32(c.Conv1dDepthwise(c.model(window), w))
 	out = c.ScalarMul(c.Add(out, c.f32(x)), float32(1/math.Sqrt(float64(k+1))))
-	return c.model(out), window
+	cache.slide(c, slot, window, k)
+	return c.model(out)
+}
+
+// tapWindow is one token's convolution input per channel, [1, C, K] with
+// the newest last, on a backend that takes it so (engine.RelAttention):
+// the tail is kept [1, C, K-1] there, and the token joins it with no copy
+// of the tail's rows turned around. Nil for more than one token, at the
+// first one, and on any other backend.
+func (c *ctx) tapWindow(x, tail engine.Tensor) engine.Tensor {
+	s := x.Shape()
+	if c.rel == nil || s[1] != 1 || tail == nil {
+		return nil
+	}
+	return c.Concat(tail, c.Reshape(c.f32(x), 1, s[2], 1), 2)
 }
 
 func (c *ctx) convWindow(x, tail engine.Tensor, k int) engine.Tensor {

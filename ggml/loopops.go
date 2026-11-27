@@ -47,7 +47,12 @@ func (b *Backend) TopK(x engine.Tensor, k int) engine.Tensor {
 	shape := append([]int(nil), tx.shape...)
 	shape[len(shape)-1] = k
 	return b.op(engine.I32, shape, []*tensor{tx}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
-		return C.ggml_cont(ctx, C.ggml_argsort_top_k(ctx, contig(ctx, f32(ctx, tx)), C.int(k)))
+		top := C.ggml_argsort_top_k(ctx, contig(ctx, f32(ctx, tx)), C.int(k))
+		if C.ggml_is_contiguous(top) { // one row: its first k lie together
+			m := ne(shape)
+			return C.ggml_reshape_4d(ctx, top, m[0], m[1], m[2], m[3])
+		}
+		return C.ggml_cont(ctx, top)
 	})
 }
 
@@ -93,7 +98,7 @@ func (b *Backend) TakeAlong(a, indices engine.Tensor, axis int) engine.Tensor {
 		rows := C.ggml_reshape_3d(ctx, contig(ctx, f32(ctx, ts)), C.int64_t(W), C.int64_t(N), C.int64_t(T))
 		ids := C.ggml_reshape_2d(ctx, contig(ctx, ti.t), C.int64_t(K), C.int64_t(T))
 		m := ne(moved)
-		return C.ggml_cont(ctx, C.ggml_reshape_4d(ctx, C.ggml_get_rows(ctx, rows, ids), m[0], m[1], m[2], m[3]))
+		return C.ggml_reshape_4d(ctx, C.ggml_get_rows(ctx, rows, ids), m[0], m[1], m[2], m[3])
 	})
 	if len(wide) == 0 {
 		return got
@@ -254,7 +259,7 @@ func (b *Backend) GatherModeMatmul(x, w, scales, rhsIndices engine.Tensor, group
 		ids := C.ggml_reshape_2d(ctx, contig(ctx, ti.t), C.int64_t(K), C.int64_t(nTok))
 		r := C.ggml_mul_mat_id(ctx, q.t, xb, ids) // ne (out, K, nTok)
 		m := ne(shape)
-		return C.ggml_cont(ctx, C.ggml_reshape_4d(ctx, r, m[0], m[1], m[2], m[3]))
+		return C.ggml_reshape_4d(ctx, r, m[0], m[1], m[2], m[3])
 	})
 }
 

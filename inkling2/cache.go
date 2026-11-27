@@ -13,8 +13,11 @@ const convSlots = 4
 // A convolution tail holds no history and a sliding layer drops its old
 // keys, so the cache returns only to a mark, as a recurrent layer's does.
 type VisitCache struct {
-	K, V  engine.Tensor            // [1, kv heads, T, head dim], model dtype
-	Conv  [convSlots]engine.Tensor // [1, kernel-1, channels], float32
+	K, V engine.Tensor // [1, kv heads, T, head dim], model dtype
+	// Conv is each convolution's tail, float32: [1, kernel-1, channels],
+	// or [1, channels, kernel-1] when rel is set (the layout a token's
+	// input joins without a copy; tail and slide turn it around).
+	Conv  [convSlots]engine.Tensor
 	steps int
 
 	// rel is set on a backend that runs a decode step's attention itself
@@ -81,7 +84,7 @@ func (c *VisitCache) Truncate(b engine.Backend, n int) {
 			}
 		}
 		for i, w := range s.windows {
-			c.Conv[i] = b.Slice(w, 1, kept, kept+s.tail)
+			c.Conv[i] = c.kept(b, b.Slice(w, 1, kept, kept+s.tail))
 		}
 		c.steps, c.last = n, nil
 		for at := range c.marks {
@@ -181,7 +184,23 @@ func (c *VisitCache) slide(b engine.Backend, slot int, window engine.Tensor, ker
 		c.last.windows[slot], c.last.tail = window, kernel-1
 	}
 	n := window.Shape()[1]
-	c.Conv[slot] = b.Slice(window, 1, n-(kernel-1), n)
+	c.Conv[slot] = c.kept(b, b.Slice(window, 1, n-(kernel-1), n))
+}
+
+// kept is a tail [1, kernel-1, channels] in the layout the cache keeps.
+func (c *VisitCache) kept(b engine.Backend, tail engine.Tensor) engine.Tensor {
+	if c.rel != nil {
+		return b.Transpose(tail, 0, 2, 1)
+	}
+	return tail
+}
+
+// tail is slot's tail as [1, kernel-1, channels], nil at the start.
+func (c *VisitCache) tail(b engine.Backend, slot int) engine.Tensor {
+	if t := c.Conv[slot]; t != nil && c.rel != nil {
+		return b.Transpose(t, 0, 2, 1)
+	}
+	return c.Conv[slot]
 }
 
 // Carry is the state a recorded decode step reads and replaces: the tails
