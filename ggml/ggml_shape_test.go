@@ -556,3 +556,12 @@ func TestAnOffsetsDigitsAreTheOffset(t *testing.T) {
 		}
 	}
 }
+
+// A HALF MADE HERE IS THE HALF GGML MAKES.
+func TestF16BitsIsGGMLsHalf(t *testing.T) {
+	for _, v := range []float32{0, 1, -1, 0.1, -3.14159, 65504, 1e-5, 6e-8, 3e-8, 448 * 6, 1.0009766, 1.0004883, 1.0014648, 5.9e-8, -2.5e-6} {
+		if got, want := f16bits(v), ggmlHalf(v); got != want {
+			t.Errorf("f16bits(%g) = %#04x, ggml gives %#04x", v, got, want)
+		}
+	}
+}

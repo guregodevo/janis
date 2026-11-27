@@ -28,6 +28,9 @@ type expertStack struct {
 	// Global is each expert's own scale over its nvfp4 block scales, already
 	// divided by nvfp4Unit: float32 [experts]. Nil when the stack has none.
 	Global engine.Tensor
+	// paired: the backend gives the stack's output rows as the first
+	// projection's, then the second's, not alternating (PairRows).
+	paired bool
 	// Biases are the zero points of an affine stack (Mode "affine"), nil
 	// for the floating-point modes.
 	Biases          engine.Tensor
@@ -345,6 +348,9 @@ func loadMoE(c *ctx, st *safetensors.File, prefix string, cfg Config) (*MoE, err
 		m.GateUp = ld.experts(prefix+".experts.gate_up_proj", cfg.Hidden)
 	}
 	m.Down = ld.experts(prefix+".experts.down_proj", cfg.Intermediate)
+	if g := m.GateUp; g != nil && c.rel != nil && g.W != nil && g.Mode != "affine" {
+		g.paired = c.rel.PairRows(g.W)
+	}
 	return m, ld.err
 }
 
@@ -356,25 +362,50 @@ func (m *MoE) Forward(c *ctx, x engine.Tensor) engine.Tensor {
 	// of the chosen, normalized to sum to RouteScale.
 	scores := c.Sigmoid(c.MatMul(c.f32(x), m.RouterT)) // [1, L, experts]
 	idx := c.ops.TopK(c.Add(scores, m.RouterBias), k)  // [1, L, k]
-	weights := c.ops.TakeAlong(scores, idx, 2)
-	weights = c.ops.Div(weights, c.ScalarAdd(c.sumLast(weights), 1e-20))
-	weights = c.ScalarMul(weights, m.RouteScale)
+	// One token on a backend with these as operations: the two caps'
+	// factors leave the activation for the weights, which are linear in it.
+	fused := c.rel != nil && L == 1
+	var weights engine.Tensor
+	if fused {
+		weights = c.rel.RouteWeights(scores, idx, m.RouteScale*m.GateCap*m.UpCap)
+	} else {
+		weights = c.ops.TakeAlong(scores, idx, 2)
+		weights = c.ops.Div(weights, c.ScalarAdd(c.sumLast(weights), 1e-20))
+		weights = c.ScalarMul(weights, m.RouteScale)
+	}
 
 	r := m.route(c, idx)
 	xe := c.Reshape(x, 1, L, 1, 1, hidden)
-	var gate, up engine.Tensor
-	if m.GateUp != nil {
-		gu := c.Reshape(m.GateUp.forward(c, xe, r), 1, L, k, I, 2)
-		gate = c.f32(c.Reshape(c.Slice(gu, 4, 0, 1), 1, L, k, 1, I))
-		up = c.f32(c.Reshape(c.Slice(gu, 4, 1, 2), 1, L, k, 1, I))
+	var act engine.Tensor
+	if fused && m.GateUp != nil && m.GateUp.paired {
+		act = c.rel.CappedSwiGLU(c.f32(m.GateUp.forward(c, xe, r)), m.GateCap, m.UpCap)
 	} else {
-		gate, up = c.f32(m.Gate.forward(c, xe, r)), c.f32(m.Up.forward(c, xe, r))
+		var gate, up engine.Tensor
+		switch {
+		case m.GateUp != nil && m.GateUp.paired:
+			gu := m.GateUp.forward(c, xe, r) // [1, L, k, 1, 2I]: gate's rows, then up's
+			gate, up = c.f32(c.Slice(gu, 4, 0, I)), c.f32(c.Slice(gu, 4, I, 2*I))
+		case m.GateUp != nil:
+			gu := c.Reshape(m.GateUp.forward(c, xe, r), 1, L, k, I, 2)
+			gate = c.f32(c.Reshape(c.Slice(gu, 4, 0, 1), 1, L, k, 1, I))
+			up = c.f32(c.Reshape(c.Slice(gu, 4, 1, 2), 1, L, k, 1, I))
+		default:
+			gate, up = c.f32(m.Gate.forward(c, xe, r)), c.f32(m.Up.forward(c, xe, r))
+		}
+		// SwiGLU with both branches softly capped: tanh(x/cap)*cap.
+		if fused {
+			act = c.Mul(c.Tanh(c.ScalarMul(gate, 1/m.GateCap)), c.Sigmoid(gate))
+			act = c.Mul(act, c.Tanh(c.ScalarMul(up, 1/m.UpCap)))
+		} else {
+			act = c.Mul(c.ScalarMul(c.Tanh(c.ScalarMul(gate, 1/m.GateCap)), m.GateCap), c.Sigmoid(gate))
+			act = c.Mul(act, c.ScalarMul(c.Tanh(c.ScalarMul(up, 1/m.UpCap)), m.UpCap))
+		}
 	}
-	// SwiGLU with both branches softly capped: tanh(x/cap)*cap.
-	act := c.Mul(c.ScalarMul(c.Tanh(c.ScalarMul(gate, 1/m.GateCap)), m.GateCap), c.Sigmoid(gate))
-	act = c.Mul(act, c.ScalarMul(c.Tanh(c.ScalarMul(up, 1/m.UpCap)), m.UpCap))
 
 	out := c.f32(c.Reshape(m.Down.forward(c, c.model(act), r), 1, L, k, hidden))
+	if c.rel != nil && L == 1 {
+		return c.model(c.rel.WeightedSum(out, weights))
+	}
 	out = c.Mul(out, c.Reshape(weights, 1, L, k, 1))
 	return c.model(c.ScalarMul(c.Mean(out, 2), float32(k)))
 }

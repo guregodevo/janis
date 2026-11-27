@@ -248,6 +248,87 @@ type RowScatterer interface {
 	ScatterRows(dst Tensor, indices []int32, updates Tensor) Tensor
 }
 
+// RelAttention is a backend that runs a one-token decode step of Inkling 2's
+// attention as one operation over caches it reads in place, so that the
+// step can be recorded once and run again (StepReplayer): what moves with
+// the position is an input the backend writes, not the graph's shape.
+type RelAttention interface {
+	// RelAttend is the attention of the query at position pos, q
+	// [1, H, 1, D], over the keys and values k, v [1, G, pos+1, D] of
+	// positions 0..pos. relScale times rel [1, 1, H, d_rel] times relProj
+	// [d_rel, R+1] is the query's bias for each head at distances 0..R-1,
+	// then the bias of every distance from R on; sinks [1, 1, H] is the
+	// logit that joins each head's softmax and takes its share away.
+	// window bounds how far back the query sees (0: everything). It
+	// returns [1, H, 1, D], or nil when the caches cannot be read this way
+	// and the caller computes the attention itself.
+	RelAttend(q, k, v, rel, relProj, sinks Tensor, pos, window int, scale, relScale float32) Tensor
+	// AppendValuesT is Concat along the token axis (2) for a value cache
+	// kept in the layout RelAttend reads.
+	AppendValuesT(cache, x Tensor) Tensor
+	// StepFloats is a tensor of shape holding f(pos), which a recorded
+	// step computes again for each position it runs at.
+	StepFloats(pos int, f func(pos int) []float32, shape ...int) Tensor
+	// PrefillFit is the largest prefill window, of 64 to 2,048 tokens by
+	// doubling, whose forward fits in half of the memory the device has
+	// free once the prompt's tokens are cached at perCached bytes each,
+	// when a chunk token costs perToken bytes and perContext more for each
+	// token of the context. 0 when the backend has no count to offer.
+	PrefillFit(perToken, perContext, perCached int64, tokens int) int
+	// L2Clip shrinks each row of x (over the last axis) whose L2 norm is
+	// above threshold down to it.
+	L2Clip(x Tensor, threshold float32) Tensor
+	// L2Unit is L2Clip divided by threshold: a row of norm threshold or
+	// more comes out of norm 1.
+	L2Unit(x Tensor, threshold float32) Tensor
+	// RMS is RMSNorm with no weight.
+	RMS(x Tensor, eps float32) Tensor
+	// DepthMix mixes the states stack [1, 1, S, D] once per query of
+	// queryT [D, Q]: a softmax over the states of their scores against the
+	// query, scaled by 1/sqrt(D), weighs them -> [1, 1, Q, D]. Nil when
+	// queryT is not a weight.
+	DepthMix(stack, queryT Tensor) Tensor
+	// WeightedSum is the sum over k of y [1, 1, k, D] times w [1, 1, k]
+	// -> [1, 1, D].
+	WeightedSum(y, w Tensor) Tensor
+	// ConvTaps is one position of a short causal convolution with its
+	// residual: window [1, C, K] holds, per channel, the last K inputs
+	// (the newest last), taps [C, K, 1] the filter. The result is
+	// (input + sum over the taps) / sqrt(K+1), [1, 1, C]. With dyn
+	// [1, 1, H*K] and static [H, C/H, K], the filter of head h's channels
+	// is static plus dyn's K values for h, both indexed by lag (0 the
+	// newest), and the result is divided by sqrt(2K+1). Nil when the
+	// filter is not a weight.
+	ConvTaps(window, taps Tensor) Tensor
+	// ShiftIn is window [1, C, K] with its oldest input dropped and x
+	// [1, 1, C] as its newest.
+	ShiftIn(window, x Tensor) Tensor
+	ConvTapsDyn(window, static, dyn Tensor) Tensor
+	// RouteWeights is scores [1, 1, E] at idx [1, 1, k], divided by their
+	// sum and multiplied by scale -> [1, 1, k].
+	RouteWeights(scores, idx Tensor, scale float32) Tensor
+	// PairRows asks that the stack of experts w [E, 2I, in], whose output
+	// rows alternate between two projections, give the first projection's
+	// I rows and then the second's: a token's halves are then two views.
+	// It is asked before the stack's first use; false when it is too late
+	// or the backend keeps the rows as they are.
+	PairRows(w Tensor) bool
+	// CappedSwiGLU is tanh(gate/gateCap)*sigmoid(gate)*tanh(up/upCap) for
+	// gu [1, 1, k, 1, 2I] holding gate's I values then up's for each of k
+	// rows (PairRows) -> [1, 1, k, 1, I].
+	CappedSwiGLU(gu Tensor, gateCap, upCap float32) Tensor
+	// GateMix mixes h and message, both [1, 1, D]: with s their two
+	// weightless RMS norms side by side times downT [2D, rank],
+	// h*(1 - tanh(s·forgetT)) + message*tanh(s·admitT), forgetT and admitT
+	// [rank, D]. Nil when the three are not weights.
+	GateMix(h, message, downT, forgetT, admitT Tensor, eps float32) Tensor
+	// GateMixRows is GateMix for n inputs at once, each with gates of its
+	// own: h is [1, 1, n, D], or [1, 1, D] for one input shared by all;
+	// messages [1, 1, n, D]; downT, forgetT and admitT hold the n gates'
+	// weights -> [1, 1, n, D]. Nil when they are not weights.
+	GateMixRows(h, messages Tensor, downT, forgetT, admitT []Tensor, eps float32) Tensor
+}
+
 // LoopOps is implemented by backends that carry the operations the looped
 // Inkling 2 decoder needs beyond Backend: the L2 clip of its queries and
 // keys, the lookup of its relative-position bias, and experts stored in

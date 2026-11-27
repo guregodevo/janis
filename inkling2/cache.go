@@ -13,9 +13,19 @@ const convSlots = 4
 // A convolution tail holds no history and a sliding layer drops its old
 // keys, so the cache returns only to a mark, as a recurrent layer's does.
 type VisitCache struct {
-	K, V  engine.Tensor            // [1, kv heads, T, head dim], model dtype
-	Conv  [convSlots]engine.Tensor // [1, kernel-1, channels], float32
+	K, V engine.Tensor // [1, kv heads, T, head dim], model dtype
+	// Conv is each convolution's tail, float32 [1, kernel-1, channels].
+	// When rel is set it is the last window instead, [1, channels, kernel]
+	// with the newest input last: a token's input is shifted into it in
+	// one node (tail and kept turn the one into the other).
+	Conv  [convSlots]engine.Tensor
 	steps int
+
+	// rel is set on a backend that runs a decode step's attention itself
+	// (engine.RelAttention): the keys and values of a sliding layer are then
+	// kept whole too, f16, in buffers the backend appends to in place, and
+	// the window is the attention's mask. A cut is then a shorter view.
+	rel engine.RelAttention
 
 	marks map[int]visitMark
 
@@ -66,12 +76,18 @@ func (c *VisitCache) Truncate(b engine.Backend, n int) {
 		// Inside the last pass: its first kept tokens stay.
 		kept := n - (c.steps - s.n)
 		total := s.k.Shape()[2] - (s.n - kept)
-		c.K, c.V = b.Slice(s.k, 2, 0, total), b.Slice(s.v, 2, 0, total)
-		if s.keep > 0 && total > s.keep {
-			c.K, c.V = b.Slice(c.K, 2, total-s.keep, total), b.Slice(c.V, 2, total-s.keep, total)
+		if c.rel != nil {
+			c.K, c.V = b.Slice(c.K, 2, 0, n), b.Slice(c.V, 2, 0, n)
+		} else {
+			c.K, c.V = b.Slice(s.k, 2, 0, total), b.Slice(s.v, 2, 0, total)
+			if s.keep > 0 && total > s.keep {
+				c.K, c.V = b.Slice(c.K, 2, total-s.keep, total), b.Slice(c.V, 2, total-s.keep, total)
+			}
 		}
 		for i, w := range s.windows {
-			c.Conv[i] = b.Slice(w, 1, kept, kept+s.tail)
+			if w != nil {
+				c.Conv[i] = c.kept(b, b.Slice(w, 1, kept, kept+s.tail))
+			}
 		}
 		c.steps, c.last = n, nil
 		for at := range c.marks {
@@ -82,7 +98,9 @@ func (c *VisitCache) Truncate(b engine.Backend, n int) {
 		return
 	}
 	c.last = nil
-	if m, ok := c.marks[n]; ok {
+	if m, ok := c.marks[n]; ok && c.rel != nil {
+		c.K, c.V, c.Conv, c.steps = b.Slice(c.K, 2, 0, n), b.Slice(c.V, 2, 0, n), m.conv, n
+	} else if ok {
 		c.K, c.V, c.Conv, c.steps = m.k, m.v, m.conv, n
 	} else {
 		c.K, c.V, c.Conv, c.steps = nil, nil, [convSlots]engine.Tensor{}, 0
@@ -100,6 +118,10 @@ func (c *VisitCache) Mark() {
 	}
 	if c.marks == nil {
 		c.marks = map[int]visitMark{}
+	}
+	if c.rel != nil {
+		c.marks[c.steps] = visitMark{conv: c.Conv}
+		return
 	}
 	c.marks[c.steps] = visitMark{k: c.K, v: c.V, conv: c.Conv}
 }
@@ -128,6 +150,14 @@ func (c *VisitCache) Tensors() []engine.Tensor {
 // update appends this step's keys and values and returns all the attention
 // may read. keep bounds what stays for the next step (0: everything).
 func (c *VisitCache) update(b engine.Backend, k, v engine.Tensor, keep int) (engine.Tensor, engine.Tensor) {
+	if c.rel != nil {
+		k, v = b.Cast(k, engine.F16), b.Cast(v, engine.F16)
+		if c.K != nil {
+			k, v = b.Concat(c.K, k, 2), c.rel.AppendValuesT(c.V, v)
+		}
+		c.K, c.V = k, v
+		return k, v
+	}
 	if c.K != nil {
 		k, v = b.Concat(c.K, k, 2), b.Concat(c.V, v, 2)
 	}
@@ -157,5 +187,54 @@ func (c *VisitCache) slide(b engine.Backend, slot int, window engine.Tensor, ker
 		c.last.windows[slot], c.last.tail = window, kernel-1
 	}
 	n := window.Shape()[1]
-	c.Conv[slot] = b.Slice(window, 1, n-(kernel-1), n)
+	c.Conv[slot] = c.kept(b, b.Slice(window, 1, n-(kernel-1), n))
+}
+
+// kept is a tail [1, kernel-1, channels] as the cache keeps it.
+func (c *VisitCache) kept(b engine.Backend, tail engine.Tensor) engine.Tensor {
+	if c.rel == nil {
+		return tail
+	}
+	ch := tail.Shape()[2]
+	return b.Concat(b.FromFloats(make([]float32, ch), 1, ch, 1), b.Transpose(tail, 0, 2, 1), 2)
+}
+
+// tail is slot's tail as [1, kernel-1, channels], nil at the start.
+func (c *VisitCache) tail(b engine.Backend, slot int) engine.Tensor {
+	t := c.Conv[slot]
+	if t == nil || c.rel == nil {
+		return t
+	}
+	return b.Transpose(b.Slice(t, 2, 1, t.Shape()[2]), 0, 2, 1)
+}
+
+// Carry is the state a recorded decode step reads and replaces: the tails
+// of the convolutions (qwen's replayCache; a slot a layer does not use is
+// nil and left out). The keys and values are
+// written in place and are no part of it.
+func (c *VisitCache) Carry() []engine.Tensor {
+	ts := []engine.Tensor{}
+	for _, t := range c.Conv {
+		if t != nil {
+			ts = append(ts, t)
+		}
+	}
+	return ts
+}
+
+func (c *VisitCache) SetCarry(ts []engine.Tensor) {
+	for i, t := range c.Conv {
+		if t != nil && len(ts) > 0 {
+			c.Conv[i], ts = ts[0], ts[1:]
+		}
+	}
+}
+
+// Settle sets the cache at n tokens after a recorded step's runs: the
+// tails were advanced in place, the keys and values are viewed at n.
+func (c *VisitCache) Settle(rp engine.StepReplayer, n int) {
+	if c.rel != nil && c.K != nil {
+		c.K, c.V = rp.CacheView(c.K, n), rp.CacheView(c.V, n)
+	}
+	c.steps, c.last = n, nil
 }

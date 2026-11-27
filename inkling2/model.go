@@ -113,6 +113,11 @@ func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, erro
 	default:
 		return nil, fmt.Errorf("embed_norm.weight is %s, not a float", dt)
 	}
+	if c.rel, _ = b.(engine.RelAttention); c.rel != nil {
+		// Such a backend computes in float32 whatever the checkpoint holds:
+		// a cast to the checkpoint's dtype and back is two copies a use.
+		c.dtype = engine.F32
+	}
 	c.one = b.FromFloats([]float32{1}, 1)
 	if cfg.StreamExperts {
 		c.experts = &expertCache{budget: cfg.ExpertCacheBytes, lru: list.New()}
@@ -152,6 +157,12 @@ func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, erro
 			return nil, err
 		}
 	}
+	if c.rel != nil {
+		// The weights the load computed (a transpose, a cast) are computed
+		// now: the backend makes what it needs of a weight once, from its
+		// values.
+		b.Eval()
+	}
 	return m, nil
 }
 
@@ -161,6 +172,8 @@ func LoadModel(b engine.Backend, st *safetensors.File, cfg Config) (*Model, erro
 // sees the output of every visit.
 func (m *Model) hidden(ids engine.Tensor, L, pos int, caches []qwen.LayerCache, trace func(visit int, h engine.Tensor)) engine.Tensor {
 	c, cfg := m.c, m.Cfg
+	c.stacks = nil
+	defer func() { c.stacks = nil }()
 	masks := &maskMaker{c: c, cfg: cfg}
 	h := m.EmbedNorm.Forward(c, c.Reshape(m.Embed.Forward(c, ids), 1, L, cfg.Hidden))
 	h = m.splice(h, pos, L)
@@ -260,7 +273,7 @@ func (m *Model) forwardCachedT(_ engine.Backend, ids engine.Tensor, seqLen, offs
 func (m *Model) newCaches() []qwen.LayerCache {
 	caches := make([]qwen.LayerCache, m.Cfg.Visits())
 	for i := range caches {
-		caches[i] = &VisitCache{}
+		caches[i] = &VisitCache{rel: m.c.rel}
 	}
 	return caches
 }
@@ -279,7 +292,12 @@ func (m *Model) NewSession() *qwen.Session {
 		NLayers:      m.Cfg.Visits(),
 		Vocab:        m.Cfg.UnpaddedVocab,
 		Forward:      m.forwardCachedT,
-		NewCache:     func(int) qwen.LayerCache { return &VisitCache{} },
+		NewCache:     func(int) qwen.LayerCache { return &VisitCache{rel: m.c.rel} },
+	}
+	if rel := m.c.rel; rel != nil && chunk == 0 {
+		s.ChunkFor = func(tokens int) int {
+			return rel.PrefillFit(m.chunkBytes(), m.chunkContextBytes(), m.cachedBytes(), tokens)
+		}
 	}
 	if m.draft != nil {
 		visits := m.Cfg.Visits()
@@ -288,11 +306,53 @@ func (m *Model) NewSession() *qwen.Session {
 			if i == visits {
 				return &DraftCache{}
 			}
-			return &VisitCache{}
+			return &VisitCache{rel: m.c.rel}
 		}
 		s.Speculator, s.ForwardAll = m.draft, m.forwardAllT
 	}
 	return s
+}
+
+// chunkBytes is what a prompt chunk's forward holds for each of its tokens:
+// the routed experts' activations at their widest (TopK rows of twice the
+// intermediate size, a dozen such tensors through the MLP) and the states
+// the pass keeps to its end (the block outputs and the streams, two
+// hundred of hidden floats): 2.6 MiB on the published model. On an RTX
+// 5000 Ada with 8 GB free a 3.2k-token prompt fit at 1,024 by this count
+// and ran out of room at 2,048 (2026-11-27).
+func (m *Model) chunkBytes() int64 {
+	cfg := m.Cfg
+	return 4 * int64(12*cfg.TopK*2*cfg.Intermediate+200*cfg.Hidden)
+}
+
+// chunkContextBytes is what a chunk token holds for each token of the
+// context: its row of the attention's distances and of its mask. The
+// scores themselves the backend bounds, taking the queries in pieces.
+func (m *Model) chunkContextBytes() int64 { return 8 }
+
+// cachedBytes is what a token of the context keeps in the caches of a
+// backend that keeps every layer's keys and values whole, in f16.
+func (m *Model) cachedBytes() int64 {
+	cfg := m.Cfg
+	return int64(cfg.Visits()) * 2 * 2 * int64(max(cfg.KVHeads*cfg.HeadDim, cfg.SWAKVHeads*cfg.SWAHeadDim))
+}
+
+// Warm runs one token through the model and drops it, once the weights
+// are pinned: a backend that repacks a weight at its first use (ggml: the
+// quantized projections, the experts, what it makes of a weight once) does
+// all of it now, at the load, where the first request paid for it (15 s on
+// the published 4-bit model) and counted its prefill window on memory the
+// repacks then took. Nothing on a backend without those repacks, or with
+// the experts read from disk.
+func (m *Model) Warm() {
+	if m.c.rel == nil || m.Cfg.StreamExperts {
+		return
+	}
+	b := m.c.Backend
+	b.Floats(m.logits(m.hidden(b.FromInt32([]int32{0}, 1), 1, 0, m.newCaches(), nil)))
+	if sw, ok := b.(engine.Sweeper); ok {
+		sw.Sweep()
+	}
 }
 
 // ExpertIO is what reading experts from disk has cost so far: bytes read

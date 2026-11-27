@@ -26,10 +26,16 @@ commands in [bench/mlx.md](bench/mlx.md) and [docs/backends.md](docs/backends.md
 | Qwen3.8-27B, NVIDIA A100: decode | 55.2 tok/s | 51.2 tok/s | not measured |
 | Qwen3.8-27B, NVIDIA A100: prefill 1,500 tokens | 1,106 tok/s | 1,170 tok/s | not measured |
 | Qwen3-8B, NVIDIA A100: decode | 146.0 tok/s | 138.5 tok/s | not measured |
+| Inkling 2 Mini, RTX 5000 Ada 32 GB: decode | 59.8 tok/s | not measured | 58.3 tok/s |
+| Inkling 2 Mini, RTX 5000 Ada 32 GB: decode after a 13,000-token prompt | 50.7 tok/s | not measured | 49.9 tok/s |
+| Inkling 2 Mini, RTX 5000 Ada 32 GB: prefill 3,200 tokens | 838 tok/s | not measured | 1,219 tok/s |
+| Inkling 2 Mini, RTX 5000 Ada 32 GB: prefill 13,000 tokens | 665 tok/s | not measured | 1,147 tok/s |
 
 On the Mac, janis runs `mlx-community`'s 4-bit weights (4.3 GB for the 8B)
 and llama.cpp and Ollama the Q4_K_M GGUF (5.2 GB). Decode reads every weight
-once per token, so part of the decode lead is the smaller file.
+once per token, so part of the decode lead is the smaller file. On Inkling 2
+Mini, janis runs `mlx-community/Inkling-2-Mini-4bit` (23.0 GB on the GPU) and
+Ollama its own 4-bit GGUF with a 16k context (21.9 GB, all of it on the GPU).
 
 What is different:
 
@@ -52,8 +58,9 @@ What is different:
 Use Ollama or llama.cpp instead for Windows, vision models, architectures
 janis does not load ([Models](#models)), several models loaded at once, or
 the fastest decode of a small model on NVIDIA (Qwen3-8B on an L4:
-llama.cpp's 47.0 tok/s against 43.2), or 8-bit weights there (the 27B on
-an A100: 39.6 against 33.3).
+llama.cpp's 47.0 tok/s against 43.2), 8-bit weights there (the 27B on
+an A100: 39.6 against 33.3), or the fastest prompt reading of Inkling 2 Mini
+(Ollama's 1,219 tok/s against 838).
 
 ## Install
 
@@ -118,7 +125,7 @@ fits.
 | Qwen2.5, Qwen3 and Llama, dense; Qwen3 MoE (Qwen3-Coder-30B-A3B) | `qwen` |
 | Qwen3.5 hybrid, Gated DeltaNet and attention (0.8B, 9B, Qwen3.8-27B) | `qwen35` |
 | Gemma 2 | `gemma` |
-| Inkling 2 Mini, text and images (`Inkling-2-Mini-4bit`, `netprojects/Inkling-2-Mini-MLX-2.5bit`): looped decoder, MLX only; on a host with less memory than the model the experts are read from disk | `inkling2` |
+| Inkling 2 Mini, text and images (`Inkling-2-Mini-4bit`, `netprojects/Inkling-2-Mini-MLX-2.5bit`): looped decoder, on MLX and on CUDA (`Inkling-2-Mini-4bit`, text, 24 GB of GPU memory; images were not tried there); on a host with less memory than the model the experts are read from disk | `inkling2` |
 | Whisper (speech to text), BGE (embeddings), a reranker | `whisper`, `bge`, `reranker`, from Go only |
 
 ## Serve

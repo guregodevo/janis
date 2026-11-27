@@ -181,6 +181,45 @@ type recording struct {
 	// held (RowsOn), nil until asked for.
 	onB, offB *tensor
 	on        []bool
+
+	// What a step computes from its position: the distances and the mask
+	// of an attention with a relative bias, per (window, extent, first slot,
+	// slots),
+	// and the model's own tensors (StepFloats).
+	rel    map[[4]int]*relInputs
+	floats []stepFloats
+}
+
+// relInputs are a relative-bias attention's inputs: for each cache slot,
+// the bias row of its distance to the query, and whether the query sees it.
+type relInputs struct {
+	idx, hidden *tensor
+}
+
+// stepFloats is a tensor a recorded step fills with f(position).
+type stepFloats struct {
+	t *tensor
+	f func(pos int) []float32
+}
+
+// relMask is, for a query at pos over the n cache slots that hold positions
+// base..base+n-1 and one sink after them: the bias row of each slot (its
+// distance, extent from there on) and the mask (-inf on the slots the query
+// does not see: the ones after it, and the ones window or more behind it).
+func relMask(pos, window, extent, base, n int) ([]int32, []float32) {
+	idx, hidden := make([]int32, n), make([]float32, n+1)
+	ninf := float32(math.Inf(-1))
+	for j := 0; j < n; j++ {
+		d := pos - (base + j)
+		idx[j] = int32(extent)
+		switch {
+		case d < 0 || (window > 0 && d >= window):
+			hidden[j] = ninf
+		case d < extent:
+			idx[j] = int32(d)
+		}
+	}
+	return idx, hidden
 }
 
 // at is the offset the cache appends being recorded write at.
@@ -215,7 +254,7 @@ func (b *Backend) recordEmbed(out *tensor, gw, gs, gb *gatherRef, groupSize, bit
 // replayInput is a pinned leaf the step writes before each run.
 func (b *Backend) replayInput(dt engine.DType, shape ...int) *tensor {
 	t := b.newFrom(dt, shape, nil, 0)
-	t.pin = true
+	t.pin, t.input = true, true
 	return t
 }
 
@@ -269,6 +308,14 @@ func (rs *recording) fill(offset int) {
 			v[j] = float32(math.Inf(-1))
 		}
 		setFloat32(t, v)
+	}
+	for k, in := range rs.rel {
+		idx, hidden := relMask(offset, k[0], k[1], k[2], k[3])
+		setInt32(in.idx, idx)
+		setFloat32(in.hidden, hidden)
+	}
+	for _, in := range rs.floats {
+		setFloat32(in.t, in.f(offset))
 	}
 }
 
@@ -802,6 +849,13 @@ func (rs *recording) free() {
 	}
 	for _, t := range rs.masks {
 		t.free()
+	}
+	for _, in := range rs.rel {
+		in.idx.free()
+		in.hidden.free()
+	}
+	for _, in := range rs.floats {
+		in.t.free()
 	}
 	if rs.offs != nil {
 		rs.posB.free()

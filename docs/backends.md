@@ -73,6 +73,44 @@ JANIS_PARALLEL=1 MLX_ENABLE_THINKING=0 janis serve --model Qwen3.8-27B-4bit
 llama-server -m Qwen3.8-27B-UD-Q4_K_M.gguf -ngl 999 -c 8192 -np 1 --jinja
 ```
 
+janis against Ollama on one RTX 5000 Ada 32 GB (vast.ai, 2026-11-27),
+Inkling 2 Mini, one stream. Decode is the steady rate: the time of a
+750-token reply less that of a 50-token reply, three runs. Ollama 0.40.18
+runs the model on llama.cpp (b12734).
+
+| | janis | Ollama |
+|---|---|---|
+| Decode, greedy | 60.3, 59.8, 59.8 tok/s | 58.4, 58.3 tok/s (58.5, 58.1 by its own timer) |
+| Decode, temperature 0.7 | 58.0 tok/s | 58.0 tok/s |
+| Decode after an 820-token prompt | 57.8 tok/s | 56.0 tok/s |
+| Decode after a 3,250-token prompt | 55.4 tok/s | 53.3 tok/s |
+| Decode after a 12,970-token prompt | 50.7 tok/s | 49.9 tok/s |
+| Prefill, 820 tokens | 938 tok/s | 1,405 tok/s |
+| Prefill, 3,250 tokens | 838 tok/s | 1,219 tok/s |
+| Prefill, 12,970 tokens | 665 tok/s | 1,147 tok/s |
+| GPU memory | 23.0 GB | 21.9 GB |
+
+janis runs `mlx-community/Inkling-2-Mini-4bit`: nvfp4 experts as ggml's
+NVFP4, the four layers of mxfp8 experts decoded to f16 (4 GB more than
+their 8 bits). Ollama runs `inkling-2-mini` (IQ4_NL). Ollama's prefill is by
+its own timer, janis's is the prompt over the time of the request less its
+reply. The three "decode after" rows are a 330-token reply to a prompt
+already cached, janis's by the whole request, Ollama's by its own timer.
+With a 64k context Ollama puts 4% of the model on the CPU of this card and
+decodes at 51.8 tok/s: its rows here are with `OLLAMA_CONTEXT_LENGTH=16384`,
+where `ollama ps` says 100% GPU. janis keeps no fixed context; its caches
+are 196 KB a token by count (48 visits' keys and values in f16).
+
+A decode step of this model is 48 layer visits. janis records it once and
+runs the same graph for the tokens after (CUDA graphs replay): 9,400 nodes,
+about 16 ms. Built every token from the model's own operations it was 19,100
+nodes and 110 ms, 9 tok/s.
+
+```sh
+janis serve --model Inkling-2-Mini-4bit
+OLLAMA_CONTEXT_LENGTH=16384 ollama serve    # ollama pull inkling-2-mini
+```
+
 MoE runs resident (`JANIS_MOE_RESIDENT=1`): every expert of a layer is
 stacked once on the device and the gather picks them by index
 (`ggml_mul_mat_id`), the shape of MoE on a GPU with room for the whole

@@ -138,6 +138,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -200,6 +201,14 @@ type Backend struct {
 	// nominally free. A batch that does not fit, or finds every arena busy,
 	// gets a buffer of its own as before.
 	arenas []*arena
+	// lagOrder holds, per (heads, kernel), the index that puts a dynamic
+	// convolution's taps in the window's order (ConvTapsDyn).
+	lagOrder map[[2]int]*tensor
+	// caps holds, per (width, gate cap, up cap), the inverses of the caps
+	// CappedSwiGLU multiplies both halves by.
+	caps map[[3]float32]*tensor
+	// relRows holds a chunk's attention inputs for the pass that made them.
+	relRows map[[4]int]*relRows
 	// rec0 is the decode step being recorded (replay.go), nil otherwise.
 	rec0 *recording
 }
@@ -234,12 +243,16 @@ var flushEvery = func() int {
 	if n, err := strconv.Atoi(os.Getenv("JANIS_GGML_FLUSH")); err == nil && n > 0 {
 		return n
 	}
-	return maxNodes / 4
+	return 4096
 }()
+
+// spreadAbove is the batch buffer size from which a flush considers moving
+// its held results out (flushLocked).
+const spreadAbove = 256 << 20
 
 // maxNodes bounds one recording context (results and intermediates): a
 // result is about two nodes, so flushEvery results leave room to spare.
-const maxNodes = 16384
+const maxNodes = 32768
 
 // batchNodes bounds the context a batched step is recorded in: the whole
 // step is one graph, and 32 rows of the 27B are about 24,000 nodes.
@@ -363,8 +376,16 @@ type tensor struct {
 	sums   *tensor
 	sumsGS int
 	f32w   *tensor // a small bf16 weight's f32 copy (f32Weight)
-	pin    bool    // survives Sweep
-	freed  bool
+	// made holds what was made of a weight once and is kept with it, by
+	// what it is for: its transpose for a matmul, a convolution's taps.
+	made map[string]*tensor
+	// pairRows: a stack of experts whose repack takes the even output rows
+	// first, then the odd ones (PairRows).
+	pairRows bool
+	// input: a recorded step writes it before each run; never a weight.
+	input bool
+	pin   bool // survives Sweep
+	freed bool
 	// gathered: rows of this packed weight were taken (the embedding), so
 	// its words stay after the repack; a weight only ever multiplied keeps
 	// the Q4_1 copy alone.
@@ -560,6 +581,12 @@ func (t *tensor) free() {
 		memMu.Lock()
 	}
 	t.sums = nil
+	for k, w := range t.made {
+		delete(t.made, k)
+		memMu.Unlock()
+		w.free()
+		memMu.Lock()
+	}
 	if t.f32w != nil {
 		w := t.f32w
 		t.f32w = nil
@@ -608,6 +635,8 @@ func ggmlType(dt engine.DType) C.enum_ggml_type {
 		return C.GGML_TYPE_BF16
 	case engine.I32, engine.U32:
 		return C.GGML_TYPE_I32
+	case engine.U8:
+		return C.GGML_TYPE_I8
 	default:
 		return C.GGML_TYPE_F32
 	}
@@ -637,6 +666,31 @@ func (b *Backend) newFrom(dt engine.DType, shape []int, raw unsafe.Pointer, size
 	}
 	b.mu.Unlock()
 	return out
+}
+
+// newWeight is a pinned weight of a ggml type (a repacked quantized one),
+// filled from raw.
+func (b *Backend) newWeight(typ C.enum_ggml_type, shape []int, raw []byte, what string) *tensor {
+	ctx := C.janis_ctx(ctxMem)
+	n := ne(shape)
+	t := C.janis_new(ctx, typ, n[0], n[1], n[2], n[3])
+	buf := C.ggml_backend_alloc_ctx_tensors(ctx, b.be)
+	if buf == nil {
+		C.ggml_free(ctx)
+		panic(fmt.Sprintf("ggml: no room on the device for the %s %v", what, shape))
+	}
+	logAlloc(what, C.ggml_nbytes(t), shape)
+	C.ggml_backend_tensor_set(t, unsafe.Pointer(&raw[0]), 0, C.size_t(len(raw)))
+	return &tensor{t: t, ctx: ctx, buf: buf, shape: shape, dt: engine.F16, pin: true}
+}
+
+// dropWords frees a weight's packed words once its repack holds them.
+func (b *Backend) dropWords(tw *tensor) {
+	if !tw.gathered && tw.buf != nil {
+		C.ggml_backend_buffer_free(tw.buf)
+		C.ggml_free(tw.ctx)
+		tw.buf, tw.ctx, tw.t, tw.dropped = nil, nil, nil, true
+	}
 }
 
 // track registers a tensor for Sweep (weakly) and for the collector.
@@ -1028,6 +1082,24 @@ func (b *Backend) flushLocked() {
 		t.grp = grp
 		t.deps, t.via = nil, nil
 	}
+	// A batch's buffer is the graph's peak, and it stays whole while one
+	// result in it is held. Where the results held are under half of it
+	// and what the rest wastes is more than a sixteenth of the device's
+	// free memory, they move to buffers of their own and the batch goes: a prompt chunk of Inkling
+	// 2 is three batches, each a few GB at its peak for under a tenth of
+	// that held, and the three did not fit together (RTX 5000 Ada 32 GB,
+	// 2026-11-27).
+	if st == C.GGML_STATUS_SUCCESS && len(live) > 0 && b.lastBatch.bytes >= spreadAbove {
+		var held C.size_t
+		for _, t := range live {
+			held += C.ggml_nbytes(t.t)
+		}
+		if waste := int64(b.lastBatch.bytes - min(held, b.lastBatch.bytes)); 2*held < b.lastBatch.bytes && 16*waste > b.devFree() {
+			for _, t := range live {
+				b.ownLocked(t)
+			}
+		}
+	}
 	if len(live) == 0 {
 		// Nothing holds a result: the batch (its context, the allocator's
 		// buffer) has no tensor to be released by and goes now.
@@ -1273,6 +1345,11 @@ func (b *Backend) own(x *tensor) {
 	if x.grp == nil && x.t != nil && x.t.data == nil {
 		b.flushLocked() // pending: computed now, into a batch
 	}
+	b.ownLocked(x)
+}
+
+// ownLocked is own for a computed result. Called with b.mu held.
+func (b *Backend) ownLocked(x *tensor) {
 	if x.grp == nil || x.t == nil || x.grp.base != nil {
 		return // a leaf, or a cache view: both already own their memory
 	}
@@ -1576,6 +1653,27 @@ func (b *Backend) Transpose(x engine.Tensor, axes ...int) engine.Tensor {
 	shape := make([]int, nd)
 	for j, a := range axes {
 		shape[j] = tx.shape[a]
+	}
+	if nd > 4 {
+		// ggml has four dimensions: the axes of one element are left out,
+		// the others permuted, and the result given its full shape.
+		var dims, at []int
+		for i, d := range tx.shape {
+			if d != 1 {
+				at = append(at, i)
+				dims = append(dims, d)
+			}
+		}
+		if len(dims) > 4 {
+			panic(fmt.Sprintf("ggml: Transpose of %v: more than four axes of several elements", tx.shape))
+		}
+		var order []int
+		for _, a := range axes {
+			if i := slices.Index(at, a); i >= 0 {
+				order = append(order, i)
+			}
+		}
+		return b.Reshape(b.Transpose(b.Reshape(x, dims...), order...), shape...)
 	}
 	// ggml axis of janis axis i is nd-1-i. Source ggml axis s = nd-1-axes[j]
 	// goes to destination ggml axis nd-1-j.
@@ -2059,6 +2157,12 @@ func (b *Backend) MatMul(a, bb engine.Tensor) engine.Tensor {
 	na, nb := len(ta.shape), len(tb.shape)
 	shape := append([]int(nil), broadcastShape(ta.shape[:na-2], tb.shape[:nb-2])...)
 	shape = append(shape, ta.shape[na-2], tb.shape[nb-1])
+	if wT := b.transposedWeight(tb); wT != nil {
+		// A weight: its transpose was made once, not copied every step.
+		return b.op(engine.F32, shape, []*tensor{ta, tb, wT}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+			return C.ggml_mul_mat(ctx, wT.t, f32(ctx, ta))
+		})
+	}
 	return b.op(engine.F32, shape, []*tensor{ta, tb}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
 		wT := C.ggml_cont(ctx, C.ggml_transpose(ctx, f32(ctx, tb)))
 		return C.ggml_mul_mat(ctx, wT, f32(ctx, ta))
