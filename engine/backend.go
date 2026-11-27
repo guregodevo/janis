@@ -269,6 +269,11 @@ type RelAttention interface {
 	// StepFloats is a tensor of shape holding f(pos), which a recorded
 	// step computes again for each position it runs at.
 	StepFloats(pos int, f func(pos int) []float32, shape ...int) Tensor
+	// PrefillFit is the largest prefill window, of 64 to 2,048 tokens by
+	// doubling, whose forward fits in half of the device's free memory
+	// when a chunk token costs perToken bytes and perContext more for each
+	// token of the context. 0 when the backend has no count to offer.
+	PrefillFit(perToken, perContext int64, tokens int) int
 	// L2Clip shrinks each row of x (over the last axis) whose L2 norm is
 	// above threshold down to it.
 	L2Clip(x Tensor, threshold float32) Tensor

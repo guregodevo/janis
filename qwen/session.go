@@ -84,6 +84,11 @@ type Session struct {
 	// prompt's experts at once — ~3x faster prefill on Qwen3-30B-A3B.
 	PrefillChunk int
 
+	// ChunkFor is the prefill window for a prompt of tokens, for a model
+	// whose forward costs memory by a count of its own (0: the backend's or
+	// the global one). MLX_PREFILL_CHUNK and PrefillChunk come before it.
+	ChunkFor func(tokens int) int
+
 	// NewCache builds layer i's cache. Nil means plain KV attention on every
 	// layer; hybrid architectures (qwen3_5) supply their own per-layer mix.
 	NewCache func(layer int) LayerCache
@@ -328,6 +333,11 @@ func (s *Session) prefill(b engine.Backend, newIDs []int32, cancel func() bool, 
 	chunkSize := prefillChunk
 	if pc, ok := b.(engine.PrefillChunker); ok && !prefillChunkSet {
 		if n := pc.PrefillChunk(len(newIDs)); n > 0 {
+			chunkSize = n
+		}
+	}
+	if s.ChunkFor != nil && !prefillChunkSet {
+		if n := s.ChunkFor(len(newIDs)); n > 0 {
 			chunkSize = n
 		}
 	}

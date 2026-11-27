@@ -246,6 +246,10 @@ var flushEvery = func() int {
 	return 4096
 }()
 
+// spreadAbove is the batch buffer size from which a flush considers moving
+// its held results out (flushLocked).
+const spreadAbove = 256 << 20
+
 // maxNodes bounds one recording context (results and intermediates): a
 // result is about two nodes, so flushEvery results leave room to spare.
 const maxNodes = 32768
@@ -1078,6 +1082,24 @@ func (b *Backend) flushLocked() {
 		t.grp = grp
 		t.deps, t.via = nil, nil
 	}
+	// A batch's buffer is the graph's peak, and it stays whole while one
+	// result in it is held. Where the results held are a small part of it
+	// and the device is short of the room for another like it, they move
+	// to buffers of their own and the batch goes: a prompt chunk of Inkling
+	// 2 is three batches, each a few GB at its peak for under a tenth of
+	// that held, and the three did not fit together (RTX 5000 Ada 32 GB,
+	// 2026-11-27).
+	if st == C.GGML_STATUS_SUCCESS && len(live) > 0 && b.lastBatch.bytes >= spreadAbove {
+		var held C.size_t
+		for _, t := range live {
+			held += C.ggml_nbytes(t.t)
+		}
+		if 4*held < b.lastBatch.bytes && b.devFree() < 2*int64(b.lastBatch.bytes) {
+			for _, t := range live {
+				b.ownLocked(t)
+			}
+		}
+	}
 	if len(live) == 0 {
 		// Nothing holds a result: the batch (its context, the allocator's
 		// buffer) has no tensor to be released by and goes now.
@@ -1323,6 +1345,11 @@ func (b *Backend) own(x *tensor) {
 	if x.grp == nil && x.t != nil && x.t.data == nil {
 		b.flushLocked() // pending: computed now, into a batch
 	}
+	b.ownLocked(x)
+}
+
+// ownLocked is own for a computed result. Called with b.mu held.
+func (b *Backend) ownLocked(x *tensor) {
 	if x.grp == nil || x.t == nil || x.grp.base != nil {
 		return // a leaf, or a cache view: both already own their memory
 	}

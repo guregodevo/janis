@@ -16,6 +16,7 @@ import (
 	"github.com/guregodevo/janis/engine"
 	"math"
 	"os"
+	"strings"
 )
 
 // AppendValuesT appends to a value cache kept transposed, tokens innermost
@@ -48,6 +49,25 @@ func (b *Backend) StepFloats(pos int, f func(pos int) []float32, shape ...int) e
 	rs.floats = append(rs.floats, stepFloats{t: t, f: f})
 	b.mu.Unlock()
 	return t
+}
+
+// PrefillFit is the window by the device's free memory
+// (engine.RelAttention), on CUDA; the CPU backend reads a prompt at the
+// global window.
+func (b *Backend) PrefillFit(perToken, perContext int64, tokens int) int {
+	if !strings.HasPrefix(b.name, "CUDA") {
+		return 0
+	}
+	return prefillFit(b.devFree(), perToken, perContext, tokens)
+}
+
+func prefillFit(free, perToken, perContext int64, tokens int) int {
+	each := perToken + perContext*int64(tokens)
+	c := 64
+	for c < 2048 && int64(2*c)*each <= free/2 {
+		c *= 2
+	}
+	return c
 }
 
 // L2Clip is x*min(1, t/|x|) = t*x/max(|x|, t), and ggml's l2_norm(x, eps)

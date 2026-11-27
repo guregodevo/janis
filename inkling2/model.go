@@ -294,6 +294,9 @@ func (m *Model) NewSession() *qwen.Session {
 		Forward:      m.forwardCachedT,
 		NewCache:     func(int) qwen.LayerCache { return &VisitCache{rel: m.c.rel} },
 	}
+	if rel := m.c.rel; rel != nil && chunk == 0 {
+		s.ChunkFor = func(tokens int) int { return rel.PrefillFit(m.chunkBytes(), m.chunkContextBytes(), tokens) }
+	}
 	if m.draft != nil {
 		visits := m.Cfg.Visits()
 		s.NLayers = visits + 1
@@ -307,6 +310,21 @@ func (m *Model) NewSession() *qwen.Session {
 	}
 	return s
 }
+
+// chunkBytes is what a prompt chunk's forward holds for each of its tokens,
+// beside the attention: the routed experts' activations at their widest
+// (TopK rows of twice the intermediate size, a dozen such tensors alive
+// through the MLP) and the states the pass keeps to its end (the block
+// outputs and the stream, counted as two hundred of hidden floats).
+func (m *Model) chunkBytes() int64 {
+	cfg := m.Cfg
+	return 4 * int64(12*cfg.TopK*2*cfg.Intermediate+200*cfg.Hidden)
+}
+
+// chunkContextBytes is what the attention holds for each chunk token and
+// each token of the context: the gathered bias, the scores and the weights
+// of every head, three tensors of floats alive at once.
+func (m *Model) chunkContextBytes() int64 { return 4 * 3 * int64(m.Cfg.Heads) }
 
 // ExpertIO is what reading experts from disk has cost so far: bytes read
 // and the time spent waiting for them. Zero when the experts are resident.
