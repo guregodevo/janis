@@ -31,6 +31,25 @@ func (b *Backend) AppendValuesT(cache, x engine.Tensor) engine.Tensor {
 	return b.appendCache(ta, tb, 2, true)
 }
 
+// TrimFront is the cache without its first drop tokens, copied out of its
+// buffer (engine.RelAttention): the next append moves it into a buffer of
+// its own, whose first token is then at the position counted here.
+func (b *Backend) TrimFront(cache engine.Tensor, drop int) engine.Tensor {
+	tx := as(cache)
+	shape := append([]int(nil), tx.shape...)
+	shape[2] -= drop
+	out := b.op(tx.dt, shape, []*tensor{tx}, func(ctx *C.struct_ggml_context) *C.struct_ggml_tensor {
+		t := tx.t
+		if C.ggml_is_transposed(t) { // a value cache kept tokens innermost
+			t = C.ggml_cont(ctx, t)
+		}
+		m := ne(shape)
+		return C.ggml_cont(ctx, C.ggml_view_4d(ctx, t, m[0], m[1], m[2], m[3], t.nb[1], t.nb[2], t.nb[3], C.size_t(drop)*C.size_t(t.nb[1])))
+	})
+	out.off = tx.firstPos() + drop
+	return out
+}
+
 // StepFloats is f(pos) as a tensor; in a recorded step, an input the step
 // fills with f of each position it runs at (engine.RelAttention).
 func (b *Backend) StepFloats(pos int, f func(pos int) []float32, shape ...int) engine.Tensor {
@@ -231,7 +250,12 @@ func (b *Backend) RelAttend(q, k, v, rel, relProj, sinks engine.Tensor, pos, win
 		return b.relAttendRows(tq, tk, tv, tr, tp, proj, tsk, pos, window, scale, relScale)
 	}
 	replay := tk.replay && tv.replay
-	n := S
+	// The keys' and the values' buffers are sized apart, from the memory
+	// free when each was made (reservedSpare): a recorded step reads no
+	// further than the shorter of the two. Read to the keys' bucket, the
+	// values' view ran past its buffer (an abort at 11,008 tokens of a
+	// reply, RTX 5000 Ada, 2026-11-27).
+	n := min(S, tv.shape[2])
 	if replay {
 		b.mu.Lock()
 		rs := b.rec0
@@ -244,24 +268,28 @@ func (b *Backend) RelAttend(q, k, v, rel, relProj, sinks engine.Tensor, pos, win
 			return nil
 		}
 	} else {
-		if S != pos+1 {
+		if S+tk.firstPos() != pos+1 {
 			return nil
 		}
 		if n = tk.replayPad(tv); n <= S {
 			return nil
 		}
 	}
-	if tk.grp == nil || tv.grp == nil || tk.grp.base == nil || tv.grp.base == nil || !tv.grp.vt || tk.grp.vt {
+	if tk.grp == nil || tv.grp == nil || tk.grp.base == nil || tv.grp.base == nil || !tv.grp.vt || tk.grp.vt || tk.grp.off != tv.grp.off {
 		return nil
 	}
 	// A sliding layer reads the slots its window reaches from here to the
 	// end of the bucket, not the whole cache: a recorded step runs at this
-	// position and the ones after it.
-	base := 0
+	// position and the ones after it. base is the first position read,
+	// slot the cache's slot that holds it (a cache cut at its front,
+	// TrimFront, starts past position 0).
+	off := tk.grp.off
+	base := off
 	if window > 0 {
-		base = max(0, pos-(window-1))
+		base = max(off, pos-(window-1))
 	}
-	n -= base
+	slot := base - off
+	n -= slot
 	idx, hidden := b.relInputsFor(replay, pos, window, extent, base, n)
 	zero := b.zeroSinks(H)
 	per := H / G
@@ -271,9 +299,9 @@ func (b *Backend) RelAttend(q, k, v, rel, relProj, sinks engine.Tensor, pos, win
 		// The slots base.. of the caches, where they are: the keys
 		// ne (D, n, G), the values kept tokens innermost ne (n, D, G).
 		kb, vb := tk.grp.base, tv.grp.base
-		kk := C.ggml_view_4d(ctx, kb, cD, cn, cG, 1, kb.nb[1], kb.nb[2], kb.nb[3], C.size_t(base)*C.size_t(kb.nb[1]))
+		kk := C.ggml_view_4d(ctx, kb, cD, cn, cG, 1, kb.nb[1], kb.nb[2], kb.nb[3], C.size_t(slot)*C.size_t(kb.nb[1]))
 		C.ggml_backend_view_init(kk)
-		vT := C.ggml_view_4d(ctx, vb, cn, cD, cG, 1, vb.nb[1], vb.nb[2], vb.nb[3], C.size_t(base)*C.size_t(vb.nb[0]))
+		vT := C.ggml_view_4d(ctx, vb, cn, cD, cG, 1, vb.nb[1], vb.nb[2], vb.nb[3], C.size_t(slot)*C.size_t(vb.nb[0]))
 		C.ggml_backend_view_init(vT)
 		if os.Getenv("JANIS_GGML_REL_F32") == "1" {
 			// For tests: the CPU's f16 matmul rounds the query to f16 too,
@@ -384,7 +412,12 @@ func (b *Backend) relAttendRows(tq, tk, tv, tr, tp, proj, tsk *tensor, pos, wind
 	G, S := tk.shape[1], tk.shape[2]
 	dr, extent := tp.shape[0], tp.shape[1]-1
 	if tk.replay || tv.replay || tk.grp == nil || tv.grp == nil || tk.grp.base == nil || tv.grp.base == nil ||
-		tk.grp.vt || !tv.grp.vt || tk.cacheLen != S || tv.cacheLen != S || S != pos+L {
+		tk.grp.vt || !tv.grp.vt || tk.cacheLen != S || tv.cacheLen != S || tk.grp.off != tv.grp.off || S+tk.grp.off != pos+L {
+		return nil
+	}
+	// A cache cut at its front (TrimFront) holds the positions from off.
+	off := tk.grp.off
+	if (window == 0 && off != 0) || (window > 0 && off > max(0, pos-(window-1))) {
 		return nil
 	}
 	per := H / G
@@ -406,8 +439,9 @@ func (b *Backend) relAttendRows(tq, tk, tv, tr, tp, proj, tsk *tensor, pos, wind
 	for l0 := 0; l0 < L; l0 += piece {
 		pt := part{l0: l0, ql: min(piece, L-l0)}
 		end := pos + l0 + pt.ql // one past the piece's last query
+		pt.base = off
 		if window > 0 {
-			pt.base = max(0, pos+l0-(window-1))
+			pt.base = max(off, pos+l0-(window-1))
 		}
 		pt.n = end - pt.base
 		pt.idx, pt.hidden = b.relRowsFor([2]int{pos, L}, pos+l0, pt.ql, window, extent, pt.base, pt.n)
@@ -440,9 +474,9 @@ func (b *Backend) relAttendRows(tq, tk, tv, tr, tp, proj, tsk *tensor, pos, wind
 			cn, ql, o := C.int64_t(pt.n), C.int64_t(pt.ql), C.size_t(pt.l0)
 			// The slots base.. of the caches, where they are: the keys
 			// ne (D, n, G), the values kept tokens innermost ne (n, D, G).
-			kk := C.ggml_view_4d(ctx, kb, cD, cn, cG, 1, kb.nb[1], kb.nb[2], kb.nb[3], C.size_t(pt.base)*C.size_t(kb.nb[1]))
+			kk := C.ggml_view_4d(ctx, kb, cD, cn, cG, 1, kb.nb[1], kb.nb[2], kb.nb[3], C.size_t(pt.base-off)*C.size_t(kb.nb[1]))
 			C.ggml_backend_view_init(kk)
-			vT := C.ggml_view_4d(ctx, vb, cn, cD, cG, 1, vb.nb[1], vb.nb[2], vb.nb[3], C.size_t(pt.base)*C.size_t(vb.nb[0]))
+			vT := C.ggml_view_4d(ctx, vb, cn, cD, cG, 1, vb.nb[1], vb.nb[2], vb.nb[3], C.size_t(pt.base-off)*C.size_t(vb.nb[0]))
 			C.ggml_backend_view_init(vT)
 			if f32read {
 				kk = C.ggml_cast(ctx, C.ggml_cont(ctx, kk), C.GGML_TYPE_F32)

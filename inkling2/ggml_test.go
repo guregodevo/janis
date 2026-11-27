@@ -275,3 +275,76 @@ func TestGGMLARecordedStepGeneratesTheSameTokens(t *testing.T) {
 		t.Errorf("generated %d and %d tokens, want 12 and 12", len(recorded[0]), len(recorded[1]))
 	}
 }
+
+// A SLIDING LAYER THAT DROPS WHAT ITS WINDOW NO LONGER REACHES GENERATES
+// THE SAME TOKENS.
+//
+// The tiny model's window is 8. With a slack of 3 a sliding layer's keys
+// are cut back to 7 whenever they pass 10, at a forward pass: every token
+// when the step is built every token, every 256 (a recorded step's bucket,
+// when it is recorded again) when it is replayed. The tokens generated are
+// those of the same session keeping every key: 24 built every token, 400
+// replayed, past the cut at 256. The replayed sessions part at token 460
+// (measured): the trimmed one reads 7 fewer masked slots, the sums round
+// apart, and the random weights have a near tie there. A check against one
+// pass of the model's own operations is no use here: a replayed step on
+// ggml's CPU rounds apart from one pass by token 84, trimmed or not. Then
+// a prompt that shares only its first 4 tokens with the reply is read
+// again, the same tokens either way.
+func TestGGMLATrimmedSlidingLayerGeneratesTheSameTokens(t *testing.T) {
+	t.Setenv("JANIS_GGML_REL_F32", "1")
+	for _, tc := range []struct {
+		replay   string
+		n, bound int // tokens generated, and the keys a sliding layer may hold after
+	}{{"0", 24, 7 + 3 + 1}, {"cpu", 400, 7 + 3 + 1 + 256}} {
+		t.Run("replay "+tc.replay, func(t *testing.T) {
+			t.Setenv("JANIS_GGML_REPLAY", tc.replay)
+			type result struct {
+				first, again []int32
+				held         int
+			}
+			run := func(slack int) result {
+				old := trimSlack
+				trimSlack = slack
+				defer func() { trimSlack = old }()
+				b := ggml.New()
+				defer b.Close()
+				m, want := loadTiny(t, b, "f32", false)
+				b.PinAll()
+				ids := wantTokens(t, want)
+				s := m.NewSession()
+				var r result
+				r.first = s.Generate(b, ids[:8], tc.n, qwen.SampleParams{})
+				r.held = s.Caches[0].(*VisitCache).K.Shape()[2]
+				r.again = s.Generate(b, append(append([]int32(nil), ids[:4]...), ids[10:14]...), 8, qwen.SampleParams{})
+				return r
+			}
+			whole, trimmed := run(1<<20), run(3)
+			if fmt.Sprint(trimmed.first) != fmt.Sprint(whole.first) {
+				t.Errorf("trimmed: %v\nevery key kept: %v", trimmed.first, whole.first)
+			}
+			if fmt.Sprint(trimmed.again) != fmt.Sprint(whole.again) {
+				t.Errorf("after the cut, trimmed: %v, every key kept: %v", trimmed.again, whole.again)
+			}
+			if whole.held != 8+tc.n-1 || trimmed.held > tc.bound {
+				t.Errorf("a sliding layer holds %d keys trimmed and %d whole, want at most %d and %d", trimmed.held, whole.held, tc.bound, 8+tc.n-1)
+			}
+		})
+	}
+}
+
+// A CACHE GOES BACK ONLY TO WHAT IT STILL HOLDS.
+//
+// A sliding layer that dropped its keys before position 5 keeps its marks
+// from 5 on: a mark at 6 is a place to go back to, one at 3 is not, and the
+// session reads the prompt again instead.
+func TestATrimmedCacheGoesBackOnlyToWhatItHolds(t *testing.T) {
+	b := ggml.New()
+	t.Cleanup(b.Close)
+	c := &VisitCache{rel: b, steps: 9, first: 5, marks: map[int]visitMark{3: {}, 6: {}}}
+	for n, want := range map[int]bool{0: true, 3: false, 6: true, 9: true} {
+		if got := c.CanTruncate(n); got != want {
+			t.Errorf("back to %d: %v, want %v", n, got, want)
+		}
+	}
+}

@@ -1,11 +1,13 @@
 package serve
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -151,13 +153,24 @@ func (p *panickingEngine) ChatStream(msgs []llm.Message, opts llm.Options, onDel
 func (p *panickingEngine) ResetSessions() { p.resets.Add(1) }
 
 // One at a time (no slots), a generation that panics ends its request; the
-// sessions are reset and the engine thread answers the next request.
+// sessions are reset and the engine thread answers the next request. The
+// log has the panic's own stack, which names the engine's function: raised
+// again on the request's goroutine, it showed only the server's.
 func TestAFailedGenerationEndsItsRequestAndTheServerGoesOn(t *testing.T) {
 	installFake(t, "Qwen3-8B-4bit", 40960)
 	eng := &panickingEngine{fakeEngine: fakeEngine{reply: "fine"}}
 	s := NewWithLoader(func(dir string) (Generator, error) { return eng, nil })
-	s.logf = func(string, ...any) {}
+	var logged strings.Builder
+	var mu sync.Mutex
+	s.logf = func(f string, a ...any) { mu.Lock(); fmt.Fprintf(&logged, f, a...); mu.Unlock() }
 	url := serveFor(t, s)
+	defer func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if !strings.Contains(logged.String(), "engine panic") || !strings.Contains(logged.String(), "panickingEngine") {
+			t.Errorf("the log does not name where the panic began:\n%s", logged.String())
+		}
+	}()
 	if code, _ := ask(t, url, "first", false); code == http.StatusOK {
 		t.Fatal("the failed generation answered 200")
 	}

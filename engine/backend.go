@@ -254,8 +254,9 @@ type RowScatterer interface {
 // the position is an input the backend writes, not the graph's shape.
 type RelAttention interface {
 	// RelAttend is the attention of the query at position pos, q
-	// [1, H, 1, D], over the keys and values k, v [1, G, pos+1, D] of
-	// positions 0..pos. relScale times rel [1, 1, H, d_rel] times relProj
+	// [1, H, 1, D], over the keys and values k, v [1, G, T, D] of the
+	// positions up to pos: all of them, or the last ones left by
+	// TrimFront. relScale times rel [1, 1, H, d_rel] times relProj
 	// [d_rel, R+1] is the query's bias for each head at distances 0..R-1,
 	// then the bias of every distance from R on; sinks [1, 1, H] is the
 	// logit that joins each head's softmax and takes its share away.
@@ -263,6 +264,10 @@ type RelAttention interface {
 	// returns [1, H, 1, D], or nil when the caches cannot be read this way
 	// and the caller computes the attention itself.
 	RelAttend(q, k, v, rel, relProj, sinks Tensor, pos, window int, scale, relScale float32) Tensor
+	// TrimFront is cache [1, G, T, D] without its first drop tokens, as a
+	// cache of its own: the buffer it lived in goes once nothing holds it.
+	// The backend keeps count of the position its first token has.
+	TrimFront(cache Tensor, drop int) Tensor
 	// AppendValuesT is Concat along the token axis (2) for a value cache
 	// kept in the layout RelAttend reads.
 	AppendValuesT(cache, x Tensor) Tensor

@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -133,6 +134,11 @@ func (s *Server) onEngineCtx(ctx context.Context, f func()) error {
 		defer close(done)
 		defer func() {
 			if r := recover(); r != nil {
+				// The stack is the engine thread's, where the panic began:
+				// raised again below, it shows only the request's goroutine
+				// (a nil dereference in a decision call left nothing else to
+				// read, 2026-11-27).
+				s.logf("engine panic: %v\n%s", r, debug.Stack())
 				failed = r
 				s.resetEngine(s.current)
 			}

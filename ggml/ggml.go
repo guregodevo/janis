@@ -169,8 +169,15 @@ type Backend struct {
 	flash bool
 	// reserved is the positions a cache is made for (ReserveCache).
 	reserved int
-	name     string
-	mu       sync.Mutex
+	// reservedFree is the device's free memory when the reservation was
+	// made, which reservedSpare cuts it by: read once, so that the keys'
+	// and the values' buffers of one layer, made one after the other, get
+	// the same room. Read at each buffer, the values' was 32 tokens
+	// shorter; it filled first and moved, and a step read keys and values
+	// of two lengths (an abort at 11,168 tokens, 2026-11-27).
+	reservedFree int64
+	name         string
+	mu           sync.Mutex
 
 	rec     *C.struct_ggml_context // the recording context: nodes not yet computed
 	pending []pendingRef           // their results, in order, held weakly
@@ -385,6 +392,9 @@ type tensor struct {
 	// pairRows: a stack of experts whose repack takes the even output rows
 	// first, then the odd ones (PairRows).
 	pairRows bool
+	// off is the position of the first token of a cache cut by TrimFront
+	// and not yet in a buffer of its own (firstPos).
+	off int
 	// input: a recorded step writes it before each run; never a weight.
 	input bool
 	pin   bool // survives Sweep
@@ -421,6 +431,9 @@ type batch struct {
 	// vt is a value cache laid out tokens innermost, the way attention's
 	// v·scores reads it (AppendValues); its views are permuted back.
 	vt bool
+	// off is the position of the cache's first token: 0, or what TrimFront
+	// has dropped before it.
+	off int
 }
 
 // memMu guards the refcounts and arena state that finalizers touch from
@@ -1774,7 +1787,7 @@ func (b *Backend) appendCache(ta, tb *tensor, axis int, vt bool) engine.Tensor {
 	}
 	if grp == nil || grp.base == nil || ta.cacheLen != n || grp.cap < need || grp.vt != vt {
 		// A new buffer with room: the old cache is copied in by the flush.
-		spare := reservedSpare(need, b.reserved, numel(shape)/need*2, b.devFree())
+		spare := reservedSpare(need, b.reserved, numel(shape)/need*2, b.reservedFree)
 		capShape := append([]int(nil), shape...)
 		capShape[axis] = (need + spare + kvPad - 1) / kvPad * kvPad
 		// The buffer's context also holds every prefix view made over its
@@ -1795,7 +1808,7 @@ func (b *Backend) appendCache(ta, tb *tensor, axis int, vt bool) engine.Tensor {
 		// Zeros past the cache: a prompt chunk reads up to kvPad of them,
 		// masked, and a masked garbage NaN would still poison the sum.
 		C.ggml_backend_buffer_clear(buf, 0)
-		grp = &batch{ctx: ctx, buf: buf, base: base, cap: capShape[axis], vt: vt}
+		grp = &batch{ctx: ctx, buf: buf, base: base, cap: capShape[axis], vt: vt, off: ta.firstPos()}
 		logAlloc("cache", C.ggml_nbytes(base), capShape)
 		b.writeCache(grp, ta, 0)
 	}
@@ -1870,8 +1883,9 @@ const cacheGrow = 256
 // prompt is read without a cache being copied. Pages a cache never writes
 // are not touched on the CPU.
 func (b *Backend) ReserveCache(tokens int) {
+	free := b.devFree()
 	b.mu.Lock()
-	b.reserved = tokens
+	b.reserved, b.reservedFree = tokens, free
 	b.mu.Unlock()
 }
 
@@ -1970,6 +1984,14 @@ func (t *tensor) paddedLen() int {
 		return 0
 	}
 	return p
+}
+
+// firstPos is the position of a cache's first token.
+func (t *tensor) firstPos() int {
+	if t.grp != nil && t.grp.base != nil {
+		return t.grp.off
+	}
+	return t.off
 }
 
 // padTokens is shape with its token axis (nd-2) set to n.

@@ -284,6 +284,9 @@ func loadLayer(c *ctx, st *safetensors.File, i int, cfg Config) (*Layer, error) 
 // the new stream and block outputs.
 func (l *Layer) Forward(c *ctx, h engine.Tensor, blocks []engine.Tensor, cache *VisitCache, pos int, messages engine.Tensor, masks *maskMaker) (engine.Tensor, []engine.Tensor) {
 	eps := masks.cfg.Eps
+	if l.Sliding {
+		cache.trim(masks.cfg.Window)
+	}
 	cache.begin(h.Shape()[1])
 	hf := c.f32(h)
 	normed := c.rms(hf, defaultEps)
