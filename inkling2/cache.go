@@ -22,10 +22,14 @@ type VisitCache struct {
 	steps int
 
 	// rel is set on a backend that runs a decode step's attention itself
-	// (engine.RelAttention): the keys and values of a sliding layer are then
-	// kept whole too, f16, in buffers the backend appends to in place, and
-	// the window is the attention's mask. A cut is then a shorter view.
+	// (engine.RelAttention): the keys and values are kept f16, in buffers
+	// the backend appends to in place, and a sliding layer's window is the
+	// attention's mask. A cut is a shorter view.
 	rel engine.RelAttention
+	// first is the position of the first token K and V hold: a sliding
+	// layer on such a backend drops the tokens its window no longer
+	// reaches (trim), and a cut can then go back no further than first.
+	first int
 
 	marks map[int]visitMark
 
@@ -60,6 +64,9 @@ func (c *VisitCache) CanTruncate(n int) bool {
 	if n == 0 || n >= c.steps {
 		return true
 	}
+	if c.rel != nil && n < c.first {
+		return false // its tokens were dropped
+	}
 	if c.last != nil && n > c.steps-c.last.n {
 		return true
 	}
@@ -77,7 +84,7 @@ func (c *VisitCache) Truncate(b engine.Backend, n int) {
 		kept := n - (c.steps - s.n)
 		total := s.k.Shape()[2] - (s.n - kept)
 		if c.rel != nil {
-			c.K, c.V = b.Slice(c.K, 2, 0, n), b.Slice(c.V, 2, 0, n)
+			c.K, c.V = c.cut(b, n)
 		} else {
 			c.K, c.V = b.Slice(s.k, 2, 0, total), b.Slice(s.v, 2, 0, total)
 			if s.keep > 0 && total > s.keep {
@@ -98,12 +105,13 @@ func (c *VisitCache) Truncate(b engine.Backend, n int) {
 		return
 	}
 	c.last = nil
-	if m, ok := c.marks[n]; ok && c.rel != nil {
-		c.K, c.V, c.Conv, c.steps = b.Slice(c.K, 2, 0, n), b.Slice(c.V, 2, 0, n), m.conv, n
-	} else if ok {
+	if m, ok := c.marks[n]; ok && c.rel != nil && n >= c.first {
+		k, v := c.cut(b, n)
+		c.K, c.V, c.Conv, c.steps = k, v, m.conv, n
+	} else if ok && c.rel == nil {
 		c.K, c.V, c.Conv, c.steps = m.k, m.v, m.conv, n
 	} else {
-		c.K, c.V, c.Conv, c.steps = nil, nil, [convSlots]engine.Tensor{}, 0
+		c.K, c.V, c.Conv, c.steps, c.first = nil, nil, [convSlots]engine.Tensor{}, 0, 0
 	}
 	for at := range c.marks {
 		if at > n {
@@ -171,6 +179,44 @@ func (c *VisitCache) update(b engine.Backend, k, v engine.Tensor, keep int) (eng
 	return k, v
 }
 
+// cut is K and V at n positions, on a backend that keeps them whole.
+func (c *VisitCache) cut(b engine.Backend, n int) (engine.Tensor, engine.Tensor) {
+	return b.Slice(c.K, 2, 0, n-c.first), b.Slice(c.V, 2, 0, n-c.first)
+}
+
+// trimSlack is how far past its window a sliding layer's keys and values
+// grow before the oldest are dropped. A drop copies what is kept into a
+// buffer of its own, so it is done in strides; a cut back into a reply
+// reaches this far behind the window.
+var trimSlack = 4096
+
+// trim drops the keys and values a sliding layer's window no longer
+// reaches, on a backend that keeps them whole (rel): the next token at
+// position steps sees window-1 before it. Without it every sliding layer
+// kept the whole context, and a 32 GB card held about 40,000 tokens of the
+// published model where its full layers alone allow 160,000 ("no room on
+// the device" at 28,000 tokens of reply, 2026-11-27). Called between
+// forward passes; the marks before the new first position go.
+func (c *VisitCache) trim(window int) {
+	if c.rel == nil || window <= 0 || c.K == nil {
+		return
+	}
+	keep := window - 1
+	held := c.steps - c.first
+	if held <= keep+trimSlack {
+		return
+	}
+	drop := held - keep
+	c.K, c.V = c.rel.TrimFront(c.K, drop), c.rel.TrimFront(c.V, drop)
+	c.first += drop
+	c.last = nil
+	for at := range c.marks {
+		if at < c.first {
+			delete(c.marks, at)
+		}
+	}
+}
+
 // begin opens a forward of n tokens: one of several is kept whole, to be
 // cut back into.
 func (c *VisitCache) begin(n int) {
@@ -231,7 +277,8 @@ func (c *VisitCache) SetCarry(ts []engine.Tensor) {
 }
 
 // Settle sets the cache at n tokens after a recorded step's runs: the
-// tails were advanced in place, the keys and values are viewed at n.
+// tails were advanced in place, the keys and values are viewed at n
+// positions (the backend counts the ones a trim dropped).
 func (c *VisitCache) Settle(rp engine.StepReplayer, n int) {
 	if c.rel != nil && c.K != nil {
 		c.K, c.V = rp.CacheView(c.K, n), rp.CacheView(c.V, n)

@@ -159,7 +159,8 @@ type recording struct {
 	ok     bool // false once the step cannot be replayed
 	pos    *tensor
 	row    *tensor            // I32 [1]: the token's row in a key cache
-	cols   map[[2]int]*tensor // I32 [m] per (capacity, m): the token's elements in a transposed value cache
+	cols   map[[3]int]*tensor // I32 [m] per (capacity, m, first position): the token's elements in a transposed value cache
+	rows   map[int]*tensor    // I32 [1] per first position other than 0: the token's row in a key cache cut at its front
 	masks  map[int]*tensor    // F32 [bucket] per bucket
 	limit  int                // the least room of the caches the step writes
 	carry  []*tensor
@@ -272,7 +273,7 @@ func (b *Backend) BeginStep(offset int, carry []engine.Tensor) []engine.Tensor {
 		return nil
 	}
 	b.flush()
-	rs := &recording{offset: offset, ok: true, cols: map[[2]int]*tensor{}, masks: map[int]*tensor{}, limit: math.MaxInt}
+	rs := &recording{offset: offset, ok: true, cols: map[[3]int]*tensor{}, masks: map[int]*tensor{}, limit: math.MaxInt}
 	rs.pos = b.replayInput(engine.I32, 1)
 	rs.row = b.replayInput(engine.I32, 1)
 	moved := make([]engine.Tensor, len(carry))
@@ -295,12 +296,10 @@ func (rs *recording) fill(offset int) {
 	setInt32(rs.pos, []int32{int32(offset)})
 	setInt32(rs.row, []int32{int32(offset)})
 	for k, t := range rs.cols {
-		capacity, m := k[0], k[1]
-		v := make([]int32, m)
-		for i := range v {
-			v[i] = int32(offset + capacity*i)
-		}
-		setInt32(t, v)
+		setInt32(t, colsAt(offset-k[2], k[0], k[1]))
+	}
+	for off, t := range rs.rows {
+		setInt32(t, []int32{int32(offset - off)})
 	}
 	for n, t := range rs.masks {
 		v := make([]float32, n)
@@ -320,13 +319,13 @@ func (rs *recording) fill(offset int) {
 }
 
 // replayCols is the element index input of a transposed value cache of
-// capacity tokens written m elements a token. Called with b.mu held.
-func (b *Backend) replayCols(capacity, m int) *tensor {
+// capacity tokens written m elements a token, its first token at off. Called with b.mu held.
+func (b *Backend) replayCols(capacity, m, off int) *tensor {
 	rs := b.rec0
 	if rs.offs != nil {
 		return b.replayColsRow(rs.cur, capacity, m)
 	}
-	k := [2]int{capacity, m}
+	k := [3]int{capacity, m, off}
 	if t, ok := rs.cols[k]; ok {
 		return t
 	}
@@ -334,7 +333,28 @@ func (b *Backend) replayCols(capacity, m int) *tensor {
 	t := b.replayInput(engine.I32, m)
 	b.mu.Lock()
 	rs.cols[k] = t
-	setInt32(t, colsAt(rs.offset, capacity, m))
+	setInt32(t, colsAt(rs.offset-off, capacity, m))
+	return t
+}
+
+// replayRow is the row input of a key cache whose first token is at
+// position off. Called with b.mu held.
+func (b *Backend) replayRow(off int) *tensor {
+	rs := b.rec0
+	if off == 0 {
+		return rs.row
+	}
+	if t, ok := rs.rows[off]; ok {
+		return t
+	}
+	b.mu.Unlock()
+	t := b.replayInput(engine.I32, 1)
+	b.mu.Lock()
+	if rs.rows == nil {
+		rs.rows = map[int]*tensor{}
+	}
+	rs.rows[off] = t
+	setInt32(t, []int32{int32(rs.offset - off)})
 	return t
 }
 
@@ -400,7 +420,7 @@ func (b *Backend) BeginBatchStep(offsets []int, carry []engine.Tensor) []engine.
 	}
 	b.flush()
 	B := len(offsets)
-	rs := &recording{offset: -1, ok: true, cols: map[[2]int]*tensor{}, masks: map[int]*tensor{}, limit: math.MaxInt,
+	rs := &recording{offset: -1, ok: true, cols: map[[3]int]*tensor{}, masks: map[int]*tensor{}, limit: math.MaxInt,
 		offs: append([]int(nil), offsets...), colsB: map[[3]int]*tensor{}, masksB: map[[2]int]*tensor{}, limits: make([]int, B),
 		poolCols: map[[2]int]*tensor{}, poolMasks: map[int]*tensor{}}
 	rs.pos = b.replayInput(engine.I32, 1)
@@ -574,13 +594,13 @@ func (b *Backend) recordAppend(grp *batch, tb *tensor, shape []int, axis int) (*
 	rs := b.rec0
 	n := shape[axis] - 1
 	bucket := min(grp.cap, (n+replayBucket)/replayBucket*replayBucket)
-	if tb.shape[axis] != 1 || n != rs.at() || bucket <= n {
+	if tb.shape[axis] != 1 || n+grp.off != rs.at() || bucket <= n || (rs.offs != nil && grp.off != 0) {
 		return nil, false
 	}
 	if rs.offs != nil {
 		rs.limits[rs.cur] = min(rs.limits[rs.cur], bucket)
 	} else {
-		rs.limit = min(rs.limit, bucket)
+		rs.limit = min(rs.limit, bucket+grp.off)
 	}
 	base := grp.base
 	src := tb.t
@@ -601,10 +621,10 @@ func (b *Backend) recordAppend(grp *batch, tb *tensor, shape []int, axis int) (*
 		dst = C.ggml_view_2d(b.rec, base, 1, C.int64_t(numel(shapeOf(base))), base.nb[0], 0)
 		C.ggml_backend_view_init(dst)
 		src = C.ggml_reshape_2d(b.rec, contig(b.rec, src), 1, C.int64_t(m))
-		idx = b.replayCols(grp.cap, m).t
+		idx = b.replayCols(grp.cap, m, grp.off).t
 	} else {
 		dst = base
-		idx = b.rec0.row.t
+		idx = b.replayRow(grp.off).t
 		if rs.offs != nil {
 			idx = rs.rowsB[rs.cur].t
 		}
@@ -847,6 +867,9 @@ func (rs *recording) free() {
 	for _, t := range rs.cols {
 		t.free()
 	}
+	for _, t := range rs.rows {
+		t.free()
+	}
 	for _, t := range rs.masks {
 		t.free()
 	}
@@ -885,7 +908,10 @@ func (rs *recording) free() {
 // (engine.StepReplayer).
 func (b *Backend) CacheView(cache engine.Tensor, n int) engine.Tensor {
 	x := as(cache)
-	if !x.replay || x.grp == nil || n > x.grp.cap {
+	if x.grp != nil {
+		n -= x.grp.off // n positions are n - off of the cache's tokens
+	}
+	if !x.replay || x.grp == nil || n > x.grp.cap || n < 0 {
 		return cache
 	}
 	shape := padTokens(x.shape, n)
