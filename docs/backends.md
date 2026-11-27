@@ -80,14 +80,14 @@ runs the model on llama.cpp (b12734).
 
 | | janis | Ollama |
 |---|---|---|
-| Decode, greedy | 60.3, 59.8, 59.8 tok/s | 58.4, 58.3 tok/s (58.5, 58.1 by its own timer) |
-| Decode, temperature 0.7 | 58.0 tok/s | 58.0 tok/s |
+| Decode, greedy | 62.3, 62.0, 61.9 tok/s | 58.4, 58.3 tok/s (58.5, 58.1 by its own timer) |
+| Decode, temperature 0.7 | 59.5 tok/s | 58.0 tok/s |
 | Decode after an 820-token prompt | 57.8 tok/s | 56.0 tok/s |
-| Decode after a 3,250-token prompt | 55.4 tok/s | 53.3 tok/s |
-| Decode after a 12,970-token prompt | 50.7 tok/s | 49.9 tok/s |
-| Prefill, 820 tokens | 938 tok/s | 1,405 tok/s |
-| Prefill, 3,250 tokens | 838 tok/s | 1,219 tok/s |
-| Prefill, 12,970 tokens | 665 tok/s | 1,147 tok/s |
+| Decode after a 3,250-token prompt | 55.6 tok/s | 53.3 tok/s |
+| Decode after a 12,970-token prompt | 51.1 tok/s | 49.9 tok/s |
+| Prefill, 820 tokens | 1,013 tok/s | 1,405 tok/s |
+| Prefill, 3,250 tokens | 1,041 tok/s | 1,219 tok/s |
+| Prefill, 12,970 tokens | 807 tok/s | 1,147 tok/s |
 | GPU memory | 23.0 GB | 21.9 GB |
 
 janis runs `mlx-community/Inkling-2-Mini-4bit`: nvfp4 experts as ggml's
@@ -103,7 +103,10 @@ are 196 KB a token by count (48 visits' keys and values in f16).
 
 A decode step of this model is 48 layer visits. janis records it once and
 runs the same graph for the tokens after (CUDA graphs replay): 9,400 nodes,
-about 16 ms. Built every token from the model's own operations it was 19,100
+about 16 ms. `JANIS_GGML_PROF=1` times a forward pass by backend method: a
+1,024-token chunk of a prompt was 28% its attention, 12% the experts'
+matmuls and 9% the depth mixes, measured one change before these figures. ggml b8640's CUDA flash attention takes no
+mask per head, which this model's bias is; llama.cpp's newer one does. Built every token from the model's own operations it was 19,100
 nodes and 110 ms, 9 tok/s.
 
 ```sh

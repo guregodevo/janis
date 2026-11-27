@@ -26,10 +26,10 @@ commands in [bench/mlx.md](bench/mlx.md) and [docs/backends.md](docs/backends.md
 | Qwen3.8-27B, NVIDIA A100: decode | 55.2 tok/s | 51.2 tok/s | not measured |
 | Qwen3.8-27B, NVIDIA A100: prefill 1,500 tokens | 1,106 tok/s | 1,170 tok/s | not measured |
 | Qwen3-8B, NVIDIA A100: decode | 146.0 tok/s | 138.5 tok/s | not measured |
-| Inkling 2 Mini, RTX 5000 Ada 32 GB: decode | 59.8 tok/s | not measured | 58.3 tok/s |
-| Inkling 2 Mini, RTX 5000 Ada 32 GB: decode after a 13,000-token prompt | 50.7 tok/s | not measured | 49.9 tok/s |
-| Inkling 2 Mini, RTX 5000 Ada 32 GB: prefill 3,200 tokens | 838 tok/s | not measured | 1,219 tok/s |
-| Inkling 2 Mini, RTX 5000 Ada 32 GB: prefill 13,000 tokens | 665 tok/s | not measured | 1,147 tok/s |
+| Inkling 2 Mini, RTX 5000 Ada 32 GB: decode | 62.0 tok/s | not measured | 58.3 tok/s |
+| Inkling 2 Mini, RTX 5000 Ada 32 GB: decode after a 13,000-token prompt | 51.1 tok/s | not measured | 49.9 tok/s |
+| Inkling 2 Mini, RTX 5000 Ada 32 GB: prefill 3,200 tokens | 1,041 tok/s | not measured | 1,219 tok/s |
+| Inkling 2 Mini, RTX 5000 Ada 32 GB: prefill 13,000 tokens | 807 tok/s | not measured | 1,147 tok/s |
 
 On the Mac, janis runs `mlx-community`'s 4-bit weights (4.3 GB for the 8B)
 and llama.cpp and Ollama the Q4_K_M GGUF (5.2 GB). Decode reads every weight
@@ -60,7 +60,7 @@ janis does not load ([Models](#models)), several models loaded at once, or
 the fastest decode of a small model on NVIDIA (Qwen3-8B on an L4:
 llama.cpp's 47.0 tok/s against 43.2), 8-bit weights there (the 27B on
 an A100: 39.6 against 33.3), or the fastest prompt reading of Inkling 2 Mini
-(Ollama's 1,219 tok/s against 838).
+(Ollama's 1,219 tok/s against 1,041).
 
 ## Install
 
