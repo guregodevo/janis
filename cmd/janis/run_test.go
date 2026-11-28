@@ -46,13 +46,31 @@ func TestRestartTakesTheSavedFlagsUnlessGiven(t *testing.T) {
 	st := runState{Host: "0.0.0.0", Port: 8090, Model: "Qwen3.5-9B-MLX-4bit", Log: "/tmp/j.log"}
 	f := newServeFlags("restart")
 	_ = f.fs.Parse(nil)
-	if h, m, l := restartFlags(st, f); h != "0.0.0.0" || m != "Qwen3.5-9B-MLX-4bit" || l != "/tmp/j.log" {
-		t.Fatalf("saved: %s %s %s", h, m, l)
+	if h, m, l, e := restartFlags(st, f); h != "0.0.0.0" || m != "Qwen3.5-9B-MLX-4bit" || l != "/tmp/j.log" || e {
+		t.Fatalf("saved: %s %s %s %v", h, m, l, e)
 	}
 	f = newServeFlags("restart")
 	_ = f.fs.Parse([]string{"--model", "mlx-community/Qwen3-8B-4bit"})
-	if h, m, _ := restartFlags(st, f); h != "0.0.0.0" || m != "Qwen3-8B-4bit" {
+	if h, m, _, _ := restartFlags(st, f); h != "0.0.0.0" || m != "Qwen3-8B-4bit" {
 		t.Fatalf("--model given: %s %s", h, m)
+	}
+	// A server started with --edit is restarted with it.
+	st.Edit = true
+	f = newServeFlags("restart")
+	_ = f.fs.Parse(nil)
+	if _, _, _, e := restartFlags(st, f); !e {
+		t.Fatal("--edit was not kept")
+	}
+	if st, ok := parseServeArgs([]string{"--edit"}); !ok || !st.Edit {
+		t.Fatalf("serve --edit read as %+v", st)
+	}
+}
+
+func TestLoopbackHosts(t *testing.T) {
+	for host, want := range map[string]bool{"127.0.0.1": true, "localhost": true, "::1": true, "0.0.0.0": false, "10.0.0.2": false, "box": false} {
+		if loopback(host) != want {
+			t.Errorf("loopback(%q) = %v", host, !want)
+		}
 	}
 }
 
@@ -216,7 +234,7 @@ func TestAnOlderJanisOnThePortIsFoundAndStopped(t *testing.T) {
 	}
 	f := newServeFlags("restart")
 	_ = f.fs.Parse(nil)
-	if h, m, _ := restartFlags(st, f); h != "0.0.0.0" || m != "Qwen3.5-9B-MLX-4bit" {
+	if h, m, _, _ := restartFlags(st, f); h != "0.0.0.0" || m != "Qwen3.5-9B-MLX-4bit" {
 		t.Fatalf("restart takes its flags: %s %s", h, m)
 	}
 	if _, ok := serveProcess(port + 1); ok {

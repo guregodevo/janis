@@ -188,6 +188,36 @@ runs. `engine.DecideContext(ctx, state, questions)` is the Go call that stops
 with `ctx`. `GET /health` names the server's release, `{"status":"ok","version":"v0.1.20"}`;
 a server from v0.1.19 or older answers without it.
 
+### Weight edits (`--edit`)
+
+`janis serve --edit` adds endpoints that read and replace the loaded model's
+weights while it serves (the Qwen3.5 family, `edit.go`). They are off without
+the flag. `--edit` refuses a host that is not loopback. `start` and `restart`
+keep the flag.
+
+| Call | Body | Does |
+|---|---|---|
+| `GET /v1/weights` | | the editable weights: `name`, `shape`, `dtype`, `group_size`, `bits`, `edited`; and `edits` |
+| `GET /v1/weights/{name}` | | `values`, row major, a quantized matrix dequantized to `shape` |
+| `POST /v1/weights/{name}` | `{"values":[…],"bits":0}` | replaces the weight; a matrix is quantized again (`bits` 0 keeps its bits) |
+| `POST /v1/weights/{name}/project` | `{"u":[…],"alpha":1}` | W ← W − α·û·ûᵀ·W, `u` of the matrix's rows; `alpha` defaults to 1 |
+| `POST /v1/weights/revert` | `{}` | every weight back to the checkpoint |
+| `POST /v1/weights/save` | `{"path":"…"}` | the edits to a safetensors file |
+| `POST /v1/weights/load` | `{"path":"…"}` | an edits file applied, all of it or none |
+
+A call that changes weights answers `{"edits":[…]}`, the weights replaced
+now. Every edit resets the sessions. A cached prefix of other weights is
+never reused. An edit sent while the batch loop decodes replies gets 409.
+A projection quantizes the whole matrix again, so even `alpha` 0 changes it
+by the quantization error.
+
+```bash
+janis serve --edit --model Qwen3.5-0.8B-MLX-4bit
+W=language_model.model.layers.0.linear_attn.dt_bias
+curl -s localhost:8090/v1/weights/$W            # {"name":…,"shape":[16],"values":[2.547,…]}
+curl -s localhost:8090/v1/weights/revert -d '{}'  # {"edits":[]}
+```
+
 ## As a library
 
 ```go

@@ -511,3 +511,57 @@ func numel(shape []int) int {
 	}
 	return n
 }
+
+// ProjectWeight takes the direction u out of what the matrix writes:
+// W ← W − α·û·ûᵀ·W, û = u/|u|, u of the matrix's output size (its rows).
+// α 1 removes the direction (the self-rewriting paper's direction
+// ablation), α 0 changes nothing but quantizes the matrix again. The
+// result is stored as EditWeight stores it, at the matrix's bits.
+func (e *Engine) ProjectWeight(name string, u []float32, alpha float64) error {
+	v, shape, err := e.ReadWeight(name)
+	if err != nil {
+		return err
+	}
+	if err := project(v, shape, u, alpha); err != nil {
+		return fmt.Errorf("weight edits: %s: %w", name, err)
+	}
+	return e.EditWeight(name, v, 0)
+}
+
+// project applies W ← W − α·û·ûᵀ·W to v, a row-major matrix of shape.
+func project(v []float32, shape []int, u []float32, alpha float64) error {
+	if len(shape) != 2 {
+		return fmt.Errorf("a projection takes a matrix, this weight is %v", shape)
+	}
+	rows, cols := shape[0], shape[1]
+	if len(u) != rows {
+		return fmt.Errorf("u has %d values, the matrix writes %d", len(u), rows)
+	}
+	if math.IsNaN(alpha) || math.IsInf(alpha, 0) {
+		return fmt.Errorf("alpha is %v", alpha)
+	}
+	var norm float64
+	for _, x := range u {
+		norm += float64(x) * float64(x)
+	}
+	norm = math.Sqrt(norm)
+	if norm == 0 || math.IsNaN(norm) || math.IsInf(norm, 0) {
+		return fmt.Errorf("u has norm %v", norm)
+	}
+	p := make([]float64, cols)
+	for r := 0; r < rows; r++ {
+		ur := float64(u[r]) / norm
+		row := v[r*cols : (r+1)*cols]
+		for c, x := range row {
+			p[c] += ur * float64(x)
+		}
+	}
+	for r := 0; r < rows; r++ {
+		k := alpha * float64(u[r]) / norm
+		row := v[r*cols : (r+1)*cols]
+		for c := range row {
+			row[c] -= float32(k * p[c])
+		}
+	}
+	return nil
+}
