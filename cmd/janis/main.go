@@ -8,6 +8,9 @@
 //	janis stop [--port N]            stop it gracefully (SIGKILL after 10 s)
 //	janis restart [--port N] [flags] stop, then start on the same flags, or the ones given; none running: start
 //	janis status [--port N]          pid, version, model, uptime, and whether /health answers
+//	janis eval --problems F --out S  a problems file asked of a server with fixed seeds, scored
+//	janis eval compare BASE [CONTROL...] EDITED   the last score paired with each before it: PASS or FAIL
+//	janis weights shift|revert|save|load   the weight edits of a server started with --edit
 //	janis version                    the release this binary is
 //
 // serve answers GET /v1/models and POST /v1/chat/completions (streamed or
@@ -45,6 +48,14 @@ func main() {
 		restartCmd(os.Args[2:])
 	case "status":
 		statusCmd(os.Args[2:])
+	case "eval":
+		if err := evalCmd(os.Args[2:], os.Stdout); err != nil {
+			fail(err)
+		}
+	case "weights":
+		if err := weightsCmd(os.Args[2:], os.Stdout); err != nil {
+			fail(err)
+		}
 	case "upgrade":
 		if err := upgrade(os.Args[2:]); err != nil {
 			fail(err)
@@ -65,6 +76,10 @@ func usage() {
        janis stop    [--port 8090]
        janis restart [--port 8090] [--host ADDR] [--model NAME] [--log FILE] [--edit]
        janis status  [--port 8090]
+       janis eval    --problems FILE.jsonl --out SCORE.json [--url URL] [--model NAME] [--seed 1000] [--max-tokens 16384] [--parallel 1] [--effort high] [--repetition-penalty R]
+       janis eval compare [--alpha 0.05] BASE.json [CONTROL.json...] EDITED.json
+       janis weights shift --match REGEXP --by DELTA [--url URL]
+       janis weights revert|save|load [--url URL] [PATH]
        janis upgrade [--check] [--force] [VERSION]
        janis version`)
 }
