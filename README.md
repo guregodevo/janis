@@ -218,6 +218,40 @@ curl -s localhost:8090/v1/weights/$W            # {"name":…,"shape":[16],"valu
 curl -s localhost:8090/v1/weights/revert -d '{}'  # {"edits":[]}
 ```
 
+### Measuring an edit (`janis eval`)
+
+`janis eval` asks a running server every problem of a JSONL file
+(`{"question","answer"}`, the answer put in `\boxed{}`), problem i with seed
+`--seed`+i, and writes a score: each problem's answer, whether it was right,
+whether it ran out of tokens, and the weights the server had edited.
+`janis eval compare` pairs two scores of the same file, seeds, cap and model
+problem by problem, and refuses two that differ in any of them.
+
+| Command | Does |
+|---|---|
+| `janis eval --problems P.jsonl --out S.json [--seed 1000] [--max-tokens 16384] [--parallel 1] [--effort high]` | one score; prints `correct 9/24  at cap 12/24  mean tokens 1396` |
+| `janis eval compare [--alpha 0.05] BASE.json EDITED.json` | gained, lost and a one-sided exact sign test; last line `PASS` (more gained than lost at p < alpha) or `FAIL` |
+| `janis weights shift --match REGEXP --by D` | adds D to every weight whose name matches |
+| `janis weights revert` | the checkpoint's weights |
+| `janis weights save PATH`, `janis weights load PATH` | the edits to a file, a file's edits applied; PATH is made absolute here |
+
+Every command takes `--url` (default `http://127.0.0.1:8090`). Sampling
+defaults to temperature 0.6, top_p 0.95, top_k 20, thinking on: the
+settings of arXiv:2611.21885. Set `--parallel` to the server's
+`JANIS_PARALLEL`.
+
+```bash
+JANIS_PARALLEL=4 janis serve --edit --model Qwen3.5-4B-MLX-4bit
+janis eval --problems dev.jsonl --out base.json --max-tokens 2048 --parallel 4
+janis weights shift --match 'linear_attn\.dt_bias$' --by 0.5
+janis eval --problems dev.jsonl --out edited.json --max-tokens 2048 --parallel 4
+janis eval compare base.json edited.json
+```
+
+On Qwen3.5-4B, 24 problems, 2,048 tokens: the same seeds asked twice gave 23
+of 24 replies identical with four requests batched; new seeds changed the
+answer to 8 of 24. A gain of a few points needs hundreds of problems.
+
 ## As a library
 
 ```go
