@@ -22,7 +22,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"runtime"
 	"runtime/debug"
@@ -242,23 +241,7 @@ func installedModels() ([]hostfit.InstalledModel, error) { return hostfit.ListIn
 // file does not say. A multimodal checkpoint (Qwen3.5, Qwen3.8) keeps it in
 // text_config: read only at the top, the 27B listed no window and a client
 // guessed 128k for a 262,144-token model.
-func contextLength(dir string) int {
-	b, err := os.ReadFile(filepath.Join(dir, "config.json"))
-	if err != nil {
-		return 0
-	}
-	var cfg struct {
-		MaxPositionEmbeddings int `json:"max_position_embeddings"`
-		TextConfig            struct {
-			MaxPositionEmbeddings int `json:"max_position_embeddings"`
-		} `json:"text_config"`
-	}
-	_ = json.Unmarshal(b, &cfg)
-	if cfg.MaxPositionEmbeddings > 0 {
-		return cfg.MaxPositionEmbeddings
-	}
-	return cfg.TextConfig.MaxPositionEmbeddings
-}
+func contextLength(dir string) int { return llm.ContextLength(dir) }
 
 // ensure loads name (an installed model's name, or "" for whatever is
 // loaded, else the first installed), swapping the engine when it differs.
@@ -382,9 +365,8 @@ type usage struct {
 }
 
 const (
-	defaultTemp      = 0.6
-	defaultTopP      = 0.95
-	defaultMaxTokens = 4096
+	defaultTemp = 0.6
+	defaultTopP = 0.95
 )
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -431,7 +413,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if sm == (sampling{}) {
 			sm = janisSampling
 		}
-		opts := llm.Options{Temp: sm.temp, TopP: sm.topP, TopK: sm.topK, RepeatPenalty: sm.repeatPenalty, MaxTokens: defaultMaxTokens}
+		opts := llm.Options{Temp: sm.temp, TopP: sm.topP, TopK: sm.topK, RepeatPenalty: sm.repeatPenalty, ToWindow: true}
 		if req.Temperature != nil {
 			opts.Temp = float32(*req.Temperature)
 		}
@@ -444,10 +426,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if req.RepetitionPenalty != nil {
 			opts.RepeatPenalty = float32(*req.RepetitionPenalty)
 		}
+		// No max_tokens: the reply runs until the model stops or the window
+		// is full (ToWindow), as with OpenAI's API, not to a server default.
 		if req.MaxCompletionTokens > 0 {
-			opts.MaxTokens = req.MaxCompletionTokens
+			opts.MaxTokens, opts.ToWindow = req.MaxCompletionTokens, false
 		} else if req.MaxTokens > 0 {
-			opts.MaxTokens = req.MaxTokens
+			opts.MaxTokens, opts.ToWindow = req.MaxTokens, false
 		}
 		if req.Seed != nil {
 			opts.Seed = *req.Seed
@@ -693,13 +677,23 @@ func (s *Server) streamChat(st *sseStream, ctx context.Context, req chatRequest,
 // tokenBudget counts the tokens a reply commits against its max_tokens. A
 // stop token is never committed, so a reply that reached the budget was cut.
 type tokenBudget struct {
-	max int
+	max atomic.Int64
 	n   atomic.Int64
 }
 
 // countTokens wraps opts.OnToken with the count, keeping what it did.
 func countTokens(opts *llm.Options) *tokenBudget {
-	b := &tokenBudget{max: opts.MaxTokens}
+	b := &tokenBudget{}
+	b.max.Store(int64(opts.MaxTokens))
+	// The engine settles the budget once the prompt is read (ToWindow: what
+	// the prompt leaves of the window); a reply that reached it was cut.
+	prevBudget := opts.OnBudget
+	opts.OnBudget = func(n int) {
+		b.max.Store(int64(n))
+		if prevBudget != nil {
+			prevBudget(n)
+		}
+	}
 	prev := opts.OnToken
 	opts.OnToken = func(id int32, text string) {
 		b.n.Add(1)
@@ -710,7 +704,7 @@ func countTokens(opts *llm.Options) *tokenBudget {
 	return b
 }
 
-func (b *tokenBudget) spent() bool { return b.max > 0 && int(b.n.Load()) >= b.max }
+func (b *tokenBudget) spent() bool { m := b.max.Load(); return m > 0 && b.n.Load() >= m }
 
 // finishReason is the OpenAI finish_reason: tool_calls for a reply that
 // called, length for one the token budget cut, else stop. A client reads
