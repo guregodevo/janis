@@ -5,8 +5,10 @@ package llm
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,7 +68,15 @@ type Options struct {
 	// leaves the engine's own (JANIS_REPEAT_PENALTY, 1.1 by default).
 	RepeatPenalty float32
 	MaxTokens     int
-	Seed          uint64
+	// ToWindow, with no MaxTokens, lets the reply run until the model stops
+	// or the window is full: the budget is what the prompt leaves of the
+	// model's window (ContextLength). A model whose config names no window
+	// keeps the server's old default, 4096.
+	ToWindow bool
+	// OnBudget, if set, is told the reply's token budget once the prompt is
+	// read: the client's max_tokens, or what ToWindow left.
+	OnBudget func(n int)
+	Seed     uint64
 	// Cancel, if set, is polled during generation; returning true stops early and
 	// returns the partial reply. Used to interrupt an in-flight chat.
 	Cancel func() bool
@@ -102,6 +112,8 @@ type sessionMaker interface {
 // It is safe for concurrent callers (generation is serialized internally).
 type Engine struct {
 	bk engine.Backend
+	// window is the model's context length from its config (0: not named).
+	window int
 	// session is the main conversational session (prefix-reused across an
 	// agent's turns). utilSession serves one-off utility generations — query
 	// reformulation, wiki summarize/synthesize — so they don't overwrite the
@@ -162,7 +174,7 @@ func Open(modelDir string) (*Engine, error) {
 	} else if cfg, err = qwen.LoadConfig(modelDir); err != nil {
 		return nil, err
 	}
-	e := &Engine{bk: newBackend(), mtype: cfg.ModelType, stops: map[int32]bool{}, vocab: cfg.Vocab, modelDir: modelDir}
+	e := &Engine{bk: newBackend(), mtype: cfg.ModelType, stops: map[int32]bool{}, vocab: cfg.Vocab, modelDir: modelDir, window: ContextLength(modelDir)}
 	b := e.bk
 
 	st, err := safetensors.OpenModel(modelDir)
@@ -462,6 +474,49 @@ func (e *Engine) sampleParams(opts Options, onDelta func(string)) (qwen.SamplePa
 	return p, maxTok
 }
 
+// windowlessBudget is a ToWindow reply's budget on a model whose config
+// names no window: the server's default before ToWindow.
+const windowlessBudget = 4096
+
+// replyBudget is the reply's budget once the prompt is read: ToWindow (with no
+// MaxTokens) takes what the prompt leaves of the window; a budget a client
+// named is kept as it is. OnBudget is told the figure.
+func (e *Engine) replyBudget(opts Options, maxTok, promptLen int) int {
+	if opts.ToWindow && opts.MaxTokens <= 0 {
+		maxTok = windowlessBudget
+		if e.window > 0 {
+			maxTok = max(e.window-promptLen, 1)
+		}
+	}
+	if opts.OnBudget != nil {
+		opts.OnBudget(maxTok)
+	}
+	return maxTok
+}
+
+// ContextLength is a model's window from its config.json: max_position_
+// embeddings at the top, else in text_config (a multimodal checkpoint, Qwen3.5
+// and Qwen3.8, keeps it there: read only at the top, the 27B listed no window
+// and a client guessed 128k for a 262,144-token model). 0 when the file does
+// not say.
+func ContextLength(dir string) int {
+	b, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil {
+		return 0
+	}
+	var cfg struct {
+		MaxPositionEmbeddings int `json:"max_position_embeddings"`
+		TextConfig            struct {
+			MaxPositionEmbeddings int `json:"max_position_embeddings"`
+		} `json:"text_config"`
+	}
+	_ = json.Unmarshal(b, &cfg)
+	if cfg.MaxPositionEmbeddings > 0 {
+		return cfg.MaxPositionEmbeddings
+	}
+	return cfg.TextConfig.MaxPositionEmbeddings
+}
+
 func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *qwen.Session) string {
 	ids := e.tok.Encode(chat.ApplyTemplateEffort(e.mtype, msgs, opts.ReasoningEffort))
 	var images [][]byte
@@ -470,6 +525,7 @@ func (e *Engine) chat(msgs []Message, opts Options, onDelta func(string), sess *
 	}
 
 	p, maxTok := e.sampleParams(opts, onDelta)
+	maxTok = e.replyBudget(opts, maxTok, len(ids))
 
 	out := e.generate(sess, ids, images, maxTok, p)
 	text, _ := e.reply(out)

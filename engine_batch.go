@@ -142,6 +142,7 @@ func (e *Engine) BeginChat(msgs []Message, opts Options, onDelta func(string)) (
 	te := time.Now()
 	ids := e.tok.Encode(chat.ApplyTemplateEffort(e.mtype, msgs, opts.ReasoningEffort))
 	p, maxTok := e.sampleParams(opts, onDelta)
+	maxTok = e.replyBudget(opts, maxTok, len(ids))
 	encoded := time.Since(te)
 
 	mlxComputeMu.Lock()

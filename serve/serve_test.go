@@ -31,6 +31,9 @@ type fakeEngine struct {
 	// generating, when set, makes ChatStream a long generation: it sends a
 	// first delta, closes generating and runs until opts.Cancel says stop.
 	generating chan struct{}
+	// budget, when set, is the reply budget the fake engine settles on
+	// (opts.OnBudget), as a real one does once the prompt is read.
+	budget int
 }
 
 func (f *fakeEngine) ModelType() string { return "qwen3" }
@@ -45,6 +48,9 @@ func (f *fakeEngine) ChatStream(msgs []llm.Message, opts llm.Options, onDelta fu
 			time.Sleep(5 * time.Millisecond)
 		}
 		return "Half"
+	}
+	if f.budget > 0 && opts.OnBudget != nil {
+		opts.OnBudget(f.budget)
 	}
 	if opts.OnToken != nil {
 		for _, w := range strings.Fields(f.reply) { // a word a token, as NumTokens counts
